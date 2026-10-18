@@ -642,8 +642,12 @@ impl App {
             .as_ref()
             .map(|live| {
                 format!(
-                    "Typst {} · sync {} · {}ms · ",
-                    if live.compiling { "compiling" } else { "ready" },
+                    "{} · sync {} · {}ms · ",
+                    if live.compiling || self.loading {
+                        "⏳"
+                    } else {
+                        "✓"
+                    },
                     if live.auto_sync { "on" } else { "off" },
                     self.compile_millis
                 )

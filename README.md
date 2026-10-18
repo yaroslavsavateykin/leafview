@@ -109,6 +109,9 @@ or server features. LeafView does not claim full Typst CLI flag compatibility.
 | `f` | Follow the last mapped edit manually |
 | `r` | Recompile |
 
+The status shows `⏳` while compiling or preparing the image, then `✓` once
+loading finishes. Compilation errors display an error instead of a success mark.
+
 Source synchronization compares successful source snapshots, selects the last
 changed character/token in the most recently changed source file, then uses
 compiler glyph spans to find its new PDF coordinates. Multiple disjoint edits

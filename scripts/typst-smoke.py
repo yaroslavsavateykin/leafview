@@ -41,7 +41,9 @@ with tempfile.TemporaryDirectory(prefix='leafview-live-') as tmp:
         replacement.replace(target)
     try:
         pump(2)
-        assert b'Typst ready' in output, output[-2000:]
+        assert '✓'.encode() in output, output[-2000:]
+        assert '⏳'.encode() in output, 'missing loading indicator'
+        assert b'Typst ready' not in output
         def current():
             return json.loads(trace.read_text().splitlines()[-1])
         assert current()['page'] == 0
