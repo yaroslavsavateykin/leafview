@@ -58,6 +58,37 @@ impl View {
         self.zoom = new;
         true
     }
+    /// Keep the page point under the pointer stationary, including centered
+    /// pages and the raster-width cap. Anchor is viewport-relative in pixels.
+    pub fn zoom_at(
+        &mut self,
+        delta: f32,
+        viewport: Viewport,
+        aspect: f64,
+        anchor: (f64, f64),
+    ) -> bool {
+        let old_width = raster_width(self, viewport) as f64;
+        let old = (self.x, self.y);
+        // Avoid accumulating floating-point drift over many wheel ticks.
+        let target = ((self.zoom + delta) * 100.).round() / 100.;
+        if !self.adjust_zoom(target - self.zoom) {
+            return false;
+        }
+        let new_width = raster_width(self, viewport) as f64;
+        let ratio = new_width / old_width;
+        let offset = |scroll: u32, pointer: f64, extent: f64, dimension: f64| {
+            let old_padding = (extent - dimension).max(0.) / 2.;
+            let new_padding = (extent - dimension * ratio).max(0.) / 2.;
+            let point = (scroll as f64 + pointer - old_padding).clamp(0., dimension);
+            (point * ratio - pointer + new_padding)
+                .max(0.)
+                .min((dimension * ratio - extent).max(0.))
+                .round() as u32
+        };
+        self.x = offset(old.0, anchor.0, viewport.width as f64, old_width);
+        self.y = offset(old.1, anchor.1, viewport.height as f64, old_width * aspect);
+        true
+    }
     pub fn scroll(&mut self, dx: i32, dy: i32) {
         self.x = self.x.saturating_add_signed(dx);
         self.y = self.y.saturating_add_signed(dy);
@@ -152,6 +183,33 @@ mod tests {
             ),
             (0, 0, 0, 0)
         );
+    }
+    #[test]
+    fn pointer_zoom_preserves_page_point() {
+        let viewport = Viewport {
+            width: 800,
+            height: 600,
+        };
+        let mut v = View::new(2);
+        v.zoom = 2.;
+        v.x = 300;
+        v.y = 500;
+        let anchor = (200., 250.);
+        let before = (
+            (v.x as f64 + anchor.0) / 1600.,
+            (v.y as f64 + anchor.1) / 2400.,
+        );
+        assert!(v.zoom_at(0.05, viewport, 1.5, anchor));
+        let width = raster_width(&v, viewport) as f64;
+        assert!(((v.x as f64 + anchor.0) / width - before.0).abs() < 0.001);
+        assert!(((v.y as f64 + anchor.1) / (width * 1.5) - before.1).abs() < 0.001);
+        let mut centered = View::new(1);
+        centered.zoom = 0.5;
+        assert!(centered.zoom_at(0.5, viewport, 1.5, (400., 300.)));
+        assert_eq!(centered.x, 0);
+        assert_eq!(centered.y, 300);
+        v.zoom = 3.;
+        assert!(!v.zoom_at(0.05, viewport, 1.5, anchor));
     }
     #[test]
     fn zoom_is_bounded() {

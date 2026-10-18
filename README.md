@@ -29,6 +29,8 @@ versions, not the old Rust shipped by some distribution packages.
 | PageUp / PageDown, Space | Previous / next page (Space: next) |
 | `j` / `k`, Down / Up | Vertical scroll |
 | `H` / `L` | Horizontal scroll |
+| Wheel/trackpad up / down | Zoom in / out by 5 percentage points around the pointer |
+| Wheel/trackpad right / left | Next / previous page (at most one turn per 250 ms) |
 | `+` / `-` (also `=` / `_`) | Zoom, 50–300% of pane width |
 | `z` | Reset zoom and scroll |
 | `g` / `G`, Home / End | First / last page |
@@ -37,6 +39,13 @@ versions, not the old Rust shipped by some distribution packages.
 | `r` | Reload PDF |
 | `b` | Back to previous internal-link location |
 | `q`, Esc with no page input | Quit |
+
+Trackpad gestures work when the terminal/tmux forwards SGR wheel events;
+LeafView cannot read raw touchpad/pinch gestures. Zoom uses small discrete steps
+coalesced by the existing renderer, not pixel-level animation. At page edges or
+the 3400-pixel raster cap the pointer anchor is clamped. `j/k` still scroll the
+page vertically; `H/L` scroll horizontally. Horizontal gesture direction follows
+the ScrollLeft/ScrollRight events supplied by your natural-scroll settings.
 
 One status bar shows the requested page, zoom, loading or error state. While
 loading, **the previous image remains visible** and is explicitly labelled as

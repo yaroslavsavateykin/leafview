@@ -61,6 +61,7 @@ struct App {
     hovered: Option<usize>,
     hover_deadline: Option<Instant>,
     pointer: Option<(u16, u16)>,
+    last_swipe_page: Option<Instant>,
     destination: Option<Destination>,
     history: std::collections::VecDeque<View>,
     browser: Worker<String, Result<()>>,
@@ -458,6 +459,64 @@ impl App {
     fn on_mouse(&mut self, event: MouseEvent) {
         self.pointer = Some((event.column, event.row));
         self.hover_at(event.column, event.row);
+        let changed = match event.kind {
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                let aspect = self
+                    .doc
+                    .links
+                    .pages
+                    .get(self.view.page as usize)
+                    .and_then(|p| p.as_ref())
+                    .map(|p| {
+                        let (w, h) = p.space.size();
+                        h / w
+                    })
+                    .or_else(|| {
+                        self.displayed
+                            .as_ref()
+                            .filter(|g| g.page == self.view.page)
+                            .map(|g| g.raster.1 as f64 / g.raster.0 as f64)
+                    });
+                if let Some(aspect) = aspect {
+                    let anchor = (
+                        f64::from(event.column) * f64::from(self.font_width)
+                            + f64::from(self.font_width) / 2.,
+                        f64::from(event.row) * f64::from(self.font_height)
+                            + f64::from(self.font_height) / 2.,
+                    );
+                    // Five percentage points per terminal wheel tick; existing
+                    // latest-wins scheduling coalesces trackpad bursts.
+                    let delta = if event.kind == MouseEventKind::ScrollUp {
+                        0.05
+                    } else {
+                        -0.05
+                    };
+                    self.view.zoom_at(delta, self.viewport, aspect, anchor)
+                } else {
+                    false
+                }
+            }
+            // A swipe produces many ticks: bound page turns during a gesture.
+            MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight
+                if self
+                    .last_swipe_page
+                    .is_none_or(|t| t.elapsed() >= Duration::from_millis(250)) =>
+            {
+                self.last_swipe_page = Some(Instant::now());
+                self.view
+                    .step_page(if event.kind == MouseEventKind::ScrollRight {
+                        1
+                    } else {
+                        -1
+                    })
+            }
+            _ => false,
+        };
+        if changed {
+            self.destination = None;
+            self.schedule();
+            self.dirty = true;
+        }
         if event.kind != MouseEventKind::Down(MouseButton::Left) {
             return;
         }
@@ -864,6 +923,7 @@ fn viewer_loop(
         hovered: None,
         hover_deadline: None,
         pointer: None,
+        last_swipe_page: None,
         destination: None,
         history: std::collections::VecDeque::new(),
         browser: Worker::new(links::open_url),

@@ -48,8 +48,16 @@ with tempfile.TemporaryDirectory(prefix='leafview-live-') as tmp:
             return json.loads(trace.read_text().splitlines()[-1])
         assert current()['page'] == 0
         assert current()['revision'] > 0
-        os.write(master, b'++')
+        # Real SGR wheel reports: zoom and horizontal page turns.
+        os.write(master, b'\x1b[<64;46;15M' * 10)
+        pump(.8)
+        assert abs(current()['zoom'] - 1.5) < .001, current()
+        os.write(master, b'\x1b[<67;46;15M')
         pump(.5)
+        assert current()['page'] == 1, current()
+        os.write(master, b'\x1b[<66;46;15M')
+        pump(.5)
+        assert current()['page'] == 0, current()
         output.clear()
         start = time.monotonic()
         save(source.replace('c^2', 'c^3'))
@@ -58,7 +66,7 @@ with tempfile.TemporaryDirectory(prefix='leafview-live-') as tmp:
             if current()['page'] == 6:
                 break
         assert current()['page'] == 6, current()
-        assert current()['zoom'] == 1.5, current()
+        assert abs(current()['zoom'] - 1.5) < .001, current()
         assert current()['crop'][1] > 0, current()
         print(f'PASS: include/formula auto-follow save-to-display {time.monotonic()-start:.3f}s; crop={current()["crop"]}; zoom={current()["zoom"]}')
         os.write(master, b'g')
@@ -77,7 +85,7 @@ with tempfile.TemporaryDirectory(prefix='leafview-live-') as tmp:
         save(source.replace('c^2', 'c^99'))
         pump(2)
         assert current()['page'] == 6, current()
-        assert current()['zoom'] == 1.5, current()
+        assert abs(current()['zoom'] - 1.5) < .001, current()
         assert current()['crop'][1] > 0, current()
         assert current()['revision'] > 2
         os.write(master, b'sg')

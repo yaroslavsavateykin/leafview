@@ -1,5 +1,19 @@
 # Typst Live Preview verification — 2026-10-19
 
+## Trackpad/wheel navigation update
+
+Added ScrollUp/Down pointer-anchored zoom (5 percentage points, rounded to avoid
+float drift) and ScrollLeft/Right page navigation (250 ms turn throttle). Anchor
+math accounts for image centering, zoom raster cap, current offsets and page
+aspect; bounds still clamp. Existing keyboard scrolling unchanged. Unit test
+checks normalized page-point stability and centered-page zoom. PTY integration
+sends actual SGR 64/66/67 reports, checks ten wheel ticks reach exactly 150%,
+horizontal right/left reach pages 2/1, then source follow and remaining live tests.
+Default unit tests, feature tests, Clippy, release and both PTY suites passed;
+feature version installed. Physical touchpad gesture delivery in Ghostty/tmux
+has NOT been tested here; terminal event forwarding is required. This is small
+stepped zoom, not raw touch/pinch or pixel-smooth animation.
+
 ## Native graphics default update
 
 Removed automatic Ghostty+tmux Halfblocks selection; safe/halfblocks are now
