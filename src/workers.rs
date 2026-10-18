@@ -1,11 +1,11 @@
 //! Owned, bounded background tasks. Drop cancels queued work and joins the worker.
-use std::time::Duration;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     mpsc::{self, Receiver, SyncSender, TrySendError},
     Arc,
 };
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 pub struct Worker<I, O> {
     pub input: Option<SyncSender<I>>,
@@ -70,10 +70,19 @@ mod tests {
         worker.input.as_ref().unwrap().send(1).unwrap();
         worker.input.as_ref().unwrap().send(2).unwrap();
         thread::sleep(Duration::from_millis(30));
-        assert_eq!(worker.output.recv_timeout(Duration::from_secs(1)).unwrap(), 1);
-        assert_eq!(worker.output.recv_timeout(Duration::from_secs(1)).unwrap(), 2);
+        assert_eq!(
+            worker.output.recv_timeout(Duration::from_secs(1)).unwrap(),
+            1
+        );
+        assert_eq!(
+            worker.output.recv_timeout(Duration::from_secs(1)).unwrap(),
+            2
+        );
         worker.input.as_ref().unwrap().send(3).unwrap();
-        assert_eq!(worker.output.recv_timeout(Duration::from_secs(1)).unwrap(), 3);
+        assert_eq!(
+            worker.output.recv_timeout(Duration::from_secs(1)).unwrap(),
+            3
+        );
     }
     #[test]
     fn bounded_work_and_owned_shutdown() {
