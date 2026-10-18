@@ -1,0 +1,23 @@
+[package]
+name = "leafview"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Minimal, responsive PDF viewer for terminals and tmux"
+readme = "README.md"
+
+[dependencies]
+anyhow = "1.0"
+crossterm = "0.29"
+image = { version = "0.25", default-features = false, features = ["png"] }
+lru = "0.12"
+notify = "8"
+ratatui = "0.30"
+ratatui-image = { version = "=11.0.8", default-features = false, features = ["crossterm"] }
+rayon = "1.12"
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
