@@ -22,7 +22,11 @@ with tempfile.TemporaryDirectory(prefix="leafview-test-") as tmp:
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 90, 0, 0))
     before = termios.tcgetattr(slave)
-    env = {**os.environ, "TERM": "xterm-256color"}
+    opener = Path(tmp) / "xdg-open"
+    opened = Path(tmp) / "opened-url"
+    opener.write_text('#!/usr/bin/env python3\nimport sys\nfrom pathlib import Path\nPath(' + repr(str(opened)) + ').write_text(sys.argv[1])\n')
+    opener.chmod(0o755)
+    env = {**os.environ, "TERM": "xterm-256color", "PATH": tmp + os.pathsep + os.environ['PATH']}
     for key in ["TMUX", "TERM_PROGRAM", "KITTY_WINDOW_ID"]:
         env.pop(key, None)
     proc = subprocess.Popen([str(root / "target/release/leafview"), str(source)],
@@ -70,6 +74,49 @@ with tempfile.TemporaryDirectory(prefix="leafview-test-") as tmp:
             os.kill(proc.pid, signal.SIGWINCH)
             pump(0.04)
         pump(1)
+        # Real SGR mouse reports, using the checked-in Typst annotation fixture.
+        source.write_bytes((root / 'tests/fixtures/typst-links.pdf').read_bytes())
+        pump(2)
+        os.write(master, b'zg')
+        pump(2)
+        output.clear()
+        os.write(master, b'\x1b[<35;16;11M')  # move over DOI, one-based cells
+        pump(0.3)
+        assert b'doi.org/10.1000/182' in output, output[-1500:]
+        assert not opened.exists(), 'hover must not open browser'
+        before_hover = len(output)
+        for _ in range(50):
+            os.write(master, b'\x1b[<35;16;11M')
+        pump(0.3)
+        assert len(output) == before_hover, 'unchanged hover should not redraw'
+        os.write(master, b'\x1b[<0;16;11M\x1b[<0;16;11m')
+        pump(0.5)
+        assert opened.read_text() == 'https://doi.org/10.1000/182'
+        opener.write_text('#!/usr/bin/env python3\nraise SystemExit(1)\n')
+        output.clear()
+        os.write(master, b'\x1b[<0;16;11M\x1b[<0;16;11m')
+        pump(0.5)
+        os.write(master, b'\x1b[<35;80;25M')  # leave link to expose error status
+        pump(0.2)
+        assert b'Browser:' in output, 'failed launcher should report error'
+        output.clear()
+        os.write(master, b'\x1b[<35;16;17M')
+        pump(0.2)
+        assert b'Page 2' in output, output[-1000:]
+        os.write(master, b'\x1b[<0;16;17M\x1b[<0;16;17m')
+        pump(1)
+        output.clear()
+        os.write(master, b'\x1b[<35;16;11M')
+        pump(0.2)
+        assert b'Page 1' in output, 'internal click did not reach destination page'
+        os.write(master, b'b')
+        pump(1)
+        os.write(master, b'\x1b[<35;80;25M')
+        pump(0.2)
+        output.clear()
+        os.write(master, b'\x1b[<35;16;11M')
+        pump(0.2)
+        assert b'doi.org/10.1000/182' in output, 'history did not restore source position'
         start = time.monotonic()
         os.write(master, b"q")
         while proc.poll() is None and time.monotonic() - start < 3:
@@ -77,6 +124,7 @@ with tempfile.TemporaryDirectory(prefix="leafview-test-") as tmp:
         assert proc.wait(timeout=1) == 0, output[-2000:]
         assert termios.tcgetattr(slave) == before, "TTY flags not restored"
         assert b"\x1b[?1049l" in output, "alternate screen not restored"
+        assert b'\x1b[?1003l' in output, 'mouse capture not disabled'
         print(f"PASS: PTY display/navigation/auto-reload/resize/quit; peak RSS {peak} KiB; quit {time.monotonic()-start:.3f}s; output {len(output)} bytes")
     finally:
         if proc.poll() is None:

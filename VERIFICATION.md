@@ -1,5 +1,73 @@
 # Verification — 2026-10-18
 
+## Interactive hyperlinks update
+
+Implemented annotation-based URI and local GoTo links in `src/links.rs`, including
+indirect objects, legacy named destinations and name trees. Poppler remains the
+renderer. Chosen parser: lopdf 0.45 without default features. Poppler GLib was
+considered but requires new GLib/Cairo/system-library dependencies; pdfinfo URL
+listing does not provide the required annotation geometry/destinations. Serde and
+serde_json carry bounded helper output, not PDF actions or executable code.
+
+Parsing is eager once per immutable snapshot in a separate resource-limited
+Leafview helper (`--extract-links`), called by the existing document worker.
+Helper parsing is cancellable via process termination and has the same 12 s /
+512 MiB process limits as rendering; metadata output is capped at 32 MiB.
+This favors bounded shutdown and fault isolation over an in-process parser that
+cannot be interrupted. The parsed PDF is discarded; compact metadata stays with
+its snapshot. No mouse event parses a PDF. Large PDFs can hit metadata limits and
+remain viewable with links disabled; lazy page extraction is not implemented.
+
+Current regression run: `cargo fmt --all -- --check`, `cargo check --locked`,
+`cargo test --locked`, Clippy `-D warnings`, release build, `git diff --check`:
+PASS. **19 unit tests and 3 CLI integration tests passed**, one optional older
+performance test remains ignored. New tests cover URI/GoTo/name-tree/legacy-name
+extraction, unsafe actions, actual Typst PDF, PDF Y inversion, rotations 0/90/180/270,
+nonzero MediaBox/CropBox, zoom 50/100/125/200/300%, horizontal/vertical/both-axis
+scroll, centered image, different cell dimensions, ambiguous/tiny/outside regions,
+stale image identity, destination offsets/fit and URL argument/sanitization rules.
+A Poppler pixel test rasterizes red annotation rectangles and confirms their
+transformed centers are actually red on all four rotations (not just a transform
+round-trip test). Fixtures and deterministic generator are checked in; Typst
+fixture source is included, Typst is not required for normal tests/CI.
+
+Extended PTY test: PASS. SGR mouse motion previews DOI, 50 repeated moves within
+one link cause **zero additional terminal output**, hover never opens a browser,
+click passes the exact DOI to an injected PATH-local mock `xdg-open`, launcher
+failure is reported without exit, internal click and `b` restore source location.
+Also reruns rapid keyboard input, corrupt/atomic reload, 1×1 resize, termios
+restoration and mouse capture disable. Latest run: viewer peak RSS 31056 KiB,
+quit 0.022 s. The script clears captured output between assertions, so its final
+byte count is not total session transmission volume.
+
+### New real-terminal status (not inherited from earlier graphics tests)
+
+Ghostty + isolated tmux 3.6 launched with the Typst hyperlink fixture. Pane capture
+confirmed internal-link hover status (`→ Page 2 [click to follow · b back]`).
+However XWayland pointer injection / screenshot capture in this environment did
+not provide a consistent synchronized interactive view: screenshots lagged the
+current tmux state. Therefore **real visual hyperlink click, browser opening,
+horizontal/vertical split interaction, zoom/scroll clicking and detach/attach
+hyperlink interaction are NOT VERIFIED**. The PTY tests above exercise application
+mouse events but are not claimed as end-to-end physical mouse testing. Kitty,
+Sixel and iTerm2 hyperlink behavior: NOT TESTED. Real browser opening: NOT TESTED
+(the automated test intentionally uses a mock). Existing earlier graphics checks
+below predate hyperlinks and do not certify the new interaction paths.
+
+Hover uses cyan destination feedback in the status bar, no PDF-region overlay,
+1016 pixel mode or hand cursor. Rectangular Link annotations only; QuadPoints,
+FitB-family, GoToR, JavaScript and Launch are unsupported. Null XYZ coordinates
+preserve corresponding scroll coordinates; zoom/fit are constrained by existing
+50–300% and raster limits. History is cleared on successful reload.
+
+Manual hyperlink check: open `tests/fixtures/typst-links.pdf` in the active pane;
+hover DOI without clicking (browser must not open), click Go to target (page 2),
+press `b`, click DOI and verify browser. Repeat after +/- and H/L/j/k, pane splits,
+resize and fresh-terminal attach; verify blank/status/neighbor regions never
+activate. Repeat with `tests/fixtures/links.pdf` to cover rotated pages and
+unsupported-action feedback. No tmux mouse setting is changed by Leafview.
+
+
 Source: supplied `leafview-rust-source.zip`, imported unchanged in commit
 69e825b before modifications. Tests below were actually executed, not inferred
 from successful compilation. No Fancy Cat source was modified or used as base.

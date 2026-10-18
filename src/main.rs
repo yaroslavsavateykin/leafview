@@ -1,13 +1,19 @@
 //! Leafview: a small terminal PDF viewer with latest-wins rendering and tmux graphics support.
 mod document;
+#[cfg(test)]
+mod link_tests;
+mod links;
 mod process;
 mod render;
 mod view;
 mod workers;
 
 use anyhow::{Context, Result};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
+};
 use document::Document;
+use links::{Destination, LinkAction, RenderGeometry};
 use notify::Watcher;
 use ratatui::{
     layout::{Constraint, Layout, Size},
@@ -38,6 +44,14 @@ struct App {
     viewport: Viewport,
     renderer: Renderer,
     image: Option<Protocol>,
+    displayed: Option<RenderGeometry>,
+    image_area: ratatui::layout::Rect,
+    hovered: Option<usize>,
+    pointer: Option<(u16, u16)>,
+    destination: Option<Destination>,
+    history: std::collections::VecDeque<View>,
+    browser: Worker<String, Result<()>>,
+    browser_pending: bool,
     completed: Receiver<Completed>,
     encoder: Worker<EncodeInput, EncodeOutput>,
     reloader: Worker<(PathBuf, u64), Result<Document>>,
@@ -82,8 +96,11 @@ impl Drop for GraphicsCleanup {
     }
 }
 
-type EncodeInput = (u64, image::DynamicImage, Size);
-type EncodeOutput = (u64, Result<Protocol, ratatui_image::errors::Errors>);
+type EncodeInput = (RenderGeometry, image::DynamicImage, Size);
+type EncodeOutput = (
+    RenderGeometry,
+    Result<Protocol, ratatui_image::errors::Errors>,
+);
 
 impl App {
     fn schedule(&mut self) {
@@ -91,8 +108,10 @@ impl App {
             return;
         }
         self.loading = true;
+        self.hovered = None;
         self.renderer.request(Request {
             generation: 0,
+            destination: self.destination.clone(),
             doc: self.doc.clone(),
             page: self.view.page,
             width: raster_width(&self.view, self.viewport),
@@ -179,6 +198,12 @@ impl App {
                 self.view.y = 0;
                 request = true;
             }
+            KeyCode::Char('b') => {
+                if let Some(view) = self.history.pop_back() {
+                    self.view = view;
+                    request = true;
+                }
+            }
             KeyCode::Char('r') => {
                 self.reload();
                 self.dirty = true;
@@ -186,6 +211,7 @@ impl App {
             _ => {}
         }
         if request {
+            self.destination = None;
             self.schedule();
             self.dirty = true;
         }
@@ -209,14 +235,89 @@ impl App {
         match result {
             Ok(doc) => {
                 self.view.set_pages(doc.pages);
+                self.history.clear();
+                self.destination = None;
+                self.error = doc.links.error.clone();
                 self.doc = Arc::new(doc);
-                self.error = None;
                 self.schedule();
             }
             Err(err) => self.error = Some(format!("Reload: {err:#}")),
         }
     }
+    fn hover_at(&mut self, column: u16, row: u16) {
+        let hovered = self
+            .displayed
+            .as_ref()
+            .filter(|g| {
+                g.is_current(
+                    self.doc.revision,
+                    self.view.page,
+                    self.renderer.current_generation(),
+                ) && !self.loading
+            })
+            .and_then(|g| {
+                g.hit(
+                    column,
+                    row,
+                    self.image_area,
+                    (self.font_width, self.font_height),
+                )
+            });
+        if hovered != self.hovered {
+            self.hovered = hovered;
+            self.dirty = true;
+        }
+    }
+    fn on_mouse(&mut self, event: MouseEvent) {
+        self.pointer = Some((event.column, event.row));
+        self.hover_at(event.column, event.row);
+        if event.kind != MouseEventKind::Down(MouseButton::Left) {
+            return;
+        }
+        let action = self.hovered.and_then(|id| {
+            self.displayed
+                .as_ref()?
+                .links
+                .as_ref()?
+                .links
+                .get(id)
+                .map(|l| l.action.clone())
+        });
+        match action {
+            Some(LinkAction::Internal(dest)) => {
+                if self.history.len() == 64 {
+                    self.history.pop_front();
+                }
+                self.history.push_back(self.view.clone());
+                self.view.page = dest.page;
+                self.view.zoom =
+                    dest.view_zoom((self.viewport.width, self.viewport.height), self.view.zoom);
+                self.destination = Some(dest);
+                self.schedule();
+                self.dirty = true;
+            }
+            Some(LinkAction::External(url)) if !self.browser_pending => {
+                match self.browser.input.as_ref().unwrap().try_send(url) {
+                    Ok(()) => self.browser_pending = true,
+                    Err(_) => self.error = Some("Browser launcher busy".into()),
+                }
+                self.dirty = true;
+            }
+            Some(LinkAction::Unsupported(reason)) => {
+                self.error = Some(links::sanitize(&reason));
+                self.dirty = true;
+            }
+            _ => {}
+        }
+    }
     fn consume(&mut self) {
+        while let Ok(result) = self.browser.output.try_recv() {
+            self.browser_pending = false;
+            if let Err(e) = result {
+                self.error = Some(format!("Browser: {e}"));
+            }
+            self.dirty = true;
+        }
         while let Ok(result) = self.reloader.output.try_recv() {
             self.finish_reload(result);
             self.dirty = true;
@@ -237,8 +338,10 @@ impl App {
                         (self.viewport.width / self.font_width) as u16,
                         (self.viewport.height / self.font_height) as u16,
                     );
-                    self.encode_latest = Some((completed.generation, image, size));
-                    self.error = None;
+                    if let Some(geometry) = completed.geometry {
+                        self.encode_latest = Some((geometry, image, size));
+                    }
+                    self.error = self.doc.links.error.clone();
                 }
                 Err(err) => {
                     self.error = Some(err);
@@ -247,21 +350,26 @@ impl App {
             }
             self.dirty = true;
         }
-        while let Ok((generation, result)) = self.encoder.output.try_recv() {
+        while let Ok((geometry, result)) = self.encoder.output.try_recv() {
             self.encoding_pending = false;
-            if generation != self.renderer.current_generation() {
+            if geometry.generation != self.renderer.current_generation() {
                 continue;
             }
             self.loading = false;
             match result {
-                Ok(proto) => self.image = Some(proto),
+                Ok(proto) => {
+                    self.image = Some(proto);
+                    self.displayed = Some(geometry);
+                    self.hovered = None;
+                    self.destination = None;
+                }
                 Err(err) => self.error = Some(format!("Image encoding: {err}")),
             }
             self.dirty = true;
         }
         if !self.encoding_pending {
             if let Some(input) = self.encode_latest.take() {
-                if input.0 == self.renderer.current_generation() {
+                if input.0.generation == self.renderer.current_generation() {
                     self.encoding_pending =
                         self.encoder.input.as_ref().unwrap().try_send(input).is_ok();
                 }
@@ -269,6 +377,27 @@ impl App {
         }
     }
     fn status(&self) -> String {
+        if let Some(action) = self.hovered.and_then(|i| {
+            self.displayed
+                .as_ref()?
+                .links
+                .as_ref()?
+                .links
+                .get(i)
+                .map(|l| &l.action)
+        }) {
+            return match action {
+                LinkAction::External(url) => {
+                    format!(" ↗ {}  [click to open]", links::sanitize(url))
+                }
+                LinkAction::Internal(d) => {
+                    format!(" → Page {}  [click to follow · b back]", d.page + 1)
+                }
+                LinkAction::Unsupported(reason) => {
+                    format!(" Unsupported link: {}", links::sanitize(reason))
+                }
+            };
+        }
         let name = self
             .source
             .file_name()
@@ -325,17 +454,21 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
             return;
         }
         let size = image.size();
-        let mut area = screen;
-        area.x += screen.width.saturating_sub(size.width) / 2;
-        area.y += screen.height.saturating_sub(size.height) / 2;
-        area.width = area.width.min(size.width);
-        area.height = area.height.min(size.height);
+        let area = links::image_area(screen, size);
+        app.image_area = area;
         f.render_widget(Image::new(image), area);
     }
+    if let Some((x, y)) = app.pointer {
+        app.hover_at(x, y);
+    }
     f.render_widget(
-        Paragraph::new(app.status()).style(
+        Paragraph::new(links::sanitize(&app.status())).style(
             Style::default()
-                .fg(Color::Rgb(195, 199, 208))
+                .fg(if app.hovered.is_some() {
+                    Color::LightCyan
+                } else {
+                    Color::Rgb(195, 199, 208)
+                })
                 .bg(Color::Rgb(35, 38, 44)),
         ),
         parts[1],
@@ -375,7 +508,20 @@ fn viewer_loop(path: PathBuf, doc: Arc<Document>, mut terminal: DefaultTerminal)
         GraphicsCleanup::new(picker.protocol_type() == ratatui_image::picker::ProtocolType::Kitty);
     let image_id = graphics.id;
     let tmux = env::var("TERM").is_ok_and(|v| v.starts_with("tmux"));
-    let encoder = Worker::new(move |(generation, image, size): EncodeInput, _| {
+    let encoder = Worker::new(move |(geometry, image, _size): EncodeInput, _| {
+        // Pad the last terminal cell instead of stretching the PDF pixels into
+        // ceil-sized Kitty placements. All backends now have identical pixel scale.
+        let cells = Size::new(
+            image.width().div_ceil(u32::from(font.width.max(1))) as u16,
+            image.height().div_ceil(u32::from(font.height.max(1))) as u16,
+        );
+        let mut padded = image::DynamicImage::new_rgba8(
+            u32::from(cells.width) * u32::from(font.width.max(1)),
+            u32::from(cells.height) * u32::from(font.height.max(1)),
+        );
+        image::imageops::overlay(&mut padded, &image, 0, 0);
+        let image = padded;
+        let size = cells;
         let result = if picker.protocol_type() == ratatui_image::picker::ProtocolType::Kitty {
             // Reuse only our own ID: upstream generates a new random ID per protocol
             // and does not release terminal-side image data on Drop.
@@ -388,7 +534,7 @@ fn viewer_loop(path: PathBuf, doc: Arc<Document>, mut terminal: DefaultTerminal)
         } else {
             picker.new_protocol(image, size, Resize::Crop(None))
         };
-        (generation, result)
+        (geometry, result)
     });
     let reloader = Worker::new(|(path, revision): (PathBuf, u64), stop| {
         Document::open_cancel(&path, revision, || {
@@ -400,7 +546,7 @@ fn viewer_loop(path: PathBuf, doc: Arc<Document>, mut terminal: DefaultTerminal)
     let mut app = App {
         source: path,
         view: View::new(doc.pages),
-        doc,
+        doc: doc.clone(),
         font_width: u32::from(font.width.max(1)),
         font_height: u32::from(font.height.max(1)),
         viewport: Viewport {
@@ -409,6 +555,14 @@ fn viewer_loop(path: PathBuf, doc: Arc<Document>, mut terminal: DefaultTerminal)
         },
         renderer,
         image: None,
+        displayed: None,
+        image_area: ratatui::layout::Rect::default(),
+        hovered: None,
+        pointer: None,
+        destination: None,
+        history: std::collections::VecDeque::new(),
+        browser: Worker::new(links::open_url),
+        browser_pending: false,
         completed,
         encoder,
         reloader,
@@ -417,7 +571,7 @@ fn viewer_loop(path: PathBuf, doc: Arc<Document>, mut terminal: DefaultTerminal)
         encoding_pending: false,
         encode_latest: None,
         jump: String::new(),
-        error: None,
+        error: doc.links.error.clone(),
         dirty: true,
         loading: false,
     };
@@ -455,8 +609,16 @@ fn viewer_loop(path: PathBuf, doc: Arc<Document>, mut terminal: DefaultTerminal)
                         break;
                     }
                 }
+                Event::Mouse(mouse) => app.on_mouse(mouse),
                 Event::Resize(width, height) => {
+                    app.hovered = None;
+                    app.image_area = ratatui::layout::Rect::default();
                     app.geometry(Size::new(width, height));
+                    app.dirty = true;
+                }
+                Event::FocusLost => {
+                    app.pointer = None;
+                    app.hovered = None;
                     app.dirty = true;
                 }
                 Event::FocusGained => {
@@ -472,6 +634,17 @@ fn viewer_loop(path: PathBuf, doc: Arc<Document>, mut terminal: DefaultTerminal)
 }
 
 fn main() -> Result<()> {
+    // Private bounded helper: parsing cannot stall the UI, leak threads, or make
+    // shutdown wait for an uninterruptible in-process PDF parser.
+    if env::args_os()
+        .nth(1)
+        .is_some_and(|s| s == "--extract-links")
+    {
+        let path = env::args_os().nth(2).context("missing snapshot")?;
+        let index = links::LinkIndex::extract(Path::new(&path))?;
+        serde_json::to_writer(std::io::stdout().lock(), &index)?;
+        return Ok(());
+    }
     let mut args = env::args_os();
     let _exe = args.next();
     let path = match (args.next(), args.next()) {
@@ -500,14 +673,22 @@ fn main() -> Result<()> {
     let doc = Arc::new(Document::open(&path, 1)?);
     let terminal = ratatui::try_init()?;
     let _restore = TerminalRestore;
-    crossterm::execute!(std::io::stdout(), event::EnableFocusChange)?;
+    crossterm::execute!(
+        std::io::stdout(),
+        event::EnableFocusChange,
+        event::EnableMouseCapture
+    )?;
     viewer_loop(path, doc, terminal)
 }
 
 struct TerminalRestore;
 impl Drop for TerminalRestore {
     fn drop(&mut self) {
-        let _ = crossterm::execute!(std::io::stdout(), event::DisableFocusChange);
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            event::DisableMouseCapture,
+            event::DisableFocusChange
+        );
         ratatui::restore();
     }
 }

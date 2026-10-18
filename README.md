@@ -35,11 +35,46 @@ versions, not the old Rust shipped by some distribution packages.
 | Digits + Enter | Jump to page (one-based) |
 | Backspace / Esc while entering digits | Edit / cancel page input |
 | `r` | Reload PDF |
+| `b` | Back to previous internal-link location |
 | `q`, Esc with no page input | Quit |
 
 One status bar shows the requested page, zoom, loading or error state. While
 loading, **the previous image remains visible** and is explicitly labelled as
 previous: do not mistake it for the requested page.
+
+## PDF hyperlinks
+
+Move the mouse over a PDF link to preview its destination in the cyan status
+bar. Left-click follows it; moving alone never opens a browser. Internal links
+support explicit page references and named destinations (`XYZ`, `Fit`, `FitH`,
+`FitV`, `FitR`). `b` restores the previous page, zoom and scroll (64-entry history,
+cleared on document reload). Fit/zoom requests respect Leafview's 50–300% limits.
+External `http`/`https` links open asynchronously using `xdg-open` (`xdg-utils`
+package). JavaScript, Launch, file URLs and other PDF actions cannot execute.
+
+Hit testing uses terminal **cells**, not mouse pixels: the cell center must be
+inside one link with at least half its area covered. Ambiguous cells, tiny links,
+padded image edges and stale/loading images cannot be activated. Zoom in if a
+small reference cannot be selected. Rotation, nonzero MediaBox/CropBox origins,
+scroll and image centering are included in the transform. The viewer still
+renders the MediaBox, matching its existing Poppler configuration; CropBox is
+not silently substituted. Nonrectangular QuadPoints links are currently skipped.
+
+Hover changes only the status bar: no Poppler render, image encoding or overlay
+is performed. This avoids corrupting Kitty placeholders in tmux. Pixel mouse mode
+1016 and a hand cursor are not implemented. Mouse capture is restored on exit.
+Tmux normally forwards application-requested mouse events; depending on your
+configuration you may need to enable mouse forwarding yourself. Leafview does
+not modify tmux mouse settings. Hold your terminal/tmux selection modifier when
+you need text selection rather than application mouse input.
+
+Annotations are parsed once per immutable document snapshot in a cancellable,
+resource-limited helper process (lopdf, no Tokio/GLib). Only extracted geometry
+and actions survive parsing, with caps of 100,000 links, 4096 annotations/page and
+32 MiB serialized metadata. Invalid/encrypted/oversized metadata disables links
+without disabling PDF rendering. Eager extraction can add document-load latency
+on very large PDFs; it never runs on mouse movement. Malformed destinations,
+FitB-family, remote GoTo and nonrectangular actions are unsupported, not guessed.
 
 ## Terminals and tmux
 
@@ -97,7 +132,7 @@ establish graphics support, halfblocks provide a lower-resolution fallback.
 The cache bound is **not a total RSS promise**: in-flight decoded/cropped images,
 encoded terminal strings, allocator overhead, the terminal and Poppler processes
 consume additional memory. Pathological PDFs may be rejected by the limits.
-No PDF text search, links, selection, passwords or outlines are implemented.
+No PDF text search, selection, passwords or outlines are implemented.
 
 ## Verification and development
 

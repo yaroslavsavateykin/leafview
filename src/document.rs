@@ -11,6 +11,7 @@ pub struct Document {
     snapshot: NamedTempFile,
     pub pages: u32,
     pub revision: u64,
+    pub links: crate::links::LinkIndex,
 }
 impl Document {
     pub fn open(source: &Path, revision: u64) -> Result<Self> {
@@ -46,7 +47,7 @@ impl Document {
         let mut output = crate::process::run(
             Command::new("pdfinfo").arg(snapshot.path()),
             65536,
-            cancelled,
+            &cancelled,
         )?;
         output.seek(SeekFrom::Start(0))?;
         let mut info = String::new();
@@ -59,7 +60,9 @@ impl Document {
             })
             .filter(|&n| n > 0)
             .context("pdfinfo did not report a valid page count")?;
+        let links = crate::links::LinkIndex::load(snapshot.path(), cancelled);
         Ok(Self {
+            links,
             snapshot,
             pages,
             revision,

@@ -75,8 +75,10 @@ pub struct Request {
     pub viewport: Viewport,
     pub x: u32,
     pub y: u32,
+    pub destination: Option<crate::links::Destination>,
 }
 pub struct Completed {
+    pub geometry: Option<crate::links::RenderGeometry>,
     pub generation: u64,
     pub image: Result<DynamicImage, String>,
     pub x: u32,
@@ -128,21 +130,38 @@ impl Renderer {
                     width: req.width,
                 };
                 let result = cached(&cache, key, req.doc.snapshot_path(), &cancelled).map(|r| {
-                    let (x, y, w, h) =
-                        crop_bounds(r.width(), r.height(), req.viewport, req.x, req.y);
-                    (r.crop_imm(x, y, w, h), x, y)
+                    let (sx, sy) = req.destination.as_ref().map_or((req.x, req.y), |d| {
+                        d.offsets((r.width(), r.height()), (req.x, req.y))
+                    });
+                    let (x, y, w, h) = crop_bounds(r.width(), r.height(), req.viewport, sx, sy);
+                    let geometry = crate::links::RenderGeometry {
+                        revision: req.doc.revision,
+                        page: req.page,
+                        generation: req.generation,
+                        raster: (r.width(), r.height()),
+                        crop: (x, y, w, h),
+                        links: req
+                            .doc
+                            .links
+                            .pages
+                            .get(req.page as usize)
+                            .cloned()
+                            .flatten(),
+                    };
+                    (r.crop_imm(x, y, w, h), x, y, geometry)
                 });
                 if cancelled() {
                     continue;
                 }
                 let success = result.is_ok();
-                let (image, x, y) = match result {
-                    Ok((img, x, y)) => (Ok(img), x, y),
-                    Err(e) => (Err(format!("{e:#}")), req.x, req.y),
+                let (image, x, y, geometry) = match result {
+                    Ok((img, x, y, geometry)) => (Ok(img), x, y, Some(geometry)),
+                    Err(e) => (Err(format!("{e:#}")), req.x, req.y, None),
                 };
                 // A full result slot is harmless: the UI will drain it and reschedule.
                 // Retrying is cancellable and cannot block shutdown.
                 let mut completed = Completed {
+                    geometry,
                     generation: req.generation,
                     image,
                     x,
@@ -395,6 +414,28 @@ mod tests {
         }
     }
     #[test]
+    fn annotation_geometry_matches_poppler_pixels() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/links.pdf");
+        let index = crate::links::LinkIndex::extract(&path).unwrap();
+        for page in [0, 2, 3, 4] {
+            let raster = rasterize(&path, page, 600, || false).unwrap().to_rgb8();
+            let links = index.pages[page as usize].as_ref().unwrap();
+            let r = links.links[0].bounds;
+            let (u, v) = links
+                .space
+                .to_display((r.x0 + r.x1) / 2., (r.y0 + r.y1) / 2.);
+            let p = raster.get_pixel(
+                (u * raster.width() as f64) as u32,
+                (v * raster.height() as f64) as u32,
+            );
+            assert!(
+                p[0] > 240 && p[1] < 20 && p[2] < 20,
+                "rotation {}: {p:?}",
+                links.space.rotation
+            );
+        }
+    }
+    #[test]
     fn raster_and_cache() {
         let img = Arc::new(rasterize(&fixture(), 1, 800, || false).unwrap());
         assert_eq!(img.width(), 800);
@@ -419,6 +460,7 @@ mod tests {
         for i in 0..1000 {
             renderer.request(Request {
                 generation: 0,
+                destination: None,
                 doc: doc.clone(),
                 page: i % 3,
                 width: 400,

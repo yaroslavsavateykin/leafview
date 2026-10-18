@@ -1,6 +1,25 @@
 use std::process::Command;
 
 #[test]
+fn extracts_snapshot_links_in_bounded_helper() {
+    let output = Command::new(env!("CARGO_BIN_EXE_leafview"))
+        .arg("--extract-links")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/links.pdf"
+        ))
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let data: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(data["pages"][0]["links"].as_array().unwrap().len(), 8);
+    assert_eq!(
+        data["pages"][0]["links"][1]["action"]["Internal"]["page"],
+        1
+    );
+}
+
+#[test]
 fn prints_usage_without_arguments() {
     let output = Command::new(env!("CARGO_BIN_EXE_leafview"))
         .output()
