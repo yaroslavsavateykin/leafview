@@ -6,6 +6,10 @@ license = "MIT"
 description = "Minimal, responsive PDF viewer for terminals and tmux"
 readme = "README.md"
 
+[features]
+default = []
+typst = ["dep:typst", "dep:typst-layout", "dep:typst-pdf", "dep:typst-kit"]
+
 [dependencies]
 anyhow = "1.0"
 base64 = "0.22"
@@ -21,10 +25,10 @@ serde = { version = "1.0.229", features = ["derive", "rc"] }
 serde_json = "1.0.154"
 signal-hook = "0.3"
 tempfile = "3"
-typst = "=0.15.1"
-typst-layout = "=0.15.1"
-typst-pdf = "=0.15.1"
-typst-kit = { version = "=0.15.1", features = ["embedded-fonts", "system-files", "scan-fonts", "system-downloader", "datetime"] }
+typst = { version = "=0.15.1", optional = true }
+typst-layout = { version = "=0.15.1", optional = true }
+typst-pdf = { version = "=0.15.1", optional = true }
+typst-kit = { version = "=0.15.1", optional = true, features = ["embedded-fonts", "system-files", "scan-fonts", "system-downloader", "datetime"] }
 
 [profile.release]
 lto = "thin"

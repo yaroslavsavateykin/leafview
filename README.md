@@ -49,11 +49,22 @@ leafview typst main.typ
 leafview typst "./notes with spaces/lecture.typ"
 ```
 
+Typst support is opt-in (ordinary PDF builds do not include the compiler):
+
+```sh
+cargo install --locked --features typst --path . -j 2
+```
+
+For a PDF-only installation, use `cargo install --locked --path .`.
+
 LeafView compiles the entry file in an owned background compiler process and
 shows the PDF using the **same renderer and graphics policy** as PDF mode.
-You do not need to run `typst watch`. The installed `typst` command is checked
+You do not need to run `typst watch`. Its CLI reports compilation status and
+can list dependencies, but does not export source-to-PDF coordinates or the
+changed layout region. LeafView instead reuses an incremental compiler world
+and reads source spans from that same compilation's layout. The installed `typst` command is checked
 at startup; compilation itself uses the pinned **Typst Rust API 0.15.1** bundled
-with LeafView, not a potentially different CLI version. This adds substantial
+with the `typst` feature, not a potentially different CLI version. This adds substantial
 build dependencies and a roughly 47 MiB release executable.
 
 After a save, dependency events are debounced for 200 ms. One compiler is reused

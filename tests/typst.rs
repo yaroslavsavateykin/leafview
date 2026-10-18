@@ -1,4 +1,5 @@
 //! End-to-end compiler process tests. No installed Typst CLI needed.
+#![cfg(feature = "typst")]
 use serde_json::{json, Value};
 use std::{
     io::Write,

@@ -6,7 +6,9 @@ mod link_tests;
 mod links;
 mod process;
 mod render;
+#[cfg(feature = "typst")]
 mod typst_compiler;
+#[cfg(feature = "typst")]
 mod typst_live;
 mod view;
 mod workers;
@@ -40,7 +42,9 @@ use view::{raster_width, View, Viewport};
 use workers::Worker;
 
 struct App {
+    #[cfg(feature = "typst")]
     live: Option<typst_live::Live>,
+    #[cfg(feature = "typst")]
     compile_millis: u64,
     doc: Arc<Document>,
     view: View,
@@ -250,22 +254,26 @@ impl App {
                     request = true;
                 }
             }
+            #[cfg(feature = "typst")]
             KeyCode::Char('s') if self.live.is_some() => {
                 let live = self.live.as_mut().unwrap();
                 live.auto_sync = !live.auto_sync;
                 self.dirty = true;
             }
+            #[cfg(feature = "typst")]
             KeyCode::Char('f') if self.live.is_some() => {
                 if let Some(location) = self.live.as_ref().and_then(|l| l.last.clone()) {
                     self.follow_source(&location);
                 }
             }
             KeyCode::Char('r') => {
+                #[cfg(feature = "typst")]
                 if let Some(live) = &mut self.live {
                     live.refresh();
-                } else {
-                    self.reload();
+                    self.dirty = true;
+                    return false;
                 }
+                self.reload();
                 self.dirty = true;
             }
             _ => {}
@@ -277,6 +285,7 @@ impl App {
         }
         false
     }
+    #[cfg(feature = "typst")]
     fn follow_source(&mut self, location: &typst_live::SourcePoint) {
         if location.page >= self.doc.pages {
             return;
@@ -320,6 +329,7 @@ impl App {
         self.schedule();
         self.dirty = true;
     }
+    #[cfg(feature = "typst")]
     fn consume_live(&mut self) {
         let Some(live) = &mut self.live else {
             return;
@@ -622,6 +632,9 @@ impl App {
                 abbreviate(err, 110)
             );
         }
+        #[cfg(not(feature = "typst"))]
+        let live_state = "";
+        #[cfg(feature = "typst")]
         let live_state = self
             .live
             .as_ref()
@@ -741,7 +754,7 @@ fn viewer_loop(
     path: PathBuf,
     doc: Arc<Document>,
     mut terminal: DefaultTerminal,
-    live: Option<typst_live::Live>,
+    #[cfg(feature = "typst")] live: Option<typst_live::Live>,
 ) -> Result<()> {
     let tmux =
         env::var_os("TMUX").is_some() || env::var("TERM").is_ok_and(|v| v.starts_with("tmux"));
@@ -822,7 +835,11 @@ fn viewer_loop(
             stop.load(std::sync::atomic::Ordering::SeqCst)
         })
     });
-    let (watcher, watched) = if live.is_none() {
+    #[cfg(not(feature = "typst"))]
+    let pdf_mode = true;
+    #[cfg(feature = "typst")]
+    let pdf_mode = live.is_none();
+    let (watcher, watched) = if pdf_mode {
         let (w, r) = watch(&path)?;
         (Some(w), r)
     } else {
@@ -831,7 +848,9 @@ fn viewer_loop(
     };
     let _watcher = watcher; // Keep the OS watcher alive for the duration of the viewer.
     let mut app = App {
+        #[cfg(feature = "typst")]
         live,
+        #[cfg(feature = "typst")]
         compile_millis: 0,
         source: path,
         view: View::new(doc.pages),
@@ -893,6 +912,7 @@ fn viewer_loop(
         if stopping.load(std::sync::atomic::Ordering::Relaxed) {
             break;
         }
+        #[cfg(feature = "typst")]
         app.consume_live();
         app.flush_render();
         app.consume();
@@ -954,6 +974,7 @@ fn viewer_loop(
 }
 
 fn main() -> Result<()> {
+    #[cfg(feature = "typst")]
     if env::args_os()
         .nth(1)
         .is_some_and(|s| s == "--typst-compiler")
@@ -997,6 +1018,11 @@ fn main() -> Result<()> {
             );
         }
     }
+    #[cfg(not(feature = "typst"))]
+    if typst_mode {
+        anyhow::bail!("Typst support is not enabled; install with: cargo install --locked --features typst --path .");
+    }
+    #[cfg(feature = "typst")]
     let mut live = if typst_mode {
         if CommandCheck::missing("typst") {
             anyhow::bail!("required command not found: typst");
@@ -1007,6 +1033,9 @@ fn main() -> Result<()> {
     };
     // Initial compilation runs in its owned worker before terminal entry. Errors
     // still enter the viewer with a placeholder, allowing edit/retry and quit.
+    #[cfg(not(feature = "typst"))]
+    let doc = Arc::new(Document::open(&path, 1)?);
+    #[cfg(feature = "typst")]
     let doc = if typst_mode {
         let placeholder = initial_placeholder()?;
         Arc::new(Document::open(placeholder.path(), 0)?)
@@ -1015,9 +1044,16 @@ fn main() -> Result<()> {
     };
     let terminal = ratatui::try_init()?;
     let _restore = TerminalRestore;
-    viewer_loop(path, doc, terminal, live.take())
+    viewer_loop(
+        path,
+        doc,
+        terminal,
+        #[cfg(feature = "typst")]
+        live.take(),
+    )
 }
 
+#[cfg(feature = "typst")]
 fn initial_placeholder() -> Result<tempfile::NamedTempFile> {
     // Poppler-valid blank PDF, held only long enough for Document's snapshot.
     let mut pdf = lopdf::Document::with_version("1.5");

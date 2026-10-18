@@ -1,5 +1,24 @@
 # Typst Live Preview verification — 2026-10-19
 
+## Optional Cargo feature update
+
+Typst is now opt-in: `cargo install --locked --features typst --path . -j 2`.
+Default builds exclude all four optional Typst dependencies, compiler/live modules,
+and compiler integration tests. A PDF-only binary rejects `leafview typst ...`
+with the exact installation hint before terminal entry. CI now tests both feature
+configurations. README updated accordingly; the historical install command below
+predates this change.
+
+Rechecked check/test/clippy for both configurations, PDF-only release + PTY smoke,
+Typst release + live PTY smoke (save-to-display 0.653 s), feature-disabled CLI
+regression test. Installed successfully using `--features typst`.
+No new real-terminal test for this packaging-only update; prior visual results
+below apply to the same compiler/navigation implementation.
+
+`typst watch` is not a source-map protocol: status/dependencies don't tell the
+changed PDF page or coordinates. The retained compiler world remains necessary
+for exact same-generation source mapping; no second watch compiler was added.
+
 ## Implementation and choice
 
 Base: clean main/origin/main at 1fdbb0d, fetched before work. Separate branch
