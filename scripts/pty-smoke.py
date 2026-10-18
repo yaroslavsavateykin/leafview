@@ -137,6 +137,39 @@ with tempfile.TemporaryDirectory(prefix="leafview-test-") as tmp:
         os.close(master)
         os.close(slave)
 
+    # Termination during rendering must use the normal resource/TTY cleanup path.
+    for sig in [signal.SIGTERM, signal.SIGHUP, signal.SIGINT]:
+        master, slave = pty.openpty()
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 90, 0, 0))
+        before = termios.tcgetattr(slave)
+        proc = subprocess.Popen([str(root / "target/release/leafview"), str(source)],
+                                stdin=slave, stdout=slave, stderr=slave,
+                                env={**env, "LEAFVIEW_GRAPHICS": "safe"}, start_new_session=True)
+        captured = bytearray()
+        try:
+            deadline = time.monotonic() + 5
+            while b'100%' not in captured and time.monotonic() < deadline:
+                if select.select([master], [], [], .02)[0]:
+                    captured.extend(os.read(master, 65536))
+            assert b'100%' in captured, 'signal test did not initialize'
+            # Let signal registration finish after the first frame.
+            time.sleep(.1)
+            os.write(master, b'+jlHL' * 20)
+            os.kill(proc.pid, sig)
+            deadline = time.monotonic() + 3
+            while proc.poll() is None and time.monotonic() < deadline:
+                if select.select([master], [], [], .02)[0]:
+                    captured.extend(os.read(master, 65536))
+            assert proc.wait(timeout=1) == 0, f'signal {sig}: abnormal exit'
+            assert termios.tcgetattr(slave) == before, f'signal {sig}: TTY not restored'
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+            os.close(master)
+            os.close(slave)
+    print('PASS: SIGTERM/SIGHUP/SIGINT during navigation restore TTY')
+
     # Simulate a Ghostty pane under tmux. In automatic safe mode, no Kitty
     # graphics (or capability query) must be emitted to an at-risk emulator.
     master, slave = pty.openpty()

@@ -1,5 +1,6 @@
 //! Leafview: a small terminal PDF viewer with latest-wins rendering and tmux graphics support.
 mod document;
+mod kitty;
 #[cfg(test)]
 mod link_tests;
 mod links;
@@ -44,7 +45,7 @@ struct App {
     font_height: u32,
     viewport: Viewport,
     renderer: Renderer,
-    image: Option<Protocol>,
+    image: Option<DisplayImage>,
     displayed: Option<RenderGeometry>,
     image_area: ratatui::layout::Rect,
     hovered: Option<usize>,
@@ -104,11 +105,21 @@ impl Drop for GraphicsCleanup {
     }
 }
 
+enum DisplayImage {
+    Kitty(kitty::KittyImage),
+    Other(Protocol),
+}
+impl DisplayImage {
+    fn size(&self) -> Size {
+        match self {
+            Self::Kitty(image) => image.size,
+            Self::Other(image) => image.size(),
+        }
+    }
+}
+
 type EncodeInput = (RenderGeometry, image::DynamicImage, Size);
-type EncodeOutput = (
-    RenderGeometry,
-    Result<Protocol, ratatui_image::errors::Errors>,
-);
+type EncodeOutput = (RenderGeometry, Result<DisplayImage>);
 
 impl App {
     // Bound request churn when the user holds a scroll/navigation key. Requests
@@ -406,8 +417,8 @@ impl App {
             {
                 continue;
             }
-            self.view.x = completed.x;
-            self.view.y = completed.y;
+            // Input can still arrive while encoding runs. Commit clamped offsets
+            // only together with the matching displayed image below.
             match completed.image {
                 Ok(image) => {
                     let size = Size::new(
@@ -436,6 +447,8 @@ impl App {
             self.loading = false;
             match result {
                 Ok(proto) => {
+                    self.view.x = geometry.crop.0;
+                    self.view.y = geometry.crop.1;
                     self.image = Some(proto);
                     self.displayed = Some(geometry);
                     self.hovered = None;
@@ -550,7 +563,10 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
         let size = image.size();
         let area = links::image_area(screen, size);
         app.image_area = area;
-        f.render_widget(Image::new(image), area);
+        match image {
+            DisplayImage::Kitty(image) => f.render_widget(image, area),
+            DisplayImage::Other(image) => f.render_widget(Image::new(image), area),
+        }
     }
     if let Some((x, y)) = app.pointer {
         app.hover_at(x, y);
@@ -670,10 +686,12 @@ fn viewer_loop(path: PathBuf, doc: Arc<Document>, mut terminal: DefaultTerminal)
                 image.width().div_ceil(u32::from(font.width.max(1))) as u16,
                 image.height().div_ceil(u32::from(font.height.max(1))) as u16,
             );
-            ratatui_image::protocol::kitty::Kitty::new(image, cells, image_id, tmux)
-                .map(Protocol::Kitty)
+            kitty::KittyImage::new(image, cells, image_id, tmux).map(DisplayImage::Kitty)
         } else {
-            picker.new_protocol(image, size, Resize::Crop(None))
+            picker
+                .new_protocol(image, size, Resize::Crop(None))
+                .map(DisplayImage::Other)
+                .map_err(anyhow::Error::from)
         };
         (geometry, result)
     });
@@ -722,8 +740,29 @@ fn viewer_loop(path: PathBuf, doc: Arc<Document>, mut terminal: DefaultTerminal)
         render_due: None,
     };
     app.geometry(terminal.size()?);
+    let stopping = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut signal_ids = Vec::new();
+    for signal in [
+        signal_hook::consts::SIGTERM,
+        signal_hook::consts::SIGHUP,
+        signal_hook::consts::SIGINT,
+    ] {
+        signal_ids.push(signal_hook::flag::register(signal, stopping.clone())?);
+    }
+    struct Signals(Vec<signal_hook::SigId>);
+    impl Drop for Signals {
+        fn drop(&mut self) {
+            for id in self.0.drain(..) {
+                signal_hook::low_level::unregister(id);
+            }
+        }
+    }
+    let _signals = Signals(signal_ids);
     let mut reload_due: Option<Instant> = None;
     loop {
+        if stopping.load(std::sync::atomic::Ordering::Relaxed) {
+            break;
+        }
         app.flush_render();
         app.consume();
         app.maybe_hint();

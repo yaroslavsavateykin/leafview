@@ -81,8 +81,6 @@ pub struct Completed {
     pub geometry: Option<crate::links::RenderGeometry>,
     pub generation: u64,
     pub image: Result<DynamicImage, String>,
-    pub x: u32,
-    pub y: u32,
 }
 struct Hint {
     doc: Arc<Document>,
@@ -98,6 +96,7 @@ struct Mailbox {
 pub struct Renderer {
     inbox: Arc<(Mutex<Mailbox>, Condvar)>,
     generation: Arc<AtomicU64>,
+    raster_key: Arc<Mutex<Option<Key>>>,
     stopped: Arc<AtomicBool>,
     cache: Arc<Mutex<Cache>>,
     worker: Option<thread::JoinHandle<()>>,
@@ -107,6 +106,8 @@ impl Renderer {
         let inbox = Arc::new((Mutex::new(Mailbox::default()), Condvar::new()));
         let generation = Arc::new(AtomicU64::new(0));
         let stopped = Arc::new(AtomicBool::new(false));
+        let raster_key = Arc::new(Mutex::new(None));
+        let desired_raster = raster_key.clone();
         let hint_pending = Arc::new(AtomicUsize::new(0));
         let cache: Arc<Mutex<Cache>> = Arc::new(Mutex::new(Cache::new(96 * 1024 * 1024)));
         let pool = rayon::ThreadPoolBuilder::new()
@@ -155,11 +156,24 @@ impl Renderer {
                             continue;
                         }
                         wp.fetch_add(1, Ordering::SeqCst);
-                        let (cache, stopped, pending, doc) =
-                            (wc.clone(), ws.clone(), wp.clone(), hint.doc);
+                        let (cache, stopped, pending, doc, generation) =
+                            (wc.clone(), ws.clone(), wp.clone(), hint.doc, wg.clone());
+                        let started_generation = generation.load(Ordering::SeqCst);
                         pool.spawn(move || {
-                            let cancelled = || stopped.load(Ordering::SeqCst);
-                            let _ = cached(&cache, key, doc.snapshot_path(), &cancelled);
+                            let cancelled = || {
+                                stopped.load(Ordering::SeqCst)
+                                    || generation.load(Ordering::SeqCst) != started_generation
+                            };
+                            if let Ok(image) =
+                                rasterize(doc.snapshot_path(), key.page, key.width, cancelled)
+                            {
+                                if !cancelled() {
+                                    cache
+                                        .lock()
+                                        .unwrap()
+                                        .insert_prefetched(key, Arc::new(image));
+                                }
+                            }
                             pending.fetch_sub(1, Ordering::SeqCst);
                         });
                     }
@@ -175,34 +189,40 @@ impl Renderer {
                     page: req.page,
                     width: req.width,
                 };
-                let result = cached(&wc, key, req.doc.snapshot_path(), &cancelled).map(|r| {
-                    let (sx, sy) = req.destination.as_ref().map_or((req.x, req.y), |d| {
-                        d.offsets((r.width(), r.height()), (req.x, req.y))
+                // Scrolling changes the crop, not the raster. Let Poppler finish
+                // useful work for the latest page/width even when its crop is
+                // superseded; otherwise key-repeat can starve a cache miss forever.
+                let raster_cancelled =
+                    || ws.load(Ordering::SeqCst) || *desired_raster.lock().unwrap() != Some(key);
+                let result =
+                    cached(&wc, key, req.doc.snapshot_path(), &raster_cancelled).map(|r| {
+                        let (sx, sy) = req.destination.as_ref().map_or((req.x, req.y), |d| {
+                            d.offsets((r.width(), r.height()), (req.x, req.y))
+                        });
+                        let (x, y, w, h) = crop_bounds(r.width(), r.height(), req.viewport, sx, sy);
+                        let geometry = crate::links::RenderGeometry {
+                            revision: req.doc.revision,
+                            page: req.page,
+                            generation: req.generation,
+                            raster: (r.width(), r.height()),
+                            crop: (x, y, w, h),
+                            links: req
+                                .doc
+                                .links
+                                .pages
+                                .get(req.page as usize)
+                                .cloned()
+                                .flatten(),
+                        };
+                        (r.crop_imm(x, y, w, h), x, y, geometry)
                     });
-                    let (x, y, w, h) = crop_bounds(r.width(), r.height(), req.viewport, sx, sy);
-                    let geometry = crate::links::RenderGeometry {
-                        revision: req.doc.revision,
-                        page: req.page,
-                        generation: req.generation,
-                        raster: (r.width(), r.height()),
-                        crop: (x, y, w, h),
-                        links: req
-                            .doc
-                            .links
-                            .pages
-                            .get(req.page as usize)
-                            .cloned()
-                            .flatten(),
-                    };
-                    (r.crop_imm(x, y, w, h), x, y, geometry)
-                });
                 if cancelled() {
                     continue;
                 }
                 let success = result.is_ok();
-                let (image, x, y, geometry) = match result {
-                    Ok((img, x, y, geometry)) => (Ok(img), x, y, Some(geometry)),
-                    Err(e) => (Err(format!("{e:#}")), req.x, req.y, None),
+                let (image, geometry) = match result {
+                    Ok((img, _, _, geometry)) => (Ok(img), Some(geometry)),
+                    Err(e) => (Err(format!("{e:#}")), None),
                 };
                 // A full result slot is harmless: the UI will drain it and reschedule.
                 // Retrying is cancellable and cannot block shutdown.
@@ -210,8 +230,6 @@ impl Renderer {
                     geometry,
                     generation: req.generation,
                     image,
-                    x,
-                    y,
                 };
                 loop {
                     match tx.try_send(completed) {
@@ -273,12 +291,18 @@ impl Renderer {
         Ok(Self {
             inbox,
             generation,
+            raster_key,
             stopped,
             cache,
             worker: Some(worker),
         })
     }
     pub fn request(&self, mut request: Request) {
+        *self.raster_key.lock().unwrap() = Some(Key {
+            revision: request.doc.revision,
+            page: request.page,
+            width: request.width,
+        });
         request.generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         let (lock, cv) = &*self.inbox;
         let mut slot = lock.lock().unwrap();
@@ -555,6 +579,33 @@ mod tests {
         let start = std::time::Instant::now();
         drop(renderer);
         assert!(start.elapsed() < std::time::Duration::from_secs(2));
+    }
+    #[test]
+    fn scroll_requests_preserve_raster_work() {
+        use std::time::{Duration, Instant};
+        let doc = Arc::new(Document::open(&fixture(), 1).unwrap());
+        let (tx, _rx) = std::sync::mpsc::sync_channel(1);
+        let renderer = Renderer::new(tx).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut y = 0;
+        while !renderer.cache_contains(1, 0, 1800) {
+            assert!(Instant::now() < deadline, "scrolling starved raster cache");
+            renderer.request(Request {
+                generation: 0,
+                destination: None,
+                doc: doc.clone(),
+                page: 0,
+                width: 1800,
+                viewport: Viewport {
+                    width: 800,
+                    height: 600,
+                },
+                x: 0,
+                y,
+            });
+            y += 1;
+            thread::sleep(Duration::from_millis(2));
+        }
     }
     #[test]
     fn hover_hint_warms_cache() {
