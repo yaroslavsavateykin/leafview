@@ -42,6 +42,62 @@ One status bar shows the requested page, zoom, loading or error state. While
 loading, **the previous image remains visible** and is explicitly labelled as
 previous: do not mistake it for the requested page.
 
+## Typst Live Preview
+
+```sh
+leafview typst main.typ
+leafview typst "./notes with spaces/lecture.typ"
+```
+
+LeafView compiles the entry file in an owned background compiler process and
+shows the PDF using the **same renderer and graphics policy** as PDF mode.
+You do not need to run `typst watch`. The installed `typst` command is checked
+at startup; compilation itself uses the pinned **Typst Rust API 0.15.1** bundled
+with LeafView, not a potentially different CLI version. This adds substantial
+build dependencies and a roughly 47 MiB release executable.
+
+After a save, dependency events are debounced for 200 ms. One compiler is reused
+for incremental compilation; at most one job is running and one latest request
+is pending. Newer edits invalidate older results. PDF and source coordinates
+always come from the same compiled layout. Output stays in a private temporary
+directory: your existing `main.pdf` is **not overwritten**. Compilation errors
+keep the previous PDF visible; fix and save again, or press `r` to retry. An
+initial error shows a blank placeholder until compilation succeeds.
+
+Changes in included/imported files and compiler-known resources also trigger a
+build. LeafView watches dependency **parent directories non-recursively**, so
+Neovim atomic saves work without recursively watching your home directory. The
+entry file is the root document; the project root defaults to its parent. Set
+`TYPST_ROOT=/path/to/project` for a different root. `TYPST_FONT_PATHS` is supported;
+other Typst CLI flags/sys.inputs/package overrides are not currently exposed.
+
+| Key in Typst mode | Action |
+| --- | --- |
+| `s` | Toggle automatic source synchronization (shown as `sync on/off`) |
+| `f` | Follow the last mapped edit manually |
+| `r` | Recompile |
+
+Source synchronization compares successful source snapshots, selects the last
+changed character/token in the most recently changed source file, then uses
+compiler glyph spans to find its new PDF coordinates. Multiple disjoint edits
+in one save deterministically select the last change in file order; deletion
+uses the nearest surviving mapped token. Repeated spans on different pages,
+style-only changes without glyph correspondence and resource-only changes do
+not force an arbitrary jump. Manual navigation stays put until a new mapped
+source change; zoom is preserved, and a target already visible does not scroll.
+Otherwise it is positioned near the upper/left third of the viewport.
+
+Limits: one compile has a 60 s timeout and a 3 GiB address-space cap; source
+snapshots are capped at 16 MiB, the map at 500,000 glyph entries. Mapping covers
+text/math glyphs, not arbitrary shape/image source expressions. Highly dynamic
+macros, generated content and multi-location spans can remain unmapped. Glyph
+coordinates indicate a baseline, not an exact selection rectangle. Native
+Ghostty+tmux graphics limitations from [AUDIT-2026-10-19.md](AUDIT-2026-10-19.md)
+still apply; this feature does **not** silently bypass existing safety mode.
+
+See [TYPST-VERIFICATION.md](TYPST-VERIFICATION.md) for actual tests, measurements
+and remaining gaps. Additional automated check: `python3 scripts/typst-smoke.py`.
+
 ## PDF hyperlinks
 
 Move the mouse over a PDF link to preview its destination in the cyan status

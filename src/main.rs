@@ -6,6 +6,8 @@ mod link_tests;
 mod links;
 mod process;
 mod render;
+mod typst_compiler;
+mod typst_live;
 mod view;
 mod workers;
 
@@ -38,6 +40,8 @@ use view::{raster_width, View, Viewport};
 use workers::Worker;
 
 struct App {
+    live: Option<typst_live::Live>,
+    compile_millis: u64,
     doc: Arc<Document>,
     view: View,
     source: PathBuf,
@@ -246,8 +250,22 @@ impl App {
                     request = true;
                 }
             }
+            KeyCode::Char('s') if self.live.is_some() => {
+                let live = self.live.as_mut().unwrap();
+                live.auto_sync = !live.auto_sync;
+                self.dirty = true;
+            }
+            KeyCode::Char('f') if self.live.is_some() => {
+                if let Some(location) = self.live.as_ref().and_then(|l| l.last.clone()) {
+                    self.follow_source(&location);
+                }
+            }
             KeyCode::Char('r') => {
-                self.reload();
+                if let Some(live) = &mut self.live {
+                    live.refresh();
+                } else {
+                    self.reload();
+                }
                 self.dirty = true;
             }
             _ => {}
@@ -258,6 +276,78 @@ impl App {
             self.dirty = true;
         }
         false
+    }
+    fn follow_source(&mut self, location: &typst_live::SourcePoint) {
+        if location.page >= self.doc.pages {
+            return;
+        }
+        let Some(links) = self
+            .doc
+            .links
+            .pages
+            .get(location.page as usize)
+            .and_then(|p| p.as_ref())
+        else {
+            return;
+        };
+        let space = links.space;
+        let width = raster_width(&self.view, self.viewport);
+        let (pw, ph) = space.size();
+        let height = width as f64 * ph / pw;
+        let px = location.x * width as f64;
+        let py = location.y * height;
+        if self.view.page == location.page
+            && px >= self.view.x as f64
+            && px < (self.view.x + self.viewport.width) as f64
+            && py >= self.view.y as f64
+            && py < (self.view.y + self.viewport.height) as f64
+        {
+            return;
+        }
+        let nx = (px - self.viewport.width as f64 / 3.).max(0.) / width as f64;
+        let ny = (py - self.viewport.height as f64 / 3.).max(0.) / height;
+        let (left, top) = space.to_pdf(nx, ny);
+        self.view.page = location.page;
+        self.destination = Some(Destination {
+            page: location.page,
+            space,
+            kind: links::DestinationKind::Xyz {
+                left: Some(left),
+                top: Some(top),
+                zoom: None,
+            },
+        });
+        self.schedule();
+        self.dirty = true;
+    }
+    fn consume_live(&mut self) {
+        let Some(live) = &mut self.live else {
+            return;
+        };
+        let was_compiling = live.compiling;
+        let update = live.poll();
+        if was_compiling != live.compiling {
+            self.dirty = true;
+        }
+        let auto_sync = live.auto_sync;
+        if let Some(update) = update {
+            self.compile_millis = update.millis;
+            self.error = update.error;
+            if let Some(doc) = update.document {
+                debug_assert_eq!(doc.revision, update.generation);
+                self.view.set_pages(doc.pages);
+                self.history.clear();
+                self.destination = None;
+                self.doc = Arc::new(doc);
+                self.schedule();
+                if auto_sync {
+                    if let Some(location) = update.location {
+                        self.follow_source(&location);
+                    }
+                }
+            }
+            self.dirty = true;
+        }
     }
     fn reload(&mut self) {
         if self.reload_pending {
@@ -447,6 +537,20 @@ impl App {
             self.loading = false;
             match result {
                 Ok(proto) => {
+                    if let Some(path) = env::var_os("LEAFVIEW_TRACE") {
+                        use std::io::Write;
+                        if let Ok(mut file) = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(path)
+                        {
+                            let _ = writeln!(
+                                file,
+                                "{}",
+                                serde_json::json!({"revision": geometry.revision, "page": geometry.page, "zoom": self.view.zoom, "crop": geometry.crop, "raster": geometry.raster})
+                            );
+                        }
+                    }
                     self.view.x = geometry.crop.0;
                     self.view.y = geometry.crop.1;
                     self.image = Some(proto);
@@ -518,6 +622,18 @@ impl App {
                 abbreviate(err, 110)
             );
         }
+        let live_state = self
+            .live
+            .as_ref()
+            .map(|live| {
+                format!(
+                    "Typst {} · sync {} · {}ms · ",
+                    if live.compiling { "compiling" } else { "ready" },
+                    if live.auto_sync { "on" } else { "off" },
+                    self.compile_millis
+                )
+            })
+            .unwrap_or_default();
         let state = if self.graphics_safe {
             "Halfblocks (Ghostty/tmux safety mode) · "
         } else if self.backend == ratatui_image::picker::ProtocolType::Halfblocks {
@@ -530,11 +646,12 @@ impl App {
             ""
         };
         format!(
-            " {}  {}/{}   {:.0}%   {}j/k scroll · h/l pages · +/- zoom · r reload · q quit",
+            " {}  {}/{}   {:.0}%   {}{}j/k scroll · h/l pages · +/- zoom · r reload · q quit",
             name,
             self.view.page + 1,
             self.view.pages,
             self.view.zoom * 100.0,
+            live_state,
             state
         )
     }
@@ -620,7 +737,12 @@ fn use_safe_graphics(tmux: bool, ghostty: bool, mode: &str) -> bool {
     }
 }
 
-fn viewer_loop(path: PathBuf, doc: Arc<Document>, mut terminal: DefaultTerminal) -> Result<()> {
+fn viewer_loop(
+    path: PathBuf,
+    doc: Arc<Document>,
+    mut terminal: DefaultTerminal,
+    live: Option<typst_live::Live>,
+) -> Result<()> {
     let tmux =
         env::var_os("TMUX").is_some() || env::var("TERM").is_ok_and(|v| v.starts_with("tmux"));
     let ghostty = env::var("TERM_PROGRAM").is_ok_and(|v| v.eq_ignore_ascii_case("ghostty"))
@@ -700,9 +822,17 @@ fn viewer_loop(path: PathBuf, doc: Arc<Document>, mut terminal: DefaultTerminal)
             stop.load(std::sync::atomic::Ordering::SeqCst)
         })
     });
-    let (watcher, watched) = watch(&path)?;
+    let (watcher, watched) = if live.is_none() {
+        let (w, r) = watch(&path)?;
+        (Some(w), r)
+    } else {
+        let (_, r) = mpsc::channel();
+        (None, r)
+    };
     let _watcher = watcher; // Keep the OS watcher alive for the duration of the viewer.
     let mut app = App {
+        live,
+        compile_millis: 0,
         source: path,
         view: View::new(doc.pages),
         doc: doc.clone(),
@@ -763,6 +893,7 @@ fn viewer_loop(path: PathBuf, doc: Arc<Document>, mut terminal: DefaultTerminal)
         if stopping.load(std::sync::atomic::Ordering::Relaxed) {
             break;
         }
+        app.consume_live();
         app.flush_render();
         app.consume();
         app.maybe_hint();
@@ -823,6 +954,12 @@ fn viewer_loop(path: PathBuf, doc: Arc<Document>, mut terminal: DefaultTerminal)
 }
 
 fn main() -> Result<()> {
+    if env::args_os()
+        .nth(1)
+        .is_some_and(|s| s == "--typst-compiler")
+    {
+        return typst_compiler::serve();
+    }
     // Private bounded helper: parsing cannot stall the UI, leak threads, or make
     // shutdown wait for an uninterruptible in-process PDF parser.
     if env::args_os()
@@ -836,11 +973,12 @@ fn main() -> Result<()> {
     }
     let mut args = env::args_os();
     let _exe = args.next();
-    let path = match (args.next(), args.next()) {
-        (Some(path), None) => PathBuf::from(path),
+    let (path, typst_mode) = match (args.next(), args.next(), args.next(), args.next()) {
+        (Some(mode), Some(path), None, None) if mode == "typst" => (PathBuf::from(path), true),
+        (Some(path), None, None, None) => (PathBuf::from(path), false),
         _ => {
             eprintln!(
-                "Usage: leafview <file.pdf>\n\nRequires Poppler: sudo apt install poppler-utils"
+                "Usage: leafview <file.pdf>\n       leafview typst <file.typ>\n\nRequires Poppler: sudo apt install poppler-utils"
             );
             std::process::exit(2)
         }
@@ -859,10 +997,41 @@ fn main() -> Result<()> {
             );
         }
     }
-    let doc = Arc::new(Document::open(&path, 1)?);
+    let mut live = if typst_mode {
+        if CommandCheck::missing("typst") {
+            anyhow::bail!("required command not found: typst");
+        }
+        Some(typst_live::Live::new(&path)?)
+    } else {
+        None
+    };
+    // Initial compilation runs in its owned worker before terminal entry. Errors
+    // still enter the viewer with a placeholder, allowing edit/retry and quit.
+    let doc = if typst_mode {
+        let placeholder = initial_placeholder()?;
+        Arc::new(Document::open(placeholder.path(), 0)?)
+    } else {
+        Arc::new(Document::open(&path, 1)?)
+    };
     let terminal = ratatui::try_init()?;
     let _restore = TerminalRestore;
-    viewer_loop(path, doc, terminal)
+    viewer_loop(path, doc, terminal, live.take())
+}
+
+fn initial_placeholder() -> Result<tempfile::NamedTempFile> {
+    // Poppler-valid blank PDF, held only long enough for Document's snapshot.
+    let mut pdf = lopdf::Document::with_version("1.5");
+    let pages = pdf.new_object_id();
+    let page = pdf.add_object(lopdf::dictionary! { "Type" => "Page", "Parent" => pages, "MediaBox" => vec![0.into(),0.into(),595.into(),842.into()] });
+    pdf.objects.insert(
+        pages,
+        lopdf::dictionary! { "Type" => "Pages", "Kids" => vec![page.into()], "Count" => 1 }.into(),
+    );
+    let catalog = pdf.add_object(lopdf::dictionary! { "Type" => "Catalog", "Pages" => pages });
+    pdf.trailer.set("Root", catalog);
+    let file = tempfile::NamedTempFile::new()?;
+    pdf.save(file.path())?;
+    Ok(file)
 }
 
 struct TerminalRestore;
