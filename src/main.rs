@@ -10,7 +10,8 @@ mod workers;
 
 use anyhow::{Context, Result};
 use crossterm::event::{
-    self, Event, KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
 };
 use document::Document;
 use links::{Destination, LinkAction, RenderGeometry};
@@ -65,18 +66,23 @@ struct App {
     dirty: bool,
     loading: bool,
     backend: ratatui_image::picker::ProtocolType,
+    graphics_safe: bool,
+    last_render_at: Option<Instant>,
+    render_due: Option<Instant>,
 }
 
 // Only targeted Kitty deletion: never erase images belonging to adjacent panes.
 struct GraphicsCleanup {
     id: u32,
     enabled: bool,
+    tmux: bool,
 }
 impl GraphicsCleanup {
-    fn new(enabled: bool) -> Self {
+    fn new(enabled: bool, tmux: bool) -> Self {
         Self {
             id: std::process::id(),
             enabled,
+            tmux,
         }
     }
 }
@@ -87,7 +93,7 @@ impl Drop for GraphicsCleanup {
             return;
         }
         let seq = format!("\x1b_Ga=d,d=I,i={},q=2;\x1b\\", self.id);
-        let seq = if env::var("TERM").is_ok_and(|v| v.starts_with("tmux")) {
+        let seq = if self.tmux {
             format!("\x1bPtmux;{}\x1b\\", seq.replace('\x1b', "\x1b\x1b"))
         } else {
             seq
@@ -105,12 +111,34 @@ type EncodeOutput = (
 );
 
 impl App {
+    // Bound request churn when the user holds a scroll/navigation key. Requests
+    // still use latest-wins semantics, but we don't restart Poppler on every
+    // auto-repeat and overwhelm Kitty/tmux with obsolete images.
     fn schedule(&mut self) {
         if self.viewport.width == 0 || self.viewport.height == 0 {
             return;
         }
         self.loading = true;
         self.hovered = None;
+        self.hover_deadline = None;
+        const MIN_INTERVAL: Duration = Duration::from_millis(75);
+        if let Some(last) = self.last_render_at {
+            let earliest = last + MIN_INTERVAL;
+            if Instant::now() < earliest {
+                self.render_due = Some(earliest);
+                return;
+            }
+        }
+        self.dispatch_render();
+    }
+    fn flush_render(&mut self) {
+        if self.render_due.is_some_and(|due| Instant::now() >= due) {
+            self.dispatch_render();
+        }
+    }
+    fn dispatch_render(&mut self) {
+        self.render_due = None;
+        self.last_render_at = Some(Instant::now());
         self.renderer.request(Request {
             generation: 0,
             destination: self.destination.clone(),
@@ -143,6 +171,7 @@ impl App {
         }
         let mut request = false;
         match key.code {
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
             KeyCode::Char('q') => return true,
             KeyCode::Esc if self.jump.is_empty() => return true,
             KeyCode::Esc => {
@@ -225,12 +254,22 @@ impl App {
             return;
         }
         self.reload_pending = true;
-        let _ = self
+        if let Err(err) = self
             .reloader
             .input
             .as_ref()
             .unwrap()
-            .try_send((self.source.clone(), self.doc.revision + 1));
+            .try_send((self.source.clone(), self.doc.revision + 1))
+        {
+            if matches!(err, mpsc::TrySendError::Disconnected(_)) {
+                self.reload_pending = false;
+                self.error = Some("PDF reload worker stopped unexpectedly".into());
+            } else {
+                // A pending reload is retried when the current worker completes.
+                self.reload_pending = false;
+                self.reload_again = true;
+            }
+        }
     }
     fn finish_reload(&mut self, result: Result<Document>) {
         self.reload_pending = false;
@@ -362,7 +401,9 @@ impl App {
             }
         }
         while let Ok(completed) = self.completed.try_recv() {
-            if completed.generation != self.renderer.current_generation() {
+            if completed.generation != self.renderer.current_generation()
+                || self.render_due.is_some()
+            {
                 continue;
             }
             self.view.x = completed.x;
@@ -387,7 +428,9 @@ impl App {
         }
         while let Ok((geometry, result)) = self.encoder.output.try_recv() {
             self.encoding_pending = false;
-            if geometry.generation != self.renderer.current_generation() {
+            if geometry.generation != self.renderer.current_generation()
+                || self.render_due.is_some()
+            {
                 continue;
             }
             self.loading = false;
@@ -406,8 +449,19 @@ impl App {
         if !self.encoding_pending {
             if let Some(input) = self.encode_latest.take() {
                 if input.0.generation == self.renderer.current_generation() {
-                    self.encoding_pending =
-                        self.encoder.input.as_ref().unwrap().try_send(input).is_ok();
+                    match self.encoder.input.as_ref().unwrap().try_send(input) {
+                        Ok(()) => self.encoding_pending = true,
+                        Err(mpsc::TrySendError::Full(input)) => {
+                            // Keep the newest image; do not lose it when the
+                            // bounded worker queue is momentarily full.
+                            self.encode_latest = Some(input);
+                        }
+                        Err(mpsc::TrySendError::Disconnected(_)) => {
+                            self.loading = false;
+                            self.error = Some("Image encoding worker stopped unexpectedly".into());
+                            self.dirty = true;
+                        }
+                    }
                 }
             }
         }
@@ -451,7 +505,9 @@ impl App {
                 abbreviate(err, 110)
             );
         }
-        let state = if self.backend == ratatui_image::picker::ProtocolType::Halfblocks {
+        let state = if self.graphics_safe {
+            "Halfblocks (Ghostty/tmux safety mode) · "
+        } else if self.backend == ratatui_image::picker::ProtocolType::Halfblocks {
             "Halfblocks (low resolution) · "
         } else if self.loading {
             "Loading (previous image)…  "
@@ -536,12 +592,40 @@ fn watch(
     Ok((watcher, rx))
 }
 
+// Ghostty has documented process-wide crashes when Kitty graphics are emitted
+// through tmux (especially with mouse forwarding). A child process cannot
+// recover a terminal emulator which itself crashes. Default to the bounded
+// text-cell backend for this combination, with explicit native opt-in.
+fn use_safe_graphics(tmux: bool, ghostty: bool, mode: &str) -> bool {
+    match mode {
+        "safe" | "halfblocks" => true,
+        "native" => false,
+        _ => tmux && ghostty,
+    }
+}
+
 fn viewer_loop(path: PathBuf, doc: Arc<Document>, mut terminal: DefaultTerminal) -> Result<()> {
+    let tmux =
+        env::var_os("TMUX").is_some() || env::var("TERM").is_ok_and(|v| v.starts_with("tmux"));
+    let ghostty = env::var("TERM_PROGRAM").is_ok_and(|v| v.eq_ignore_ascii_case("ghostty"))
+        || env::var_os("GHOSTTY_RESOURCES_DIR").is_some();
+    let graphics_safe = use_safe_graphics(
+        tmux,
+        ghostty,
+        &env::var("LEAFVIEW_GRAPHICS")
+            .unwrap_or_default()
+            .to_ascii_lowercase(),
+    );
     // Picker queries must occur after alternate-screen entry, before event polling.
-    let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
+    // In safe mode skip the graphics query entirely.
+    let picker = if graphics_safe {
+        Picker::halfblocks()
+    } else {
+        Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks())
+    };
     if env::var("LEAFVIEW_DEBUG").is_ok() {
         eprintln!(
-            "leafview: protocol={:?} font={:?} tmux_env={:?} term={:?} term_program={:?}",
+            "leafview: protocol={:?} font={:?} tmux_env={:?} term={:?} term_program={:?} graphics_safe={graphics_safe}",
             picker.protocol_type(),
             picker.font_size(),
             env::var("TMUX").is_ok(),
@@ -560,10 +644,11 @@ fn viewer_loop(path: PathBuf, doc: Arc<Document>, mut terminal: DefaultTerminal)
     let font = picker.font_size();
     let (tx_completed, completed) = mpsc::sync_channel(1);
     let renderer = Renderer::new(tx_completed)?;
-    let graphics =
-        GraphicsCleanup::new(picker.protocol_type() == ratatui_image::picker::ProtocolType::Kitty);
+    let graphics = GraphicsCleanup::new(
+        picker.protocol_type() == ratatui_image::picker::ProtocolType::Kitty,
+        tmux,
+    );
     let image_id = graphics.id;
-    let tmux = env::var("TERM").is_ok_and(|v| v.starts_with("tmux"));
     let encoder = Worker::new(move |(geometry, image, _size): EncodeInput, _| {
         // Pad the last terminal cell instead of stretching the PDF pixels into
         // ceil-sized Kitty placements. All backends now have identical pixel scale.
@@ -632,10 +717,14 @@ fn viewer_loop(path: PathBuf, doc: Arc<Document>, mut terminal: DefaultTerminal)
         dirty: true,
         loading: false,
         backend,
+        graphics_safe,
+        last_render_at: None,
+        render_due: None,
     };
     app.geometry(terminal.size()?);
     let mut reload_due: Option<Instant> = None;
     loop {
+        app.flush_render();
         app.consume();
         app.maybe_hint();
         while let Ok(event) = watched.try_recv() {
@@ -758,5 +847,20 @@ impl CommandCheck {
             .stderr(std::process::Stdio::null())
             .status()
             .is_err()
+    }
+}
+
+#[cfg(test)]
+mod graphics_safety_tests {
+    use super::use_safe_graphics;
+
+    #[test]
+    fn ghostty_tmux_defaults_to_safe_backend() {
+        assert!(use_safe_graphics(true, true, "auto"));
+        assert!(use_safe_graphics(true, true, ""));
+        assert!(!use_safe_graphics(false, true, "auto"));
+        assert!(!use_safe_graphics(true, false, "auto"));
+        assert!(use_safe_graphics(false, false, "safe"));
+        assert!(!use_safe_graphics(true, true, "native"));
     }
 }
