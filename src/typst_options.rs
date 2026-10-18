@@ -18,6 +18,7 @@ pub struct Options {
     pub features: Vec<String>,
     pub pretty: bool,
     pub no_tags: bool,
+    pub no_pdf: bool,
     pub standards: Vec<String>,
     pub pages: Option<String>,
 }
@@ -81,6 +82,7 @@ impl Options {
                 "--features" => options.features = value()?.to_string_lossy().split(',').map(str::to_owned).collect(),
                 "--pdf-standard" => options.standards.extend(value()?.to_string_lossy().split(',').map(str::to_owned)),
                 "--pages" => options.pages = Some(value()?.to_string_lossy().into_owned()),
+                "--no-pdf" => { anyhow::ensure!(inline.is_none(), "--no-pdf takes no value"); options.no_pdf = true; }
                 "--pretty" | "--no-pdf-tags" | "--ignore-system-fonts" | "--ignore-embedded-fonts" => {
                     anyhow::ensure!(inline.is_none(), "{flag} takes no value");
                     match flag { "--pretty" => options.pretty=true, "--no-pdf-tags" => options.no_tags=true, "--ignore-system-fonts" => options.ignore_system=true, _ => options.ignore_embedded=true }
@@ -107,7 +109,7 @@ fn env_bool(key: &str) -> Result<bool> {
         _ => bail!("invalid boolean in {key}"),
     }
 }
-pub const HELP: &str = "Usage: leafview typst [OPTIONS] <file.typ>\n\nCompilation: --root DIR, --input key=value (repeatable), --font-path DIR,\n  --ignore-system-fonts, --ignore-embedded-fonts, --package-path DIR,\n  --package-cache-path DIR, --cert PATH, --creation-timestamp SECONDS,\n  -j/--jobs N, --features LIST, --pdf-standard LIST, --pages RANGES,\n  --no-pdf-tags, --pretty, -f/--format pdf.\nUI diagnostics: --diagnostic-format human|short, --color auto|always|never\n  (accepted; LeafView always sanitizes short status messages).\n--ppi is accepted but affects PNG export only, not PDF.\nExport/server flags --deps, --deps-format, --make-deps, --timings, --open,\n  --no-serve, --no-reload, --port are rejected explicitly.\nOutput is private, format is PDF; no user output file is overwritten.\n--help/-h shows this help; --version/-V shows the embedded compiler version.";
+pub const HELP: &str = "Usage: leafview typst [OPTIONS] <file.typ>\n\nCompilation: --root DIR, --input key=value (repeatable), --font-path DIR,\n  --ignore-system-fonts, --ignore-embedded-fonts, --package-path DIR,\n  --package-cache-path DIR, --cert PATH, --creation-timestamp SECONDS,\n  -j/--jobs N, --features LIST, --pdf-standard LIST, --pages RANGES,\n  --no-pdf-tags, --pretty, -f/--format pdf.\nUI diagnostics: --diagnostic-format human|short, --color auto|always|never\n  (accepted; LeafView always sanitizes short status messages).\n--ppi is accepted but affects PNG export only, not PDF.\nExport/server flags --deps, --deps-format, --make-deps, --timings, --open,\n  --no-serve, --no-reload, --port are rejected explicitly.\nSuccessful builds atomically update <input>.pdf beside the input.\nUse --no-pdf to keep output private (existing PDF is left untouched).\n--help/-h shows this help; --version/-V shows the embedded compiler version.";
 #[cfg(test)]
 mod tests {
     use super::*;

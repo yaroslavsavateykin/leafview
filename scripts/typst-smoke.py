@@ -2,6 +2,7 @@
 """Typst live integration through PTY: atomic include saves, errors, latest wins.
 Not a real terminal visual test. Requires installed typst for CLI prerequisite.
 """
+import argparse
 import fcntl
 import json
 import os
@@ -15,6 +16,9 @@ import tempfile
 import termios
 import time
 
+parser = argparse.ArgumentParser()
+parser.add_argument('--no-pdf', action='store_true')
+args = parser.parse_args()
 root = Path(__file__).resolve().parents[1]
 with tempfile.TemporaryDirectory(prefix='leafview-live-') as tmp:
     project = Path(tmp) / 'project with spaces'
@@ -25,7 +29,14 @@ with tempfile.TemporaryDirectory(prefix='leafview-live-') as tmp:
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 30, 90, 0, 0))
     before = termios.tcgetattr(slave)
     trace = Path(tmp) / 'trace.jsonl'
-    proc = subprocess.Popen([str(root / 'target/release/leafview'), 'typst', str(project / 'main.typ')],
+    pdf = project / 'main.pdf'
+    sentinel = b'EXISTING PDF MUST REMAIN UNTOUCHED'
+    if args.no_pdf:
+        pdf.write_bytes(sentinel)
+    command = [str(root / 'target/release/leafview'), 'typst', str(project / 'main.typ')]
+    if args.no_pdf:
+        command.append('--no-pdf')
+    proc = subprocess.Popen(command,
                             stdin=slave, stdout=slave, stderr=slave,
                             env={**os.environ, 'LEAFVIEW_GRAPHICS': 'safe', 'LEAFVIEW_TRACE': str(trace)}, start_new_session=True)
     output = bytearray()
@@ -48,6 +59,10 @@ with tempfile.TemporaryDirectory(prefix='leafview-live-') as tmp:
             return json.loads(trace.read_text().splitlines()[-1])
         assert current()['page'] == 0
         assert current()['revision'] > 0
+        if args.no_pdf:
+            assert pdf.read_bytes() == sentinel
+        else:
+            assert pdf.read_bytes().startswith(b'%PDF')
         # Real SGR wheel reports: zoom and horizontal page turns.
         os.write(master, b'\x1b[<64;46;15M' * 10)
         pump(.8)
@@ -74,12 +89,14 @@ with tempfile.TemporaryDirectory(prefix='leafview-live-') as tmp:
         output.clear()
         pump(.5)
         assert not output, 'manual navigation should settle without forced follow'
+        before_error_pdf = pdf.read_bytes()
         save('#let broken = (\n')
         pump(1)
         assert b'Typst:' in output, output[-2000:]
         assert b'compilation error' in output, 'missing centered error panel'
         assert b'theory.typ' in output, 'missing diagnostic source location'
         assert proc.poll() is None
+        assert pdf.read_bytes() == before_error_pdf, 'failed compile replaced PDF'
         output.clear()
         for i in range(40):
             save(source.replace('c^2', 'c^' + str(i + 3)))
@@ -106,6 +123,8 @@ with tempfile.TemporaryDirectory(prefix='leafview-live-') as tmp:
                 output.extend(os.read(master, 65536))
         assert proc.wait(timeout=1) == 0, output[-2000:]
         assert termios.tcgetattr(slave) == before
+        if args.no_pdf:
+            assert pdf.read_bytes() == sentinel, '--no-pdf overwrote existing file'
         print('PASS: error recovery / 40 rapid atomic saves / manual navigation / sync toggle / manual follow / clean exit')
     finally:
         if proc.poll() is None:

@@ -81,8 +81,13 @@ build dependencies and a roughly 47 MiB release executable.
 After a save, dependency events are debounced for 200 ms. One compiler is reused
 for incremental compilation; at most one job is running and one latest request
 is pending. Newer edits invalidate older results. PDF and source coordinates
-always come from the same compiled layout. Output stays in a private temporary
-directory: your existing `main.pdf` is **not overwritten**. Compilation errors
+always come from the same compiled layout. By default successful current builds
+**atomically replace `main.pdf` beside `main.typ`**, including an existing PDF.
+Compilation and preview still use a private snapshot; publishing only adds a file
+copy, not another compile/render. Use `leafview typst main.typ --no-pdf` to keep
+output private and leave any existing `main.pdf` untouched. Failed or superseded
+builds do not replace the exported file; own PDF writes do not trigger a rebuild.
+Compilation errors
 keep the previous PDF visible; fix and save again, or press `r` to retry. An
 initial error shows a blank placeholder until compilation succeeds.
 
@@ -111,6 +116,7 @@ Not all CLI side effects fit a live PDF viewer: `--deps`, `--deps-format`,
 non-PDF output formats and a positional output path are **explicitly rejected**,
 not forwarded or silently ignored. Use `typst compile/watch` for these exports
 or server features. LeafView does not claim full Typst CLI flag compatibility.
+`--no-pdf` is a LeafView-specific option, not a Typst compiler flag.
 
 | Key in Typst mode | Action |
 | --- | --- |

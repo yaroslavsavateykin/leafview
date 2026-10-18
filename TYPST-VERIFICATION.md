@@ -1,5 +1,25 @@
 # Typst Live Preview verification — 2026-10-19
 
+## Adjacent PDF publication / --no-pdf
+
+Successful current builds now stage a PDF in the entry file's directory and
+atomically rename to <entry>.pdf; --no-pdf leaves existing PDFs untouched.
+Copy/rename runs in the compile worker, not UI, no second compilation. Generation
+and source-byte validation prevent known-stale results from publishing; an edit
+racing the final generation check/rename can briefly leave the previous successful
+PDF until the next build (no filesystem-wide transaction promised). Own PDF is
+not a dependency and does not trigger compile loops. Publication errors surface
+as diagnostics while preview can still accept the compiled snapshot.
+
+Check, feature tests/Clippy/release, existing PDF PTY and live PTY both default
+and --no-pdf passed. Tests verify actual PDF creation, old bytes retained on
+compiler failure, existing sentinel retained throughout --no-pdf, atomic helper
+rejects stale publication and removes staging files. Save-to-display fixture
+0.659 s default / 0.650 s --no-pdf (single observations, not a disk benchmark).
+No new real-Ghostty run for this file-publication-only change. Installed with
+Typst feature. Earlier statements below about never writing user PDFs are
+historical and superseded by this opt-out policy.
+
 ## Centered compiler diagnostic panel
 
 Added reddish centered bounded panel, sanitized multiline compiler errors with

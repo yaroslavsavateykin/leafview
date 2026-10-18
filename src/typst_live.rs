@@ -151,6 +151,8 @@ impl Live {
             input.starts_with(&root),
             "Typst input must be within TYPST_ROOT"
         );
+        let generation_counter = Arc::new(AtomicU64::new(1));
+        let desired_generation = generation_counter.clone();
         let initial_input = input.to_owned();
         let input = input.to_owned();
         let process = std::sync::Mutex::new(None::<CompilerProcess>);
@@ -160,7 +162,7 @@ impl Live {
                 *process = Some(CompilerProcess::new(&input, &root, &options)?);
             }
             let result = process.as_mut().unwrap().compile(generation, stop);
-            let (reply, output) = match result {
+            let (mut reply, output) = match result {
                 Ok(v) => v,
                 Err(e) => {
                     process.take();
@@ -174,12 +176,24 @@ impl Live {
             } else {
                 None
             };
-            let stale = reply
+            let stale: Vec<_> = reply
                 .sources
                 .iter()
                 .filter(|(p, s)| std::fs::read_to_string(p).ok().as_ref() != Some(s))
                 .map(|(p, _)| p.clone())
                 .collect();
+            if !options.no_pdf
+                && reply.error.is_none()
+                && stale.is_empty()
+                && desired_generation.load(Ordering::SeqCst) == generation
+            {
+                if let Err(error) = publish_pdf(&output, &input.with_extension("pdf"), || {
+                    !stop.load(Ordering::SeqCst)
+                        && desired_generation.load(Ordering::SeqCst) == generation
+                }) {
+                    reply.error = Some(format!("Cannot save PDF: {error:#}"));
+                }
+            }
             Ok(Finished {
                 stale,
                 reply,
@@ -207,7 +221,7 @@ impl Live {
         )?;
         Ok(Self {
             worker,
-            generation: Arc::new(AtomicU64::new(1)),
+            generation: generation_counter,
             pending: false,
             due: Some(Instant::now()),
             watcher,
@@ -360,6 +374,19 @@ impl Live {
         None
     }
 }
+/// Stage in the destination directory: rename never exposes a partial PDF.
+fn publish_pdf(source: &Path, destination: &Path, current: impl Fn() -> bool) -> Result<()> {
+    let mut staged =
+        tempfile::NamedTempFile::new_in(destination.parent().context("PDF has no parent")?)?;
+    let mut input = std::fs::File::open(source)?;
+    std::io::copy(&mut input, &mut staged)?;
+    staged.flush()?;
+    if current() {
+        staged.persist(destination).map_err(|e| e.error)?;
+    }
+    Ok(())
+}
+
 /// Linear, UTF-8-safe changed envelope; the last differing suffix is selected.
 /// Choosing the last changed character gives deterministic last-hunk semantics
 /// even when a save contains several disjoint edits, without quadratic diff RAM.
@@ -391,6 +418,19 @@ pub fn changed_range(old: &str, new: &str) -> Option<std::ops::Range<usize>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn atomic_pdf_publication_rejects_stale_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("staged.pdf");
+        let target = dir.path().join("main.pdf");
+        std::fs::write(&source, b"new PDF").unwrap();
+        std::fs::write(&target, b"old PDF").unwrap();
+        publish_pdf(&source, &target, || false).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"old PDF");
+        publish_pdf(&source, &target, || true).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"new PDF");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
     #[test]
     fn utf8_and_last_change() {
         assert_eq!(changed_range("абв", "абXв"), Some(4..5));
