@@ -170,24 +170,23 @@ with tempfile.TemporaryDirectory(prefix="leafview-test-") as tmp:
             os.close(slave)
     print('PASS: SIGTERM/SIGHUP/SIGINT during navigation restore TTY')
 
-    # Simulate a Ghostty pane under tmux. In automatic safe mode, no Kitty
-    # graphics (or capability query) must be emitted to an at-risk emulator.
+    # Explicit compatibility mode skips graphics queries even inside tmux.
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 20, 70, 0, 0))
     before = termios.tcgetattr(slave)
     env = {**os.environ, "TERM": "tmux-256color", "TMUX": "/tmp/leafview-test",
-           "TERM_PROGRAM": "ghostty", "LEAFVIEW_GRAPHICS": "auto"}
+           "TERM_PROGRAM": "ghostty", "LEAFVIEW_GRAPHICS": "safe"}
     proc = subprocess.Popen([str(root / "target/release/leafview"), str(source)],
                             stdin=slave, stdout=slave, stderr=slave, env=env,
                             start_new_session=True)
     captured = bytearray()
     try:
         deadline = time.monotonic() + 5
-        while time.monotonic() < deadline and b"Ghostty/tmux safety mode" not in captured:
+        while time.monotonic() < deadline and b"explicit compatibility mode" not in captured:
             if select.select([master], [], [], 0.05)[0]:
                 captured.extend(os.read(master, 65536))
             assert proc.poll() is None, captured[-1000:]
-        assert b"Ghostty/tmux safety mode" in captured, captured[-2000:]
+        assert b"explicit compatibility mode" in captured, captured[-2000:]
         assert b"\x1b_G" not in captured, "unexpected Kitty graphics data in safe mode"
         assert b"\x1b[5n" not in captured, "safe mode must not query graphics"
         os.write(master, b"jlHL" * 100 + b"q")
@@ -198,7 +197,7 @@ with tempfile.TemporaryDirectory(prefix="leafview-test-") as tmp:
         assert proc.wait(timeout=1) == 0
         assert termios.tcgetattr(slave) == before, "safe mode did not restore TTY"
         assert b"\x1b[?1049l" in captured, "safe mode did not exit alternate screen"
-        print("PASS: Ghostty/tmux protected startup, scroll storm, terminal restoration")
+        print("PASS: explicit compatibility startup, scroll storm, terminal restoration")
     finally:
         if proc.poll() is None:
             proc.kill()

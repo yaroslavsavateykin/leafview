@@ -125,7 +125,8 @@ text/math glyphs, not arbitrary shape/image source expressions. Highly dynamic
 macros, generated content and multi-location spans can remain unmapped. Glyph
 coordinates indicate a baseline, not an exact selection rectangle. Native
 Ghostty+tmux graphics limitations from [AUDIT-2026-10-19.md](AUDIT-2026-10-19.md)
-still apply; this feature does **not** silently bypass existing safety mode.
+remain historical test findings. Both Typst and PDF mode now negotiate native
+graphics by default, including Ghostty+tmux; safe mode is explicit opt-in.
 
 See [TYPST-VERIFICATION.md](TYPST-VERIFICATION.md) for actual tests, measurements
 and remaining gaps. Additional automated check: `python3 scripts/typst-smoke.py`.
@@ -171,24 +172,26 @@ FitB-family, remote GoTo and nonrectangular actions are unsupported, not guessed
 
 ## Crash protection and graphics mode
 
-Ghostty has a documented terminal-emulator crash when large Kitty graphics
-are sent through tmux, often with tmux mouse forwarding enabled. Because the
-**terminal process itself** can crash, Leafview cannot catch that exception or
-close only its own process. To avoid triggering the known failure, Leafview
-**automatically uses halfblocks** on Ghostty inside tmux. This text-cell
-backend never sends Kitty image payloads, at the cost of lower PDF resolution.
-Kitty graphics continue to work automatically outside that combination.
+LeafView negotiates native graphics by default, **including Ghostty inside
+tmux**. There is no emulator blacklist or forced resolution downgrade for this
+combination. Kitty uses lossless PNG transport at the existing raster resolution.
+Halfblocks is used only when explicitly requested or graphics negotiation fails.
+
+Earlier tests observed graphics transfer corruption under intensive tmux pane
+operations (see AUDIT-2026-10-19.md); the cause is not established and is not a
+reason to assume this combination always crashes. Removing the automatic
+restriction does not constitute proof that every terminal/protocol issue is fixed.
 
 Override the automatic selection when needed:
 
 ```sh
-LEAFVIEW_GRAPHICS=safe leafview document.pdf    # force crash-resistant halfblocks
-LEAFVIEW_GRAPHICS=native leafview document.pdf  # opt in to native graphics (risky in Ghostty/tmux)
+LEAFVIEW_GRAPHICS=safe leafview document.pdf    # explicitly request low-resolution halfblocks
+LEAFVIEW_GRAPHICS=native leafview document.pdf  # negotiate native graphics (same as auto)
 LEAFVIEW_DEBUG=1 leafview document.pdf         # inspect selected backend
 ```
 
-`LEAFVIEW_GRAPHICS=auto` (default) chooses a conservative backend only when
-Ghostty and tmux are both detected. Safe mode deliberately skips graphics
+`LEAFVIEW_GRAPHICS=auto` (default) queries terminal capabilities without a
+Ghostty/tmux exception. Explicit safe mode deliberately skips graphics
 capability negotiation. Navigation/render requests are coalesced to at most
 one every 75 ms during key repeats; the final viewport is always scheduled.
 Ctrl-C is handled as an ordinary clean exit, like `q` or Esc. A system-level

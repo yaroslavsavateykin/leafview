@@ -650,7 +650,7 @@ impl App {
             })
             .unwrap_or_default();
         let state = if self.graphics_safe {
-            "Halfblocks (Ghostty/tmux safety mode) · "
+            "Halfblocks (explicit compatibility mode) · "
         } else if self.backend == ratatui_image::picker::ProtocolType::Halfblocks {
             "Halfblocks (low resolution) · "
         } else if self.loading {
@@ -740,16 +740,10 @@ fn watch(
     Ok((watcher, rx))
 }
 
-// Ghostty has documented process-wide crashes when Kitty graphics are emitted
-// through tmux (especially with mouse forwarding). A child process cannot
-// recover a terminal emulator which itself crashes. Default to the bounded
-// text-cell backend for this combination, with explicit native opt-in.
-fn use_safe_graphics(tmux: bool, ghostty: bool, mode: &str) -> bool {
-    match mode {
-        "safe" | "halfblocks" => true,
-        "native" => false,
-        _ => tmux && ghostty,
-    }
+// Low-resolution output is an explicit user choice, not an emulator blacklist.
+// Automatic mode negotiates graphics equally inside and outside tmux.
+fn use_safe_graphics(mode: &str) -> bool {
+    matches!(mode, "safe" | "halfblocks")
 }
 
 fn viewer_loop(
@@ -760,11 +754,7 @@ fn viewer_loop(
 ) -> Result<()> {
     let tmux =
         env::var_os("TMUX").is_some() || env::var("TERM").is_ok_and(|v| v.starts_with("tmux"));
-    let ghostty = env::var("TERM_PROGRAM").is_ok_and(|v| v.eq_ignore_ascii_case("ghostty"))
-        || env::var_os("GHOSTTY_RESOURCES_DIR").is_some();
     let graphics_safe = use_safe_graphics(
-        tmux,
-        ghostty,
         &env::var("LEAFVIEW_GRAPHICS")
             .unwrap_or_default()
             .to_ascii_lowercase(),
@@ -1124,12 +1114,11 @@ mod graphics_safety_tests {
     use super::use_safe_graphics;
 
     #[test]
-    fn ghostty_tmux_defaults_to_safe_backend() {
-        assert!(use_safe_graphics(true, true, "auto"));
-        assert!(use_safe_graphics(true, true, ""));
-        assert!(!use_safe_graphics(false, true, "auto"));
-        assert!(!use_safe_graphics(true, false, "auto"));
-        assert!(use_safe_graphics(false, false, "safe"));
-        assert!(!use_safe_graphics(true, true, "native"));
+    fn low_resolution_requires_explicit_opt_in() {
+        assert!(!use_safe_graphics("auto"));
+        assert!(!use_safe_graphics(""));
+        assert!(!use_safe_graphics("native"));
+        assert!(use_safe_graphics("safe"));
+        assert!(use_safe_graphics("halfblocks"));
     }
 }

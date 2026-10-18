@@ -1,5 +1,16 @@
 # Typst Live Preview verification — 2026-10-19
 
+## Native graphics default update
+
+Removed automatic Ghostty+tmux Halfblocks selection; safe/halfblocks are now
+explicit opt-in. Updated status, regression test and README. Historical mentions
+of automatic protection below are superseded. Ran check, Typst tests/Clippy,
+release, PDF and Typst PTY scripts successfully. Real separate Ghostty/tmux with
+`LEAFVIEW_GRAPHICS=auto`, user's letuchka.typ and --root ../..: confirmed Kitty
+placeholders, no Halfblocks status, zoom/scroll/page keys and normal shell return;
+no Kitty/checksum errors logged in this short run. Installed with Typst feature.
+This short smoke does not certify long-run absence of all protocol errors.
+
 ## Optional Cargo feature update
 
 Typst is now opt-in: `cargo install --locked --features typst --path . -j 2`.
