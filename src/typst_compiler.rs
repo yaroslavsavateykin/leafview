@@ -171,40 +171,43 @@ impl Compiler {
             return reply;
         }
         match output.output {
-            Err(errors) => reply.error = Some(
-                errors
-                    .iter()
-                    .take(3)
-                    .map(|e| {
-                        let mut diagnostic = format!("error: {}", e.message);
-                        if let Some(id) = e.span.id() {
-                            if let (Ok(source), Some(range), Ok(path)) = (
-                                self.source(id),
-                                self.range(e.span),
-                                self.files.loader().resolve(id),
-                            ) {
-                                let offset = range.start.min(source.text().len());
-                                let prefix = &source.text()[..offset];
-                                let line = prefix.bytes().filter(|b| *b == b'\n').count() + 1;
-                                let column =
-                                    prefix.rsplit('\n').next().unwrap_or("").chars().count() + 1;
-                                let text = source.text().lines().nth(line - 1).unwrap_or("");
-                                diagnostic.push_str(&format!(
+            Err(errors) => {
+                reply.error = Some(
+                    errors
+                        .iter()
+                        .take(3)
+                        .map(|e| {
+                            let mut diagnostic = format!("error: {}", e.message);
+                            if let Some(id) = e.span.id() {
+                                if let (Ok(source), Some(range), Ok(path)) = (
+                                    self.source(id),
+                                    self.range(e.span),
+                                    self.files.loader().resolve(id),
+                                ) {
+                                    let offset = range.start.min(source.text().len());
+                                    let prefix = &source.text()[..offset];
+                                    let line = prefix.bytes().filter(|b| *b == b'\n').count() + 1;
+                                    let column =
+                                        prefix.rsplit('\n').next().unwrap_or("").chars().count()
+                                            + 1;
+                                    let text = source.text().lines().nth(line - 1).unwrap_or("");
+                                    diagnostic.push_str(&format!(
                                     "\n  --> {}:{line}:{column}\n   |\n{line:>3} | {}\n   | {}^",
                                     path.display(),
                                     text.chars().take(180).collect::<String>(),
                                     " ".repeat(column.saturating_sub(1).min(179))
                                 ));
+                                }
                             }
-                        }
-                        for hint in e.hints.iter().take(3) {
-                            diagnostic.push_str(&format!("\n hint: {}", hint.v));
-                        }
-                        diagnostic
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n\n"),
-            ),
+                            for hint in e.hints.iter().take(3) {
+                                diagnostic.push_str(&format!("\n hint: {}", hint.v));
+                            }
+                            diagnostic
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n\n"),
+                )
+            }
             Ok(document) => {
                 let result = (|| -> Result<()> {
                     // Gather source spans from the exact frames exported below.
