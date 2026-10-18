@@ -1,5 +1,17 @@
 # Typst Live Preview verification — 2026-10-19
 
+## Centered compiler diagnostic panel
+
+Added reddish centered bounded panel, sanitized multiline compiler errors with
+path/line/column/source/caret/hints (up to three errors). Old PDF retained in
+memory but image widget hidden during errors to avoid Kitty placeholder overlap;
+success restores it. Default/Typst check, Typst tests/Clippy, release and both PTY
+scripts passed. PTY asserts panel heading and source filename. Real separate
+Ghostty/tmux initial syntax error screenshot captured and inspected
+(/tmp/leafview-error-panel.png): centered red border/text readable; correcting
+file restored native PDF and check mark. Installed updated Typst feature build.
+Long diagnostics are bounded/clipped to viewport; no scrollable diagnostic pane.
+
 ## Trackpad/wheel navigation update
 
 Added ScrollUp/Down pointer-anchored zoom (5 percentage points, rounded to avoid

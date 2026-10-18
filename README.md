@@ -119,7 +119,11 @@ or server features. LeafView does not claim full Typst CLI flag compatibility.
 | `r` | Recompile |
 
 The status shows `⏳` while compiling or preparing the image, then `✓` once
-loading finishes. Compilation errors display an error instead of a success mark.
+loading finishes. Compilation errors appear in a centered reddish bordered
+panel with the source path, line/column, source excerpt/caret and available hints.
+The last successful PDF stays in memory, temporarily hidden to keep terminal
+image placeholders from interfering with the diagnostic panel. A successful
+recompile automatically closes the panel and restores PDF display.
 
 Source synchronization compares successful source snapshots, selects the last
 changed character/token in the most recently changed source file, then uses

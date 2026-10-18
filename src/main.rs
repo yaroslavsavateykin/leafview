@@ -23,6 +23,8 @@ use crossterm::event::{
 use document::Document;
 use links::{Destination, LinkAction, RenderGeometry};
 use notify::Watcher;
+#[cfg(feature = "typst")]
+use ratatui::widgets::{Borders, Clear, Wrap};
 use ratatui::{
     layout::{Constraint, Layout, Size},
     style::{Color, Style},
@@ -75,6 +77,8 @@ struct App {
     encode_latest: Option<EncodeInput>,
     jump: String,
     error: Option<String>,
+    #[cfg(feature = "typst")]
+    compile_error: Option<String>,
     dirty: bool,
     loading: bool,
     backend: ratatui_image::picker::ProtocolType,
@@ -345,6 +349,7 @@ impl App {
         let auto_sync = live.auto_sync;
         if let Some(update) = update {
             self.compile_millis = update.millis;
+            self.compile_error = update.error.clone();
             self.error = update.error;
             if let Some(doc) = update.document {
                 debug_assert_eq!(doc.revision, update.generation);
@@ -751,7 +756,11 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
         Block::new().style(Style::default().bg(Color::Rgb(20, 22, 26))),
         screen,
     );
-    if let Some(image) = &app.image {
+    #[cfg(feature = "typst")]
+    let compilation_failed = app.compile_error.is_some();
+    #[cfg(not(feature = "typst"))]
+    let compilation_failed = false;
+    if let Some(image) = app.image.as_ref().filter(|_| !compilation_failed) {
         if screen.width == 0 || screen.height == 0 {
             return;
         }
@@ -763,8 +772,16 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
             DisplayImage::Other(image) => f.render_widget(Image::new(image), area),
         }
     }
-    if let Some((x, y)) = app.pointer {
+    if compilation_failed {
+        app.hovered = None;
+        app.hover_deadline = None;
+        app.image_area = ratatui::layout::Rect::default();
+    } else if let Some((x, y)) = app.pointer {
         app.hover_at(x, y);
+    }
+    #[cfg(feature = "typst")]
+    if let Some(error) = &app.compile_error {
+        render_compile_error(f, screen, error);
     }
     f.render_widget(
         Paragraph::new(links::sanitize(&app.status())).style(
@@ -777,6 +794,54 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
                 .bg(Color::Rgb(35, 38, 44)),
         ),
         parts[1],
+    );
+}
+
+#[cfg(feature = "typst")]
+fn render_compile_error(f: &mut Frame<'_>, screen: ratatui::layout::Rect, error: &str) {
+    let width = screen
+        .width
+        .saturating_sub(4)
+        .min(100)
+        .max(screen.width.min(1));
+    if width == 0 || screen.height == 0 {
+        return;
+    }
+    let text = error
+        .lines()
+        .take(30)
+        .map(links::sanitize)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let inner = usize::from(width.saturating_sub(4).max(1));
+    let lines: usize = text
+        .lines()
+        .map(|line| line.chars().count().max(1).div_ceil(inner))
+        .sum();
+    let height = (lines.saturating_add(4).min(u16::MAX as usize) as u16).min(screen.height);
+    let area = ratatui::layout::Rect::new(
+        screen.x + (screen.width - width) / 2,
+        screen.y + (screen.height - height) / 2,
+        width,
+        height,
+    );
+    f.render_widget(Clear, area);
+    f.render_widget(
+        Paragraph::new(text)
+            .wrap(Wrap { trim: false })
+            .style(
+                Style::default()
+                    .fg(Color::Rgb(255, 210, 210))
+                    .bg(Color::Rgb(45, 24, 29)),
+            )
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Typst — compilation error ")
+                    .border_style(Style::default().fg(Color::Rgb(220, 100, 115)))
+                    .padding(ratatui::widgets::Padding::uniform(1)),
+            ),
+        area,
     );
 }
 
@@ -937,6 +1002,8 @@ fn viewer_loop(
         encode_latest: None,
         jump: String::new(),
         error: doc.links.error.clone(),
+        #[cfg(feature = "typst")]
+        compile_error: None,
         dirty: true,
         loading: false,
         backend,

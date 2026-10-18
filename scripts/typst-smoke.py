@@ -77,6 +77,8 @@ with tempfile.TemporaryDirectory(prefix='leafview-live-') as tmp:
         save('#let broken = (\n')
         pump(1)
         assert b'Typst:' in output, output[-2000:]
+        assert b'compilation error' in output, 'missing centered error panel'
+        assert b'theory.typ' in output, 'missing diagnostic source location'
         assert proc.poll() is None
         output.clear()
         for i in range(40):
