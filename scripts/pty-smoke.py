@@ -51,6 +51,10 @@ with tempfile.TemporaryDirectory(prefix="leafview-test-") as tmp:
     try:
         pump(3)
         assert proc.poll() is None, output[-1000:]
+        # Device-status query must precede mouse reporting, or unsolicited mouse
+        # events can interfere with the graphics capability parser.
+        assert output.index(b'\x1b[5n') < output.index(b'\x1b[?1003h')
+        assert b'Halfblocks' in output, 'fallback must be visible in status'
         assert b"3" in output and b"100%" in output, "no initial status"
         # Over 1000 key events; then finish on page 3 at 125%.
         os.write(master, b"lh+-jkHL" * 140)

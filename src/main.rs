@@ -63,6 +63,7 @@ struct App {
     error: Option<String>,
     dirty: bool,
     loading: bool,
+    backend: ratatui_image::picker::ProtocolType,
 }
 
 // Only targeted Kitty deletion: never erase images belonging to adjacent panes.
@@ -415,7 +416,9 @@ impl App {
                 abbreviate(err, 110)
             );
         }
-        let state = if self.loading {
+        let state = if self.backend == ratatui_image::picker::ProtocolType::Halfblocks {
+            "Halfblocks (low resolution) · "
+        } else if self.loading {
             "Loading (previous image)…  "
         } else if self.reload_pending {
             "Reloading…  "
@@ -501,6 +504,14 @@ fn watch(
 fn viewer_loop(path: PathBuf, doc: Arc<Document>, mut terminal: DefaultTerminal) -> Result<()> {
     // Picker queries must occur after alternate-screen entry, before event polling.
     let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
+    // Do not feed unsolicited mouse/focus reports into the capability parser.
+    // Enable reporting only after its terminal query has finished.
+    crossterm::execute!(
+        std::io::stdout(),
+        event::EnableFocusChange,
+        event::EnableMouseCapture
+    )?;
+    let backend = picker.protocol_type();
     let font = picker.font_size();
     let (tx_completed, completed) = mpsc::sync_channel(1);
     let renderer = Renderer::new(tx_completed)?;
@@ -574,6 +585,7 @@ fn viewer_loop(path: PathBuf, doc: Arc<Document>, mut terminal: DefaultTerminal)
         error: doc.links.error.clone(),
         dirty: true,
         loading: false,
+        backend,
     };
     app.geometry(terminal.size()?);
     let mut reload_due: Option<Instant> = None;
@@ -673,11 +685,6 @@ fn main() -> Result<()> {
     let doc = Arc::new(Document::open(&path, 1)?);
     let terminal = ratatui::try_init()?;
     let _restore = TerminalRestore;
-    crossterm::execute!(
-        std::io::stdout(),
-        event::EnableFocusChange,
-        event::EnableMouseCapture
-    )?;
     viewer_loop(path, doc, terminal)
 }
 

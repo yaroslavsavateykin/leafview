@@ -1,5 +1,20 @@
 # Verification — 2026-10-18
 
+## Terminal quality regression fix
+
+After the hyperlink update, mouse capture was enabled before the ratatui-image
+capability query. Moving the pointer then injected SGR mouse reports into the
+query parser and caused a silent halfblocks fallback (blocky, low-resolution
+preview) even in Kitty-capable tmux. Fixed by negotiating graphics first and
+enabling mouse/focus reporting afterward. The status bar now explicitly shows
+`Halfblocks (low resolution)` whenever fallback is active, so misnegotiation is
+visible instead of silent.
+
+Verified in Ghostty 1.3 + isolated tmux 3.6: pane capture shows Kitty Unicode
+placeholders (not halfblock glyphs) and no fallback label. The PTY test asserts
+`\x1b[5n` (device query) precedes `\x1b[?1003h` (mouse reporting) and that the
+fallback label is present for the headless xterm path.
+
 ## Interactive hyperlinks update
 
 Implemented annotation-based URI and local GoTo links in `src/links.rs`, including
