@@ -100,5 +100,8 @@ proof of universal leak/deadlock freedom.
    and no remaining Leafview/Poppler processes.
 
 CI is configured on Ubuntu 24.04 for all Cargo checks and the separate PTY test.
-Remote CI execution status is reported with the final repository/commit result;
-this document does not claim an unobserved remote run passed.
+Remote CI run [39149065261](https://github.com/yaroslavsavateykin/leafview/actions/runs/39149065261)
+completed successfully on Ubuntu 24.04: format, check, test, clippy, release build
+and PTY smoke test all passed (2m50s). Repository privacy confirmed through GitHub
+API (`isPrivate: true`). Subsequent commit updates checkout to its Node 24 release
+and records this observed CI result.
