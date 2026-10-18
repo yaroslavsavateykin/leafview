@@ -81,6 +81,32 @@ without disabling PDF rendering. Eager extraction can add document-load latency
 on very large PDFs; it never runs on mouse movement. Malformed destinations,
 FitB-family, remote GoTo and nonrectangular actions are unsupported, not guessed.
 
+## Crash protection and graphics mode
+
+Ghostty has a documented terminal-emulator crash when large Kitty graphics
+are sent through tmux, often with tmux mouse forwarding enabled. Because the
+**terminal process itself** can crash, Leafview cannot catch that exception or
+close only its own process. To avoid triggering the known failure, Leafview
+**automatically uses halfblocks** on Ghostty inside tmux. This text-cell
+backend never sends Kitty image payloads, at the cost of lower PDF resolution.
+Kitty graphics continue to work automatically outside that combination.
+
+Override the automatic selection when needed:
+
+```sh
+LEAFVIEW_GRAPHICS=safe leafview document.pdf    # force crash-resistant halfblocks
+LEAFVIEW_GRAPHICS=native leafview document.pdf  # opt in to native graphics (risky in Ghostty/tmux)
+LEAFVIEW_DEBUG=1 leafview document.pdf         # inspect selected backend
+```
+
+`LEAFVIEW_GRAPHICS=auto` (default) chooses a conservative backend only when
+Ghostty and tmux are both detected. Safe mode deliberately skips graphics
+capability negotiation. Navigation/render requests are coalesced to at most
+one every 75 ms during key repeats; the final viewport is always scheduled.
+Ctrl-C is handled as an ordinary clean exit, like `q` or Esc. A system-level
+SIGKILL, OOM kill, or a crash inside Ghostty itself cannot be handled by an
+application's cleanup code.
+
 ## Terminals and tmux
 
 Ghostty 1.3 development build with tmux 3.6 has been visually tested, including
