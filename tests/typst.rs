@@ -19,6 +19,9 @@ impl Drop for Helper {
 }
 impl Helper {
     fn new() -> Self {
+        Self::with_options(serde_json::json!({}))
+    }
+    fn with_options(options: Value) -> Self {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("chapters")).unwrap();
         let main = dir.path().join("main.typ");
@@ -32,6 +35,7 @@ impl Helper {
             .arg("--typst-compiler")
             .arg(&main)
             .arg(dir.path())
+            .arg(serde_json::to_string(&options).unwrap())
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .spawn()
@@ -103,4 +107,24 @@ fn same_generation_pdf_mapping_includes_formula_shift_error_recovery() {
     let fixed = helper.compile(4);
     assert!(fixed["error"].is_null());
     assert_eq!(fixed["generation"], 4);
+}
+
+#[test]
+fn compiler_options_inputs_pages_and_pdf_mapping() {
+    let mut helper = Helper::with_options(
+        json!({"inputs":[["message","FROM_INPUT"]],"pages":"7-8", "pretty":true,"no_tags":true, "standards":["1.7"],"ignore_system":true,"jobs":1,"timestamp":1700000000}),
+    );
+    let theory = helper.dir.path().join("chapters/theory.typ");
+    std::fs::write(&theory, "#sys.inputs.message\n\n$ E = m c^2 $\n").unwrap();
+    let reply = helper.compile(1);
+    assert!(reply["error"].is_null(), "{reply}");
+    assert!(reply["points"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|p| p["file"].as_str() == theory.to_str())
+        .all(|p| p["page"] == 0));
+    let pdf = lopdf::Document::load(helper.dir.path().join("1.pdf")).unwrap();
+    assert_eq!(pdf.get_pages().len(), 2);
+    assert!(pdf.extract_text(&[1]).unwrap().contains("FROM_INPUT"));
 }

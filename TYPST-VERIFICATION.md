@@ -19,6 +19,29 @@ below apply to the same compiler/navigation implementation.
 changed PDF page or coordinates. The retained compiler world remains necessary
 for exact same-generation source mapping; no second watch compiler was added.
 
+## Compile flags update
+
+Added `src/typst_options.rs`: options before/after input, --key=value, root,
+sys.inputs, fonts, package/cache paths, certificates, timestamp, jobs, features,
+PDF standards/tags/pretty, page ranges, PDF format. Options serialized to the
+same compiler helper; page selection adjusts source-map page numbers. Help lists
+all compile/watch flags and explicitly rejected export/server side effects;
+this is NOT full CLI compatibility. Diagnostic/color accepted but status remains
+short/sanitized, PPI is PNG-only. No global environment mutation.
+
+Tests pass for default and typst builds, Clippy both, release + both PTY scripts.
+New compiler test verifies sys.inputs in actual PDF text, selected 2 PDF pages,
+source coordinates renumbered, PDF standard/pretty/no-tags/fixed date/font options.
+Parser test covers relative root, spaces, equals syntax, repeated-value input,
+unknown/non-PDF rejection. The user's exact relative-root command was launched
+in a disposable real Ghostty/tmux from the supplied project directory: compiled
+letuchka.typ successfully, page 1/2, initial compile 126 ms, clean q/shell return.
+User source not edited. Installed again with --features typst.
+
+Remaining CLI differences are explicitly documented in README: deps/timings/open
+and HTML server/export are rejected rather than implemented; helper startup
+validation failures still have generic resource/internal error feedback.
+
 ## Implementation and choice
 
 Base: clean main/origin/main at 1fdbb0d, fetched before work. Separate branch

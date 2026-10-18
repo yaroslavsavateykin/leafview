@@ -25,6 +25,7 @@ struct Compiler {
     files: FileStore<SystemFiles>,
     main: FileId,
     now: Time,
+    pdf_options: typst_pdf::PdfOptions,
 }
 impl World for Compiler {
     fn library(&self) -> &LazyHash<Library> {
@@ -50,29 +51,90 @@ impl World for Compiler {
     }
 }
 impl Compiler {
-    fn new(input: PathBuf, root: PathBuf) -> Result<Self> {
+    fn new(input: PathBuf, root: PathBuf, options: crate::typst_options::Options) -> Result<Self> {
         let main = RootedPath::new(
             VirtualRoot::Project,
             VirtualPath::virtualize(&root, &input).map_err(|e| anyhow::anyhow!("{e:?}"))?,
         )
         .intern();
         let mut fonts = FontStore::new();
-        if let Some(paths) = std::env::var_os("TYPST_FONT_PATHS") {
-            for path in std::env::split_paths(&paths) {
-                fonts.extend(typst_kit::fonts::scan(&path));
-            }
+        for path in &options.fonts {
+            fonts.extend(typst_kit::fonts::scan(path));
         }
-        fonts.extend(typst_kit::fonts::system());
-        fonts.extend(typst_kit::fonts::embedded());
+        if !options.ignore_system {
+            fonts.extend(typst_kit::fonts::system());
+        }
+        if !options.ignore_embedded {
+            fonts.extend(typst_kit::fonts::embedded());
+        }
+        use typst::foundations::IntoValue;
+        let inputs = options
+            .inputs
+            .iter()
+            .map(|(k, v)| (k.as_str().into(), v.as_str().into_value()))
+            .collect();
+        let features = options
+            .features
+            .iter()
+            .map(|name| {
+                typst::Feature::all()
+                    .find(|f| match f { typst::Feature::Html => "html", typst::Feature::Bundle => "bundle", typst::Feature::A11yExtras => "a11y-extras", _ => "" } == name)
+                    .with_context(|| format!("unknown Typst feature: {name}"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let downloader = if let Some(cert) = options.cert {
+            SystemDownloader::with_cert_path("leafview", cert)
+        } else {
+            SystemDownloader::new("leafview")
+        };
+        use typst_kit::packages::{FsPackages, UniversePackages};
+        let packages = SystemPackages::from_parts(
+            options
+                .package
+                .map(FsPackages::new)
+                .or_else(FsPackages::system_data),
+            options
+                .cache
+                .map(FsPackages::new)
+                .or_else(FsPackages::system_cache),
+            UniversePackages::new(downloader),
+        );
+        let now = options
+            .timestamp
+            .map(Time::fixed_timestamp)
+            .transpose()
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .unwrap_or_else(Time::system);
+        let standards = options
+            .standards
+            .iter()
+            .map(|s| serde_json::from_value(serde_json::Value::String(s.clone())))
+            .collect::<std::result::Result<Vec<typst_pdf::PdfStandard>, _>>()?;
+        let pdf_options = typst_pdf::PdfOptions {
+            pretty: options.pretty,
+            tagged: !options.no_tags,
+            standards: typst_pdf::PdfStandards::new(&standards)
+                .map_err(|e| anyhow::anyhow!("{e:?}"))?,
+            page_ranges: options.pages.as_deref().map(parse_pages).transpose()?,
+            timestamp: if options.timestamp.is_some() {
+                now.today(None).map(typst_pdf::Timestamp::new_utc)
+            } else {
+                None
+            },
+            ..Default::default()
+        };
         Ok(Self {
-            library: LazyHash::new(Library::builder().build()),
+            library: LazyHash::new(
+                Library::builder()
+                    .with_inputs(inputs)
+                    .with_features(features.into_iter().collect())
+                    .build(),
+            ),
             fonts,
-            files: FileStore::new(SystemFiles::new(
-                FsRoot::new(root),
-                SystemPackages::new(SystemDownloader::new("leafview")),
-            )),
+            files: FileStore::new(SystemFiles::new(FsRoot::new(root), packages)),
             main,
-            now: Time::system(),
+            now,
+            pdf_options,
         })
     }
     fn compile(&mut self, request: CompileRequest) -> CompileReply {
@@ -122,21 +184,31 @@ impl Compiler {
             Ok(document) => {
                 let result = (|| -> Result<()> {
                     // Gather source spans from the exact frames exported below.
+                    let mut exported_page = 0;
                     for (page, item) in document.pages().iter().enumerate() {
+                        if self
+                            .pdf_options
+                            .page_ranges
+                            .as_ref()
+                            .is_some_and(|ranges| !ranges.includes_page_index(page))
+                        {
+                            continue;
+                        }
                         collect(
                             self,
                             &item.frame,
                             typst::layout::Transform::identity(),
-                            page as u32,
+                            exported_page,
                             (item.frame.width().to_pt(), item.frame.height().to_pt()),
                             &mut reply.points,
                         );
+                        exported_page += 1;
                     }
                     anyhow::ensure!(
                         reply.points.len() <= 500_000,
                         "source map exceeds 500000 points"
                     );
-                    let pdf = typst_pdf::pdf(&document, &typst_pdf::PdfOptions::default())
+                    let pdf = typst_pdf::pdf(&document, &self.pdf_options)
                         .map_err(|e| anyhow::anyhow!("PDF export: {e:?}"))?;
                     anyhow::ensure!(
                         pdf.len() <= 512 * 1024 * 1024,
@@ -233,11 +305,16 @@ fn collect(
 pub fn serve() -> Result<()> {
     let input = std::env::args_os().nth(2).context("missing Typst input")?;
     let root = std::env::args_os().nth(3).context("missing Typst root")?;
+    let options: crate::typst_options::Options = std::env::args()
+        .nth(4)
+        .map(|s| serde_json::from_str(&s))
+        .transpose()?
+        .unwrap_or_default();
     rayon::ThreadPoolBuilder::new()
-        .num_threads(2)
+        .num_threads(options.jobs.unwrap_or(2))
         .build_global()
         .ok();
-    let mut compiler = Compiler::new(input.into(), root.into())?;
+    let mut compiler = Compiler::new(input.into(), root.into(), options)?;
     for line in std::io::stdin().lock().lines() {
         let line = line?;
         anyhow::ensure!(line.len() < 65536, "compiler request too large");
@@ -250,4 +327,31 @@ pub fn serve() -> Result<()> {
         std::fs::rename(temporary, path)?;
     }
     Ok(())
+}
+
+fn parse_pages(text: &str) -> Result<typst::layout::PageRanges> {
+    use std::num::NonZeroUsize;
+    let mut ranges = Vec::new();
+    for part in text.split(',') {
+        let parse = |s: &str| -> Result<Option<NonZeroUsize>> {
+            if s.is_empty() {
+                return Ok(None);
+            }
+            Ok(Some(
+                NonZeroUsize::new(s.parse()?).context("page numbers start at 1")?,
+            ))
+        };
+        let (start, end) = if let Some((a, b)) = part.split_once('-') {
+            (parse(a)?, parse(b)?)
+        } else {
+            let n = parse(part)?.context("empty page range")?;
+            (Some(n), Some(n))
+        };
+        anyhow::ensure!(
+            start.zip(end).is_none_or(|(a, b)| a <= b),
+            "reversed page range"
+        );
+        ranges.push(start..=end);
+    }
+    Ok(typst::layout::PageRanges::new(ranges))
 }

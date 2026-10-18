@@ -47,6 +47,8 @@ previous: do not mistake it for the requested page.
 ```sh
 leafview typst main.typ
 leafview typst "./notes with spaces/lecture.typ"
+leafview typst letuchka.typ --root ../..
+leafview typst main.typ --input edition=teacher --font-path ./fonts -j 2
 ```
 
 Typst support is opt-in (ordinary PDF builds do not include the compiler):
@@ -79,8 +81,27 @@ Changes in included/imported files and compiler-known resources also trigger a
 build. LeafView watches dependency **parent directories non-recursively**, so
 Neovim atomic saves work without recursively watching your home directory. The
 entry file is the root document; the project root defaults to its parent. Set
-`TYPST_ROOT=/path/to/project` for a different root. `TYPST_FONT_PATHS` is supported;
-other Typst CLI flags/sys.inputs/package overrides are not currently exposed.
+`--root /path/to/project` or `TYPST_ROOT` for a different root. Relative flag
+paths are resolved from the launch directory, like the Typst CLI. Flags may
+precede or follow the input; `--flag=value` is supported.
+
+Supported Typst 0.15.1 compile settings: `--root`, repeatable `--input key=value`,
+`--font-path` (repeatable/path-separated), `--ignore-system-fonts`,
+`--ignore-embedded-fonts`, `--package-path`, `--package-cache-path`, `--cert`,
+`--creation-timestamp`, `-j`/`--jobs`, `--features`, `--pdf-standard`,
+`--no-pdf-tags`, `--pretty`, `--pages`, `-f pdf`/`--format pdf`.
+Standard Typst environment defaults for roots/fonts/packages/cert/timestamp/features
+are honored; explicit flags take precedence (font paths add to the configured
+search paths). Page selection renumbers source mappings to the exported PDF.
+`--diagnostic-format` and `--color` are accepted, but the viewer always displays
+sanitized short status messages; `--ppi` has no effect on PDF (PNG export only).
+Use `leafview typst --help` or `--version` for help/compiler version.
+
+Not all CLI side effects fit a live PDF viewer: `--deps`, `--deps-format`,
+`--make-deps`, `--timings`, `--open`, `--no-serve`, `--no-reload`, `--port`,
+non-PDF output formats and a positional output path are **explicitly rejected**,
+not forwarded or silently ignored. Use `typst compile/watch` for these exports
+or server features. LeafView does not claim full Typst CLI flag compatibility.
 
 | Key in Typst mode | Action |
 | --- | --- |

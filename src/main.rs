@@ -10,6 +10,8 @@ mod render;
 mod typst_compiler;
 #[cfg(feature = "typst")]
 mod typst_live;
+#[cfg(feature = "typst")]
+mod typst_options;
 mod view;
 mod workers;
 
@@ -992,16 +994,39 @@ fn main() -> Result<()> {
         serde_json::to_writer(std::io::stdout().lock(), &index)?;
         return Ok(());
     }
+    #[cfg(feature = "typst")]
+    let typst_options = if env::args_os().nth(1).is_some_and(|s| s == "typst") {
+        let args: Vec<_> = env::args_os().skip(2).collect();
+        if args.iter().any(|s| s == "--help" || s == "-h") {
+            println!("{}", typst_options::HELP);
+            return Ok(());
+        }
+        if args.iter().any(|s| s == "--version" || s == "-V") {
+            println!("LeafView embedded Typst 0.15.1");
+            return Ok(());
+        }
+        Some(typst_options::Options::parse(args)?)
+    } else {
+        None
+    };
     let mut args = env::args_os();
     let _exe = args.next();
-    let (path, typst_mode) = match (args.next(), args.next(), args.next(), args.next()) {
-        (Some(mode), Some(path), None, None) if mode == "typst" => (PathBuf::from(path), true),
-        (Some(path), None, None, None) => (PathBuf::from(path), false),
-        _ => {
-            eprintln!(
+    #[cfg(feature = "typst")]
+    let parsed_typst = typst_options.as_ref().map(|(path, _)| (path.clone(), true));
+    #[cfg(not(feature = "typst"))]
+    let parsed_typst = None;
+    let (path, typst_mode) = if let Some(parsed) = parsed_typst {
+        parsed
+    } else {
+        match (args.next(), args.next(), args.next(), args.next()) {
+            (Some(mode), Some(path), None, None) if mode == "typst" => (PathBuf::from(path), true),
+            (Some(path), None, None, None) => (PathBuf::from(path), false),
+            _ => {
+                eprintln!(
                 "Usage: leafview <file.pdf>\n       leafview typst <file.typ>\n\nRequires Poppler: sudo apt install poppler-utils"
             );
-            std::process::exit(2)
+                std::process::exit(2)
+            }
         }
     };
     // Check dependencies and PDF *before* switching to alternate-screen mode.
@@ -1027,7 +1052,7 @@ fn main() -> Result<()> {
         if CommandCheck::missing("typst") {
             anyhow::bail!("required command not found: typst");
         }
-        Some(typst_live::Live::new(&path)?)
+        Some(typst_live::Live::new(&path, typst_options.unwrap().1)?)
     } else {
         None
     };

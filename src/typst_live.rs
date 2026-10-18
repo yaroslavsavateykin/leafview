@@ -53,7 +53,7 @@ impl Drop for CompilerProcess {
     }
 }
 impl CompilerProcess {
-    fn new(input: &Path, root: &Path) -> Result<Self> {
+    fn new(input: &Path, root: &Path, options: &crate::typst_options::Options) -> Result<Self> {
         let directory = tempfile::tempdir()?;
         let mut child = Command::new("prlimit")
             .args(["--as=3221225472", "--"])
@@ -61,6 +61,7 @@ impl CompilerProcess {
             .arg("--typst-compiler")
             .arg(input)
             .arg(root)
+            .arg(serde_json::to_string(options)?)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -140,9 +141,10 @@ pub struct Live {
     pub compiling: bool,
 }
 impl Live {
-    pub fn new(input: &Path) -> Result<Self> {
-        let root = std::env::var_os("TYPST_ROOT")
-            .map(PathBuf::from)
+    pub fn new(input: &Path, options: crate::typst_options::Options) -> Result<Self> {
+        let root = options
+            .root
+            .clone()
             .unwrap_or_else(|| input.parent().unwrap().to_owned())
             .canonicalize()?;
         anyhow::ensure!(
@@ -155,7 +157,7 @@ impl Live {
         let worker = Worker::new(move |generation, stop| {
             let mut process = process.lock().unwrap();
             if process.is_none() {
-                *process = Some(CompilerProcess::new(&input, &root)?);
+                *process = Some(CompilerProcess::new(&input, &root, &options)?);
             }
             let result = process.as_mut().unwrap().compile(generation, stop);
             let (reply, output) = match result {
