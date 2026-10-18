@@ -838,6 +838,18 @@ impl Drop for TerminalRestore {
     }
 }
 
+struct CommandCheck;
+impl CommandCheck {
+    fn missing(command: &str) -> bool {
+        std::process::Command::new(command)
+            .arg("--help")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_err()
+    }
+}
+
 #[cfg(test)]
 mod graphics_safety_tests {
     use super::use_safe_graphics;
@@ -853,14 +865,3 @@ mod graphics_safety_tests {
     }
 }
 
-struct CommandCheck;
-impl CommandCheck {
-    fn missing(command: &str) -> bool {
-        std::process::Command::new(command)
-            .arg("--help")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_err()
-    }
-}
