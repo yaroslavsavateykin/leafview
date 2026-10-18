@@ -8,7 +8,7 @@ from successful compilation. No Fancy Cat source was modified or used as base.
 
 - `cargo fmt --all -- --check`
 - `cargo check --locked`
-- `cargo test --locked`: 11 unit tests + 2 CLI integration tests passed.
+- `cargo test --locked`: 12 unit tests + 2 CLI integration tests passed.
   One optional synthetic performance test is ignored in the default run and was
   executed separately with `--release --ignored --nocapture` (PASS).
 - `cargo clippy --locked --all-targets -- -D warnings`
@@ -84,6 +84,21 @@ not a latency benchmark. No long-duration leak profiler/Valgrind or multi-hour
 RSS soak was run: NOT TESTED. Bounded ownership and short stress tests are not
 proof of universal leak/deadlock freedom.
 
+## Three-page bidirectional prefetch update
+
+Prefetch now prepares distance 1, then 2, then 3 on both sides with two workers.
+The moving window discards obsolete revision/width/distant rasters; speculative
+admission never evicts existing rasters and respects the 96 MiB budget. Fewer
+pages may fit at high resolution. Added unit coverage for document-edge and
+integer-overflow bounds and budget admission preserving the current page.
+
+Re-ran format, check, tests (12 unit + 2 CLI passed, optional benchmark ignored),
+Clippy with warnings denied, release build, diff whitespace check and PTY smoke:
+PASS. Updated PTY run: peak viewer RSS 27388 KiB, quit 0.024 s. This short fixture
+run does not establish the performance gain of six-page prefetch on large PDFs;
+that gain and new real-terminal performance are NOT MEASURED. Remote CI for this
+update is checked separately after pushing.
+
 ## Reproduce real-terminal checks
 
 1. Build release and generate synthetic fixtures as above.
@@ -103,5 +118,7 @@ CI is configured on Ubuntu 24.04 for all Cargo checks and the separate PTY test.
 Remote CI run [39149065261](https://github.com/yaroslavsavateykin/leafview/actions/runs/39149065261)
 completed successfully on Ubuntu 24.04: format, check, test, clippy, release build
 and PTY smoke test all passed (2m50s). Repository privacy confirmed through GitHub
-API (`isPrivate: true`). Subsequent commit updates checkout to its Node 24 release
+API (`isPrivate: true`) at initial publication. The author subsequently explicitly
+requested public publication; repository visibility is now intentionally public.
+Subsequent commit updates checkout to its Node 24 release
 and records this observed CI result.

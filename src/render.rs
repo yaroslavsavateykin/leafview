@@ -38,6 +38,15 @@ impl Cache {
             limit,
         }
     }
+    // Speculation must never evict a useful raster, especially the visible page.
+    fn insert_prefetched(&mut self, key: Key, image: Arc<DynamicImage>) {
+        if !self.images.contains(&key)
+            && self.images.len() < 8
+            && self.bytes.saturating_add(image.as_bytes().len()) <= self.limit
+        {
+            self.insert(key, image);
+        }
+    }
     fn insert(&mut self, key: Key, image: Arc<DynamicImage>) {
         if let Some(old) = self.images.pop(&key) {
             self.bytes -= old.as_bytes().len();
@@ -155,24 +164,45 @@ impl Renderer {
                 if !success || cancelled() {
                     continue;
                 }
-                // Structured parallelism: at most two children, all joined before the next
-                // request. New generations cancel both children within one polling interval.
-                pool.scope(|scope| {
-                    for page in [
-                        req.page.checked_sub(1),
-                        req.page.checked_add(1).filter(|&p| p < req.doc.pages),
-                    ]
-                    .into_iter()
-                    .flatten()
-                    {
-                        let cache = &cache;
-                        let cancelled = &cancelled;
-                        let path = req.doc.snapshot_path();
-                        scope.spawn(move |_| {
-                            let _ = cached(cache, Key { page, ..key }, path, cancelled);
-                        });
+                // Release obsolete speculative rasters to make room as the window moves.
+                {
+                    let mut cache = cache.lock().unwrap();
+                    let obsolete: Vec<_> = cache
+                        .images
+                        .iter()
+                        .map(|(&k, _)| k)
+                        .filter(|k| {
+                            k.revision != key.revision
+                                || k.width != key.width
+                                || k.page.abs_diff(key.page) > 3
+                        })
+                        .collect();
+                    for old in obsolete {
+                        if let Some(image) = cache.images.pop(&old) {
+                            cache.bytes -= image.as_bytes().len();
+                        }
                     }
-                });
+                }
+                // Complete each distance before starting the next: Rayon scopes alone
+                // do not guarantee FIFO priority. At most two renders run concurrently.
+                for distance in 1..=3 {
+                    if cancelled() {
+                        break;
+                    }
+                    pool.scope(|scope| {
+                        for page in neighbors(req.page, req.doc.pages, distance)
+                            .into_iter()
+                            .flatten()
+                        {
+                            let cache = &cache;
+                            let cancelled = &cancelled;
+                            let path = req.doc.snapshot_path();
+                            scope.spawn(move |_| {
+                                let _ = prefetch(cache, Key { page, ..key }, key, path, cancelled);
+                            });
+                        }
+                    });
+                }
             }
         });
         Ok(Self {
@@ -208,6 +238,45 @@ impl Drop for Renderer {
         }
     }
 }
+fn neighbors(page: u32, pages: u32, distance: u32) -> [Option<u32>; 2] {
+    [
+        page.checked_add(distance).filter(|&p| p < pages),
+        page.checked_sub(distance),
+    ]
+}
+
+fn prefetch(
+    cache: &Mutex<Cache>,
+    key: Key,
+    current: Key,
+    path: &Path,
+    cancelled: &(impl Fn() -> bool + Sync),
+) -> Result<()> {
+    if cancelled() {
+        return Ok(());
+    }
+    {
+        let cache = cache.lock().unwrap();
+        if cache.images.contains(&key) {
+            return Ok(());
+        }
+        // Use the current raster as a conservative estimate before doing work.
+        // Exact admission below also handles mixed-size/orientation pages.
+        let estimate = cache
+            .images
+            .peek(&current)
+            .map_or(0, |img| img.as_bytes().len());
+        if cache.images.len() == 8 || cache.bytes.saturating_add(estimate) > cache.limit {
+            return Ok(());
+        }
+    }
+    let image = Arc::new(rasterize(path, key.page, key.width, cancelled)?);
+    if !cancelled() {
+        cache.lock().unwrap().insert_prefetched(key, image);
+    }
+    Ok(())
+}
+
 fn cached(
     cache: &Mutex<Cache>,
     key: Key,
@@ -258,6 +327,30 @@ fn rasterize(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn prefetch_bounds_and_budget() {
+        assert_eq!(neighbors(0, 10, 1), [Some(1), None]);
+        assert_eq!(neighbors(9, 10, 3), [None, Some(6)]);
+        assert_eq!(neighbors(4, 10, 3), [Some(7), Some(1)]);
+        assert_eq!(neighbors(u32::MAX, u32::MAX, 1), [None, Some(u32::MAX - 1)]);
+        let img = Arc::new(DynamicImage::new_rgb8(10, 10));
+        let size = img.as_bytes().len();
+        let key = Key {
+            revision: 1,
+            page: 0,
+            width: 10,
+        };
+        let mut cache = Cache::new(size * 7);
+        cache.insert(key, img.clone());
+        for page in 1..10 {
+            cache.insert_prefetched(Key { page, ..key }, img.clone());
+        }
+        assert_eq!(cache.images.len(), 7);
+        assert_eq!(cache.bytes, size * 7);
+        assert!(cache.images.contains(&key));
+        assert!(cache.images.contains(&Key { page: 1, ..key }));
+        assert!(!cache.images.contains(&Key { page: 7, ..key }));
+    }
     fn fixture() -> std::path::PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sample.pdf")
     }

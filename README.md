@@ -1,5 +1,13 @@
 # Leafview
 
+> I vibe-coded this, inspired by [Fancy Cat](https://github.com/freref/fancy-cat).
+> It works on my system — Ubuntu 26.04.1 LTS with Ghostty and tmux 3.6.
+> I don't know how well it works on other setups. This is a personal project,
+> not a promise of production readiness or universal terminal compatibility.
+>
+> Leafview is a separate Rust project, not a fork of Fancy Cat. Thanks to Fancy
+> Cat for the inspiration!
+
 A small Linux terminal PDF viewer for a Neovim/Typst + tmux workflow.
 Poppler renders real PDF pages; ratatui-image handles Kitty graphics, Sixel,
 iTerm2 and the halfblocks fallback. No browser or GUI PDF viewer is needed.
@@ -82,7 +90,10 @@ establish graphics support, halfblocks provide a lower-resolution fallback.
   is validated before terminal entry; subsequent reloads run in a worker.
 - Renderer: one latest-request mailbox, monotonic generation IDs, bounded result
   slot. Obsolete Poppler jobs are killed and reaped on a new request or shutdown.
-- Two Rayon workers prefetch adjacent pages using independent child processes.
+- Two Rayon workers prefetch up to three pages ahead and three behind using
+  independent child processes. Nearest pairs complete before farther pairs start.
+  The sliding seven-page window releases obsolete speculative rasters; prefetch
+  stops at the existing memory budget and never evicts the current/nearby pages.
   Structured scopes prevent detached jobs or an accumulating prefetch backlog.
 - Raster LRU: at most eight entries **and 96 MiB** of pixel data, keyed by
   document revision/page/width. Scroll crops cached pixels, not a new PDF render.
@@ -130,6 +141,7 @@ See [VERIFICATION.md](VERIFICATION.md) for actual results, remaining gaps and a
 repeatable real-terminal checklist. `scripts/publish-private.sh` is an optional
 maintainer helper, never required for installation or daily use; it only creates
 private repositories and refuses to modify an existing remote repository.
+The Leafview repository itself is now public by the author's choice.
 
 ## Troubleshooting
 
