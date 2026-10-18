@@ -1,7 +1,8 @@
 //! Owned, bounded background tasks. Drop cancels queued work and joins the worker.
+use std::time::Duration;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    mpsc::{self, Receiver, SyncSender},
+    mpsc::{self, Receiver, SyncSender, TrySendError},
     Arc,
 };
 use std::thread::{self, JoinHandle};
@@ -23,9 +24,22 @@ impl<I: Send + 'static, O: Send + 'static> Worker<I, O> {
                 if stopped.load(Ordering::SeqCst) {
                     break;
                 }
-                let result = f(input, &stopped);
-                if stopped.load(Ordering::SeqCst) || done.try_send(result).is_err() {
-                    break;
+                let mut result = f(input, &stopped);
+                // A full output slot is backpressure, not a worker failure.
+                // Dropping the thread here previously caused silent permanent
+                // stalls after rapid input/reload or a slow UI frame.
+                loop {
+                    if stopped.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    match done.try_send(result) {
+                        Ok(()) => break,
+                        Err(TrySendError::Full(value)) => {
+                            result = value;
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(TrySendError::Disconnected(_)) => return,
+                    }
                 }
             }
         });
@@ -50,6 +64,17 @@ impl<I, O> Drop for Worker<I, O> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn full_output_slot_does_not_stop_worker() {
+        let worker = Worker::new(|value: u32, _| value);
+        worker.input.as_ref().unwrap().send(1).unwrap();
+        worker.input.as_ref().unwrap().send(2).unwrap();
+        thread::sleep(Duration::from_millis(30));
+        assert_eq!(worker.output.recv_timeout(Duration::from_secs(1)).unwrap(), 1);
+        assert_eq!(worker.output.recv_timeout(Duration::from_secs(1)).unwrap(), 2);
+        worker.input.as_ref().unwrap().send(3).unwrap();
+        assert_eq!(worker.output.recv_timeout(Duration::from_secs(1)).unwrap(), 3);
+    }
     #[test]
     fn bounded_work_and_owned_shutdown() {
         let worker = Worker::new(|n: u32, stop| {
