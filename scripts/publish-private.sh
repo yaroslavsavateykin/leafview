@@ -12,15 +12,17 @@ fi
 if [[ ! -d .git ]]; then git init -b main; fi
 # Lockfile is generated locally, not guessed; build requires Cargo.
 if command -v cargo >/dev/null; then
-  cargo fmt --all
-  cargo generate-lockfile
-  cargo test
-  cargo build --release
+  cargo fmt --all -- --check
+  cargo check --locked
+  cargo test --locked
+  cargo clippy --locked --all-targets -- -D warnings
+  cargo build --locked --release
+  python3 scripts/pty-smoke.py
 else
   echo 'Cargo not available: refusing to publish uncompiled source.' >&2
   exit 1
 fi
-git add .
+git add Cargo.toml Cargo.lock src tests scripts .github .gitignore README.md VERIFICATION.md LICENSE
 git commit -m "Initial Leafview terminal PDF viewer"
 gh repo create "$repo" --private --source . --remote origin --push
 echo "Private repository created: $(gh repo view --json url -q .url)"

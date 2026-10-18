@@ -1,16 +1,62 @@
-//! Latest-wins rendering mailbox and bounded raster cache.
-//! One coordinator owns PDF rendering requests; Rayon (two workers) prefetches neighbors.
-use crate::{document::Document, view::{crop_bounds, Viewport}};
-use anyhow::{bail, Context, Result};
-use image::{DynamicImage, ImageFormat};
+//! Single-slot latest-wins mailbox, byte-bounded cache and cancellable Poppler jobs.
+use crate::{
+    document::Document,
+    view::{crop_bounds, Viewport},
+};
+use anyhow::{Context, Result};
+use image::{DynamicImage, ImageReader, Limits};
 use lru::LruCache;
-use rayon::ThreadPool;
-use std::{num::NonZeroUsize, path::Path, process::Command, sync::{atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering}, mpsc::Sender, Arc, Condvar, Mutex}, thread};
+use std::{
+    io::{BufReader, Seek, SeekFrom},
+    num::NonZeroUsize,
+    path::Path,
+    process::Command,
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc::SyncSender,
+        Arc, Condvar, Mutex,
+    },
+    thread,
+};
 
 #[derive(Clone, Copy, Hash, PartialEq, Eq, Debug)]
-struct Key { revision: u64, page: u32, width: u32 }
-type RasterCache = Arc<Mutex<LruCache<Key, Arc<DynamicImage>>>>;
-
+struct Key {
+    revision: u64,
+    page: u32,
+    width: u32,
+}
+struct Cache {
+    images: LruCache<Key, Arc<DynamicImage>>,
+    bytes: usize,
+    limit: usize,
+}
+impl Cache {
+    fn new(limit: usize) -> Self {
+        Self {
+            images: LruCache::new(NonZeroUsize::new(8).unwrap()),
+            bytes: 0,
+            limit,
+        }
+    }
+    fn insert(&mut self, key: Key, image: Arc<DynamicImage>) {
+        if let Some(old) = self.images.pop(&key) {
+            self.bytes -= old.as_bytes().len();
+        }
+        let size = image.as_bytes().len();
+        if size > self.limit {
+            return;
+        }
+        while self.bytes + size > self.limit || self.images.len() == 8 {
+            if let Some((_, old)) = self.images.pop_lru() {
+                self.bytes -= old.as_bytes().len();
+            } else {
+                break;
+            }
+        }
+        self.bytes += size;
+        self.images.put(key, image);
+    }
+}
 #[derive(Clone)]
 pub struct Request {
     pub generation: u64,
@@ -21,156 +67,288 @@ pub struct Request {
     pub x: u32,
     pub y: u32,
 }
-
 pub struct Completed {
     pub generation: u64,
     pub image: Result<DynamicImage, String>,
     pub x: u32,
     pub y: u32,
 }
-
 #[derive(Default)]
-struct Mailbox { latest: Option<Request>, closed: bool }
-
+struct Mailbox {
+    latest: Option<Request>,
+    closed: bool,
+}
 pub struct Renderer {
     inbox: Arc<(Mutex<Mailbox>, Condvar)>,
     generation: Arc<AtomicU64>,
     stopped: Arc<AtomicBool>,
     worker: Option<thread::JoinHandle<()>>,
 }
-
 impl Renderer {
-    pub fn new(tx: Sender<Completed>) -> Result<Self> {
+    pub fn new(tx: SyncSender<Completed>) -> Result<Self> {
         let inbox = Arc::new((Mutex::new(Mailbox::default()), Condvar::new()));
         let generation = Arc::new(AtomicU64::new(0));
         let stopped = Arc::new(AtomicBool::new(false));
-        let cache: RasterCache = Arc::new(Mutex::new(LruCache::new(NonZeroUsize::new(4).unwrap())));
-        let prefetch_pending = Arc::new(AtomicUsize::new(0));
-        let pool = rayon::ThreadPoolBuilder::new().num_threads(2)
-            .thread_name(|index| format!("leafview-prefetch-{index}"))
-            .build().context("create Rayon pool")?;
-        let (worker_inbox, worker_generation, worker_stopped) = (inbox.clone(), generation.clone(), stopped.clone());
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .thread_name(|i| format!("leafview-raster-{i}"))
+            .build()?;
+        let (wi, wg, ws) = (inbox.clone(), generation.clone(), stopped.clone());
         let worker = thread::spawn(move || {
-            coordinate(worker_inbox, worker_generation, worker_stopped, cache, pool, prefetch_pending, tx);
+            let cache = Mutex::new(Cache::new(96 * 1024 * 1024));
+            loop {
+                let req = {
+                    let (lock, cv) = &*wi;
+                    let mut slot = lock.lock().unwrap();
+                    while slot.latest.is_none() && !slot.closed {
+                        slot = cv.wait(slot).unwrap();
+                    }
+                    if slot.closed {
+                        break;
+                    }
+                    slot.latest.take().unwrap()
+                };
+                let cancelled =
+                    || ws.load(Ordering::SeqCst) || wg.load(Ordering::SeqCst) != req.generation;
+                if cancelled() {
+                    continue;
+                }
+                let key = Key {
+                    revision: req.doc.revision,
+                    page: req.page,
+                    width: req.width,
+                };
+                let result = cached(&cache, key, req.doc.snapshot_path(), &cancelled).map(|r| {
+                    let (x, y, w, h) =
+                        crop_bounds(r.width(), r.height(), req.viewport, req.x, req.y);
+                    (r.crop_imm(x, y, w, h), x, y)
+                });
+                if cancelled() {
+                    continue;
+                }
+                let success = result.is_ok();
+                let (image, x, y) = match result {
+                    Ok((img, x, y)) => (Ok(img), x, y),
+                    Err(e) => (Err(format!("{e:#}")), req.x, req.y),
+                };
+                // A full result slot is harmless: the UI will drain it and reschedule.
+                // Retrying is cancellable and cannot block shutdown.
+                let mut completed = Completed {
+                    generation: req.generation,
+                    image,
+                    x,
+                    y,
+                };
+                loop {
+                    match tx.try_send(completed) {
+                        Ok(()) => break,
+                        Err(std::sync::mpsc::TrySendError::Full(value)) => {
+                            completed = value;
+                            if cancelled() {
+                                break;
+                            }
+                            thread::sleep(std::time::Duration::from_millis(5));
+                        }
+                        Err(_) => return,
+                    }
+                }
+                if !success || cancelled() {
+                    continue;
+                }
+                // Structured parallelism: at most two children, all joined before the next
+                // request. New generations cancel both children within one polling interval.
+                pool.scope(|scope| {
+                    for page in [
+                        req.page.checked_sub(1),
+                        req.page.checked_add(1).filter(|&p| p < req.doc.pages),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    {
+                        let cache = &cache;
+                        let cancelled = &cancelled;
+                        let path = req.doc.snapshot_path();
+                        scope.spawn(move |_| {
+                            let _ = cached(cache, Key { page, ..key }, path, cancelled);
+                        });
+                    }
+                });
+            }
         });
-        Ok(Self { inbox, generation, stopped, worker: Some(worker) })
+        Ok(Self {
+            inbox,
+            generation,
+            stopped,
+            worker: Some(worker),
+        })
     }
-
     pub fn request(&self, mut request: Request) {
-        // Atomic generation number ensures stale completions never override a newer page.
         request.generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
-        let (mutex, cv) = &*self.inbox;
-        if let Ok(mut slot) = mutex.lock() {
-            slot.latest = Some(request); // replace, don't enqueue unbounded work
-            cv.notify_one();
-        }
+        let (lock, cv) = &*self.inbox;
+        let mut slot = lock.lock().unwrap();
+        slot.latest = Some(request);
+        cv.notify_one();
     }
-
-    pub fn current_generation(&self) -> u64 { self.generation.load(Ordering::SeqCst) }
+    pub fn current_generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
 }
-
 impl Drop for Renderer {
     fn drop(&mut self) {
         self.stopped.store(true, Ordering::SeqCst);
-        let (mutex, cv) = &*self.inbox;
-        if let Ok(mut slot) = mutex.lock() { slot.closed = true; slot.latest = None; cv.notify_all(); }
-        // A renderer can be inside a native subprocess. Do not freeze quit waiting for it:
-        // the detached coordinator and bounded-time child finish without touching the TTY.
-        let _ = self.worker.take();
-    }
-}
-
-fn coordinate(inbox: Arc<(Mutex<Mailbox>, Condvar)>, generation: Arc<AtomicU64>, stopped: Arc<AtomicBool>, cache: RasterCache, pool: ThreadPool, prefetch_pending: Arc<AtomicUsize>, tx: Sender<Completed>) {
-    loop {
-        let req = {
-            let (mutex, cv) = &*inbox;
-            let mut slot = match mutex.lock() { Ok(s) => s, Err(_) => break };
-            while slot.latest.is_none() && !slot.closed {
-                slot = match cv.wait(slot) { Ok(s) => s, Err(_) => return };
-            }
-            if slot.closed { break; }
-            slot.latest.take().expect("mailbox has a request")
-        };
-        if stopped.load(Ordering::Relaxed) { break; }
-        if req.generation != generation.load(Ordering::SeqCst) { continue; }
-        let key = Key { revision: req.doc.revision, page: req.page, width: req.width };
-        let result = raster_cached(&cache, key, req.doc.snapshot_path()).map(|raster| {
-            let (x,y,w,h) = crop_bounds(raster.width(),raster.height(),req.viewport,req.x,req.y);
-            (raster.crop_imm(x,y,w,h), x, y)
-        });
-        if req.generation != generation.load(Ordering::SeqCst) { continue; }
-        let success = result.is_ok();
-        let (image, x, y) = match result {
-            Ok((image,x,y)) => (Ok(image),x,y),
-            Err(error) => (Err(format!("{error:#}")),req.x,req.y),
-        };
-        if tx.send(Completed { generation: req.generation, image, x, y }).is_err() { break; }
-        if !success { continue; }
-
-        // Prefetch only for the current generation. The two Rayon workers do independent
-        // PDF renders; no native PDF context is shared between threads.
-        for neighbor in [req.page.checked_sub(1), req.page.checked_add(1).filter(|&p| p < req.doc.pages)].into_iter().flatten() {
-            if prefetch_pending.load(Ordering::SeqCst) >= 2 { continue; }
-            prefetch_pending.fetch_add(1, Ordering::SeqCst);
-            let prefetch_pending = prefetch_pending.clone();
-            let (cache, generation, stopped, doc, width, request_generation) =
-                (cache.clone(), generation.clone(), stopped.clone(), req.doc.clone(), req.width, req.generation);
-            pool.spawn(move || {
-                if !stopped.load(Ordering::Relaxed) && generation.load(Ordering::SeqCst) == request_generation {
-                    let key = Key { revision: doc.revision, page: neighbor, width };
-                    let _ = raster_cached(&cache, key, doc.snapshot_path());
-                }
-                prefetch_pending.fetch_sub(1, Ordering::SeqCst);
-            });
+        let (lock, cv) = &*self.inbox;
+        {
+            let mut slot = lock.lock().unwrap();
+            slot.closed = true;
+            slot.latest = None;
+            cv.notify_all();
+        }
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
         }
     }
 }
-
-fn raster_cached(cache: &RasterCache, key: Key, path: &Path) -> Result<Arc<DynamicImage>> {
-    if let Some(image) = cache.lock().expect("cache mutex poisoned").get(&key).cloned() { return Ok(image); }
-    let image = Arc::new(rasterize(path,key.page,key.width)?);
-    cache.lock().expect("cache mutex poisoned").put(key,image.clone());
-    Ok(image)
-}
-
-fn rasterize(path: &Path, page_zero_based: u32, width: u32) -> Result<DynamicImage> {
-    let page = page_zero_based.checked_add(1).context("page index overflow")?;
-    // GNU timeout bounds worst-case PDF rendering; the worker never writes to the terminal.
-    let output = Command::new("timeout")
-        .args(["--signal=KILL", "12s", "pdftoppm", "-f"]).arg(page.to_string())
-        .args(["-l"]).arg(page.to_string())
-        .args(["-singlefile", "-scale-to-x"]).arg(width.clamp(100,3400).to_string())
-        .args(["-scale-to-y", "-1", "-png"])
-        .arg(path).output().context("run Poppler (install poppler-utils and coreutils)")?;
-    if !output.status.success() {
-        bail!("pdftoppm failed: {}", String::from_utf8_lossy(&output.stderr).trim());
+fn cached(
+    cache: &Mutex<Cache>,
+    key: Key,
+    path: &Path,
+    cancelled: &(impl Fn() -> bool + Sync),
+) -> Result<Arc<DynamicImage>> {
+    if let Some(image) = cache.lock().unwrap().images.get(&key).cloned() {
+        return Ok(image);
     }
-    if output.stdout.len() > 80 * 1024 * 1024 { bail!("rendered page exceeds 80 MiB PNG limit"); }
-    let image = image::load_from_memory_with_format(&output.stdout,ImageFormat::Png)
-        .context("decode Poppler PNG")?;
-    if image.width() as u64 * image.height() as u64 > 22_000_000 {
-        bail!("PDF image too large (over 22 million pixels)");
+    let image = Arc::new(rasterize(path, key.page, key.width, cancelled)?);
+    if !cancelled() {
+        cache.lock().unwrap().insert(key, image.clone());
     }
     Ok(image)
 }
-
+fn rasterize(
+    path: &Path,
+    page: u32,
+    width: u32,
+    cancelled: impl Fn() -> bool,
+) -> Result<DynamicImage> {
+    let page = page.checked_add(1).context("page overflow")?.to_string();
+    let mut command = Command::new("pdftoppm");
+    command
+        .args([
+            "-f",
+            &page,
+            "-l",
+            &page,
+            "-singlefile",
+            "-scale-to-x",
+            &width.clamp(100, 3400).to_string(),
+            "-scale-to-y",
+            "-1",
+            "-png",
+        ])
+        .arg(path);
+    let mut output = crate::process::run(&mut command, 80 * 1024 * 1024, &cancelled)?;
+    output.seek(SeekFrom::Start(0))?;
+    let mut reader = ImageReader::new(BufReader::new(output)).with_guessed_format()?;
+    let mut limits = Limits::default();
+    limits.max_image_width = Some(3400);
+    limits.max_image_height = Some(12000);
+    limits.max_alloc = Some(96 * 1024 * 1024);
+    reader.limits(limits);
+    reader.decode().context("decode bounded Poppler PNG")
+}
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test] fn independent_cache_keys() {
-        assert_ne!(Key { revision: 1,page: 0,width: 800 },Key { revision: 1,page: 0,width: 1000 });
-        assert_ne!(Key { revision: 1,page: 0,width: 800 },Key { revision: 2,page: 0,width: 800 });
+    fn fixture() -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sample.pdf")
     }
-}
-
-#[cfg(test)]
-mod pdf_smoke_test {
-    use super::*;
     #[test]
-    fn rasterizes_fixture_as_image() {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sample.pdf");
-        let img = rasterize(&path, 1, 800).unwrap();
+    #[ignore = "generate /tmp/leafview-bench using scripts/make-bench-fixtures.py first"]
+    fn profile_synthetic_pdfs() {
+        use std::time::Instant;
+        for name in ["small", "long", "vector", "raster", "math"] {
+            let path = std::path::PathBuf::from(format!("/tmp/leafview-bench/{name}.pdf"));
+            let start = Instant::now();
+            let doc = Document::open(&path, 1).unwrap();
+            let open = start.elapsed();
+            let cache = Mutex::new(Cache::new(96 * 1024 * 1024));
+            let key = Key {
+                revision: 1,
+                page: 0,
+                width: 1000,
+            };
+            let start = Instant::now();
+            let raster = cached(&cache, key, doc.snapshot_path(), &|| false).unwrap();
+            let render_decode = start.elapsed();
+            let start = Instant::now();
+            for _ in 0..1000 {
+                assert!(Arc::ptr_eq(
+                    &raster,
+                    &cached(&cache, key, doc.snapshot_path(), &|| false).unwrap()
+                ));
+            }
+            let hits = start.elapsed();
+            let start = Instant::now();
+            let crop = raster.crop_imm(0, 0, 1000, raster.height().min(700));
+            let crop_time = start.elapsed();
+            let start = Instant::now();
+            let _ = ratatui_image::protocol::kitty::Kitty::new(
+                crop,
+                ratatui::layout::Size::new(100, 35),
+                123,
+                false,
+            )
+            .unwrap();
+            println!("{name}: pages={} open={open:?} render+decode={render_decode:?} 1000 cache hits={hits:?} crop={crop_time:?} kitty encode={:?}",doc.pages,start.elapsed());
+        }
+    }
+    #[test]
+    fn raster_and_cache() {
+        let img = Arc::new(rasterize(&fixture(), 1, 800, || false).unwrap());
         assert_eq!(img.width(), 800);
         assert!(img.height() > 800);
+        let size = img.as_bytes().len();
+        let mut cache = Cache::new(size);
+        let key = Key {
+            revision: 1,
+            page: 0,
+            width: 800,
+        };
+        cache.insert(key, img.clone());
+        cache.insert(Key { page: 1, ..key }, img);
+        assert_eq!(cache.bytes, size);
+        assert!(!cache.images.contains(&key));
+    }
+    #[test]
+    fn latest_wins_and_shutdown() {
+        let doc = Arc::new(Document::open(&fixture(), 1).unwrap());
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let renderer = Renderer::new(tx).unwrap();
+        for i in 0..1000 {
+            renderer.request(Request {
+                generation: 0,
+                doc: doc.clone(),
+                page: i % 3,
+                width: 400,
+                viewport: Viewport {
+                    width: 400,
+                    height: 600,
+                },
+                x: 0,
+                y: 0,
+            });
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let result = rx
+                .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                .unwrap();
+            if result.generation == renderer.current_generation() {
+                assert!(result.image.is_ok());
+                break;
+            }
+        }
+        let start = std::time::Instant::now();
+        drop(renderer);
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
     }
 }
