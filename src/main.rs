@@ -539,6 +539,16 @@ fn watch(
 fn viewer_loop(path: PathBuf, doc: Arc<Document>, mut terminal: DefaultTerminal) -> Result<()> {
     // Picker queries must occur after alternate-screen entry, before event polling.
     let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
+    if env::var("LEAFVIEW_DEBUG").is_ok() {
+        eprintln!(
+            "leafview: protocol={:?} font={:?} tmux_env={:?} term={:?} term_program={:?}",
+            picker.protocol_type(),
+            picker.font_size(),
+            env::var("TMUX").is_ok(),
+            env::var("TERM").ok(),
+            env::var("TERM_PROGRAM").ok(),
+        );
+    }
     // Do not feed unsolicited mouse/focus reports into the capability parser.
     // Enable reporting only after its terminal query has finished.
     crossterm::execute!(
