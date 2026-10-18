@@ -47,6 +47,7 @@ struct App {
     displayed: Option<RenderGeometry>,
     image_area: ratatui::layout::Rect,
     hovered: Option<usize>,
+    hover_deadline: Option<Instant>,
     pointer: Option<(u16, u16)>,
     destination: Option<Destination>,
     history: std::collections::VecDeque<View>,
@@ -266,8 +267,41 @@ impl App {
             });
         if hovered != self.hovered {
             self.hovered = hovered;
+            self.hover_deadline = hovered.map(|_| Instant::now() + Duration::from_millis(150));
             self.dirty = true;
         }
+    }
+    fn maybe_hint(&mut self) {
+        let Some(deadline) = self.hover_deadline else {
+            return;
+        };
+        if Instant::now() < deadline {
+            return;
+        }
+        self.hover_deadline = None;
+        let Some(id) = self.hovered else {
+            return;
+        };
+        let destination = match self
+            .displayed
+            .as_ref()
+            .and_then(|g| g.links.as_ref())
+            .and_then(|l| l.links.get(id))
+        {
+            Some(link) => match &link.action {
+                LinkAction::Internal(destination) => destination.clone(),
+                _ => return,
+            },
+            None => return,
+        };
+        if destination.page == self.view.page {
+            return;
+        }
+        let zoom =
+            destination.view_zoom((self.viewport.width, self.viewport.height), self.view.zoom);
+        let width = ((self.viewport.width.max(1) as f32 * zoom).round() as u32).clamp(100, 3400);
+        self.renderer
+            .hint(self.doc.clone(), destination.page, width);
     }
     fn on_mouse(&mut self, event: MouseEvent) {
         self.pointer = Some((event.column, event.row));
@@ -362,6 +396,7 @@ impl App {
                     self.image = Some(proto);
                     self.displayed = Some(geometry);
                     self.hovered = None;
+                    self.hover_deadline = None;
                     self.destination = None;
                 }
                 Err(err) => self.error = Some(format!("Image encoding: {err}")),
@@ -569,6 +604,7 @@ fn viewer_loop(path: PathBuf, doc: Arc<Document>, mut terminal: DefaultTerminal)
         displayed: None,
         image_area: ratatui::layout::Rect::default(),
         hovered: None,
+        hover_deadline: None,
         pointer: None,
         destination: None,
         history: std::collections::VecDeque::new(),
@@ -591,6 +627,7 @@ fn viewer_loop(path: PathBuf, doc: Arc<Document>, mut terminal: DefaultTerminal)
     let mut reload_due: Option<Instant> = None;
     loop {
         app.consume();
+        app.maybe_hint();
         while let Ok(event) = watched.try_recv() {
             match event {
                 Ok(e) => {
@@ -624,6 +661,7 @@ fn viewer_loop(path: PathBuf, doc: Arc<Document>, mut terminal: DefaultTerminal)
                 Event::Mouse(mouse) => app.on_mouse(mouse),
                 Event::Resize(width, height) => {
                     app.hovered = None;
+                    app.hover_deadline = None;
                     app.image_area = ratatui::layout::Rect::default();
                     app.geometry(Size::new(width, height));
                     app.dirty = true;
@@ -631,6 +669,7 @@ fn viewer_loop(path: PathBuf, doc: Arc<Document>, mut terminal: DefaultTerminal)
                 Event::FocusLost => {
                     app.pointer = None;
                     app.hovered = None;
+                    app.hover_deadline = None;
                     app.dirty = true;
                 }
                 Event::FocusGained => {

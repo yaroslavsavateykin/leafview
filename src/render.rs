@@ -12,7 +12,7 @@ use std::{
     path::Path,
     process::Command,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc::SyncSender,
         Arc, Condvar, Mutex,
     },
@@ -84,15 +84,22 @@ pub struct Completed {
     pub x: u32,
     pub y: u32,
 }
+struct Hint {
+    doc: Arc<Document>,
+    page: u32,
+    width: u32,
+}
 #[derive(Default)]
 struct Mailbox {
     latest: Option<Request>,
+    hint: Option<Hint>,
     closed: bool,
 }
 pub struct Renderer {
     inbox: Arc<(Mutex<Mailbox>, Condvar)>,
     generation: Arc<AtomicU64>,
     stopped: Arc<AtomicBool>,
+    cache: Arc<Mutex<Cache>>,
     worker: Option<thread::JoinHandle<()>>,
 }
 impl Renderer {
@@ -100,24 +107,63 @@ impl Renderer {
         let inbox = Arc::new((Mutex::new(Mailbox::default()), Condvar::new()));
         let generation = Arc::new(AtomicU64::new(0));
         let stopped = Arc::new(AtomicBool::new(false));
+        let hint_pending = Arc::new(AtomicUsize::new(0));
+        let cache: Arc<Mutex<Cache>> = Arc::new(Mutex::new(Cache::new(96 * 1024 * 1024)));
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(2)
             .thread_name(|i| format!("leafview-raster-{i}"))
             .build()?;
-        let (wi, wg, ws) = (inbox.clone(), generation.clone(), stopped.clone());
+        let (wi, wg, ws, wp, wc) = (
+            inbox.clone(),
+            generation.clone(),
+            stopped.clone(),
+            hint_pending.clone(),
+            cache.clone(),
+        );
         let worker = thread::spawn(move || {
-            let cache = Mutex::new(Cache::new(96 * 1024 * 1024));
             loop {
-                let req = {
+                let (request, hint) = {
                     let (lock, cv) = &*wi;
                     let mut slot = lock.lock().unwrap();
-                    while slot.latest.is_none() && !slot.closed {
+                    while slot.latest.is_none() && slot.hint.is_none() && !slot.closed {
                         slot = cv.wait(slot).unwrap();
                     }
                     if slot.closed {
                         break;
                     }
-                    slot.latest.take().unwrap()
+                    // Visible pages always preempt hints; the hint stays queued.
+                    let request = slot.latest.take();
+                    let hint = if request.is_none() {
+                        slot.hint.take()
+                    } else {
+                        None
+                    };
+                    (request, hint)
+                };
+                let Some(req) = request else {
+                    // Warm a hovered internal destination off the critical path.
+                    if let Some(hint) = hint {
+                        if ws.load(Ordering::SeqCst) || wp.load(Ordering::SeqCst) >= 1 {
+                            continue;
+                        }
+                        let key = Key {
+                            revision: hint.doc.revision,
+                            page: hint.page,
+                            width: hint.width,
+                        };
+                        if wc.lock().unwrap().images.contains(&key) {
+                            continue;
+                        }
+                        wp.fetch_add(1, Ordering::SeqCst);
+                        let (cache, stopped, pending, doc) =
+                            (wc.clone(), ws.clone(), wp.clone(), hint.doc);
+                        pool.spawn(move || {
+                            let cancelled = || stopped.load(Ordering::SeqCst);
+                            let _ = cached(&cache, key, doc.snapshot_path(), &cancelled);
+                            pending.fetch_sub(1, Ordering::SeqCst);
+                        });
+                    }
+                    continue;
                 };
                 let cancelled =
                     || ws.load(Ordering::SeqCst) || wg.load(Ordering::SeqCst) != req.generation;
@@ -129,7 +175,7 @@ impl Renderer {
                     page: req.page,
                     width: req.width,
                 };
-                let result = cached(&cache, key, req.doc.snapshot_path(), &cancelled).map(|r| {
+                let result = cached(&wc, key, req.doc.snapshot_path(), &cancelled).map(|r| {
                     let (sx, sy) = req.destination.as_ref().map_or((req.x, req.y), |d| {
                         d.offsets((r.width(), r.height()), (req.x, req.y))
                     });
@@ -185,7 +231,7 @@ impl Renderer {
                 }
                 // Release obsolete speculative rasters to make room as the window moves.
                 {
-                    let mut cache = cache.lock().unwrap();
+                    let mut cache = wc.lock().unwrap();
                     let obsolete: Vec<_> = cache
                         .images
                         .iter()
@@ -213,7 +259,7 @@ impl Renderer {
                             .into_iter()
                             .flatten()
                         {
-                            let cache = &cache;
+                            let cache = &wc;
                             let cancelled = &cancelled;
                             let path = req.doc.snapshot_path();
                             scope.spawn(move |_| {
@@ -228,6 +274,7 @@ impl Renderer {
             inbox,
             generation,
             stopped,
+            cache,
             worker: Some(worker),
         })
     }
@@ -241,6 +288,28 @@ impl Renderer {
     pub fn current_generation(&self) -> u64 {
         self.generation.load(Ordering::SeqCst)
     }
+    pub fn hint(&self, doc: Arc<Document>, page: u32, width: u32) {
+        let key = Key {
+            revision: doc.revision,
+            page,
+            width,
+        };
+        if self.cache.lock().unwrap().images.contains(&key) {
+            return;
+        }
+        let (lock, cv) = &*self.inbox;
+        let mut slot = lock.lock().unwrap();
+        slot.hint = Some(Hint { doc, page, width });
+        cv.notify_one();
+    }
+    #[cfg(test)]
+    fn cache_contains(&self, revision: u64, page: u32, width: u32) -> bool {
+        self.cache.lock().unwrap().images.contains(&Key {
+            revision,
+            page,
+            width,
+        })
+    }
 }
 impl Drop for Renderer {
     fn drop(&mut self) {
@@ -250,6 +319,7 @@ impl Drop for Renderer {
             let mut slot = lock.lock().unwrap();
             slot.closed = true;
             slot.latest = None;
+            slot.hint = None;
             cv.notify_all();
         }
         if let Some(worker) = self.worker.take() {
@@ -485,5 +555,19 @@ mod tests {
         let start = std::time::Instant::now();
         drop(renderer);
         assert!(start.elapsed() < std::time::Duration::from_secs(2));
+    }
+    #[test]
+    fn hover_hint_warms_cache() {
+        use std::time::{Duration, Instant};
+        let doc = Arc::new(Document::open(&fixture(), 1).unwrap());
+        let (tx, _rx) = std::sync::mpsc::sync_channel(1);
+        let renderer = Renderer::new(tx).unwrap();
+        renderer.hint(doc.clone(), 2, 400);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !renderer.cache_contains(1, 2, 400) {
+            assert!(Instant::now() < deadline, "hint did not warm the cache");
+            thread::sleep(Duration::from_millis(10));
+        }
+        drop(renderer);
     }
 }

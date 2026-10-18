@@ -52,6 +52,11 @@ cleared on document reload). Fit/zoom requests respect Leafview's 50–300% limi
 External `http`/`https` links open asynchronously using `xdg-open` (`xdg-utils`
 package). JavaScript, Launch, file URLs and other PDF actions cannot execute.
 
+All annotations are indexed once per document snapshot, so each link's target
+page is known without re-parsing. Hovering an internal link for ~150 ms warms its
+destination page into the background raster cache (one in-flight job, cancelled
+on leave/shutdown), making the click follow the link without waiting for Poppler.
+
 Hit testing uses terminal **cells**, not mouse pixels: the cell center must be
 inside one link with at least half its area covered. Ambiguous cells, tiny links,
 padded image edges and stale/loading images cannot be activated. Zoom in if a
@@ -113,7 +118,9 @@ establish graphics support, halfblocks provide a lower-resolution fallback.
   independent child processes. Nearest pairs complete before farther pairs start.
   The sliding seven-page window releases obsolete speculative rasters; prefetch
   stops at the existing memory budget and never evicts the current/nearby pages.
-  Structured scopes prevent detached jobs or an accumulating prefetch backlog.
+  Hovered internal destinations are warmed as a separate latest-wins, single
+  in-flight job. Structured scopes prevent detached jobs or an accumulating
+  prefetch backlog.
 - Raster LRU: at most eight entries **and 96 MiB** of pixel data, keyed by
   document revision/page/width. Scroll crops cached pixels, not a new PDF render.
 - A single encoding worker builds fixed ratatui-image `Protocol`s off-thread.

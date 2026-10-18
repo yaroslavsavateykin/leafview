@@ -1,5 +1,16 @@
 # Verification — 2026-10-18
 
+## Hover destination prefetch
+
+Internal-link destinations are warmed into the raster cache while the pointer
+rests on a link (150 ms debounce, latest-wins hint slot, at most one in-flight
+hint render, cancelled via the existing stopped flag). The hint reuses the same
+raster width the destination zoom will request, so a following click usually hits
+the cache. New unit test `hover_hint_warms_cache` confirms the hinted page becomes
+cache-resident; visible requests still preempt hints. Re-ran fmt/check/test/clippy
+(`-D warnings`)/release build and PTY smoke: PASS (20 unit + 3 CLI, one ignored
+optional perf test).
+
 ## Terminal quality regression fix
 
 After the hyperlink update, mouse capture was enabled before the ratatui-image
