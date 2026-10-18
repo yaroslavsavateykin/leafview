@@ -75,12 +75,14 @@ struct App {
 struct GraphicsCleanup {
     id: u32,
     enabled: bool,
+    tmux: bool,
 }
 impl GraphicsCleanup {
-    fn new(enabled: bool) -> Self {
+    fn new(enabled: bool, tmux: bool) -> Self {
         Self {
             id: std::process::id(),
             enabled,
+            tmux,
         }
     }
 }
@@ -91,7 +93,7 @@ impl Drop for GraphicsCleanup {
             return;
         }
         let seq = format!("\x1b_Ga=d,d=I,i={},q=2;\x1b\\", self.id);
-        let seq = if env::var("TERM").is_ok_and(|v| v.starts_with("tmux")) {
+        let seq = if self.tmux {
             format!("\x1bPtmux;{}\x1b\\", seq.replace('\x1b', "\x1b\x1b"))
         } else {
             seq
@@ -642,8 +644,10 @@ fn viewer_loop(path: PathBuf, doc: Arc<Document>, mut terminal: DefaultTerminal)
     let font = picker.font_size();
     let (tx_completed, completed) = mpsc::sync_channel(1);
     let renderer = Renderer::new(tx_completed)?;
-    let graphics =
-        GraphicsCleanup::new(picker.protocol_type() == ratatui_image::picker::ProtocolType::Kitty);
+    let graphics = GraphicsCleanup::new(
+        picker.protocol_type() == ratatui_image::picker::ProtocolType::Kitty,
+        tmux,
+    );
     let image_id = graphics.id;
     let encoder = Worker::new(move |(geometry, image, _size): EncodeInput, _| {
         // Pad the last terminal cell instead of stretching the PDF pixels into
