@@ -1,16 +1,11 @@
 # Leafview
 
-> I vibe-coded this, inspired by [Fancy Cat](https://github.com/freref/fancy-cat).
-> It works on my system — Ubuntu 26.04.1 LTS with Ghostty and tmux 3.6.
-> I don't know how well it works on other setups. This is a personal project,
-> not a promise of production readiness or universal terminal compatibility.
->
-> Leafview is a separate Rust project, not a fork of Fancy Cat. Thanks to Fancy
-> Cat for the inspiration!
-
 A small Linux terminal PDF viewer for a Neovim/Typst + tmux workflow.
 Poppler renders real PDF pages; ratatui-image handles Kitty graphics, Sixel,
 iTerm2 and the halfblocks fallback. No browser or GUI PDF viewer is needed.
+
+Vibe-coded, inspired by [Fancy Cat](https://github.com/freref/fancy-cat).
+Works on my Ubuntu/Ghostty/tmux setup; other setups may vary.
 
 ## Installation (Ubuntu 24.04+)
 
@@ -45,17 +40,6 @@ versions, not the old Rust shipped by some distribution packages.
 One status bar shows the requested page, zoom, loading or error state. While
 loading, **the previous image remains visible** and is explicitly labelled as
 previous: do not mistake it for the requested page.
-
-## Live Typst preview
-
-Run `typst watch document.typ` alongside your editor and `leafview document.pdf`.
-The containing directory is watched, including atomic rename/replacement saves.
-A 350 ms quiet period debounces writes. Access events are ignored (reading a PDF
-must not trigger its own reload). Only one snapshot load runs at a time; changes
-during a load coalesce into one subsequent load. Invalid/missing replacements
-leave the previous document usable. There is no endless retry loop: the next
-file change or `r` retries. Page and zoom survive reload; page and scroll bounds
-are clamped to the new document.
 
 ## Terminals and tmux
 
