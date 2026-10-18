@@ -864,4 +864,3 @@ mod graphics_safety_tests {
         assert!(!use_safe_graphics(true, true, "native"));
     }
 }
-
