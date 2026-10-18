@@ -603,14 +603,16 @@ fn use_safe_graphics(tmux: bool, ghostty: bool, mode: &str) -> bool {
 }
 
 fn viewer_loop(path: PathBuf, doc: Arc<Document>, mut terminal: DefaultTerminal) -> Result<()> {
-    let tmux = env::var_os("TMUX").is_some()
-        || env::var("TERM").is_ok_and(|v| v.starts_with("tmux"));
+    let tmux =
+        env::var_os("TMUX").is_some() || env::var("TERM").is_ok_and(|v| v.starts_with("tmux"));
     let ghostty = env::var("TERM_PROGRAM").is_ok_and(|v| v.eq_ignore_ascii_case("ghostty"))
         || env::var_os("GHOSTTY_RESOURCES_DIR").is_some();
     let graphics_safe = use_safe_graphics(
         tmux,
         ghostty,
-        &env::var("LEAFVIEW_GRAPHICS").unwrap_or_default().to_ascii_lowercase(),
+        &env::var("LEAFVIEW_GRAPHICS")
+            .unwrap_or_default()
+            .to_ascii_lowercase(),
     );
     // Picker queries must occur after alternate-screen entry, before event polling.
     // In safe mode skip the graphics query entirely.
