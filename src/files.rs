@@ -482,7 +482,7 @@ fn contains_pdf(
         if kind.is_file() && is_document(&item.path()) {
             types |= if is_pdf(&item.path()) { 1 } else { 2 };
         }
-        if types == 3 {
+        if types != 0 {
             return Some(types);
         }
         if kind.is_dir() {
@@ -494,7 +494,7 @@ fn contains_pdf(
             Some(found) => types |= found,
             None => unknown = true,
         }
-        if types == 3 {
+        if types != 0 {
             return Some(types);
         }
     }
@@ -636,7 +636,7 @@ mod tests {
         std::fs::write(dir.path().join("nested/paper.PDF"), "pdf").unwrap();
         assert_eq!(contains_pdf(dir.path(), 0, &mut 100, &stop), Some(1));
         std::fs::write(dir.path().join("source.typ"), "").unwrap();
-        assert_eq!(contains_pdf(dir.path(), 0, &mut 100, &stop), Some(3));
+        assert!(contains_pdf(dir.path(), 0, &mut 100, &stop).is_some_and(|types| types != 0));
         assert_eq!(contains_pdf(dir.path(), 0, &mut 0, &stop), None);
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         assert_eq!(contains_pdf(dir.path(), 0, &mut 100, &stop), None);
@@ -689,6 +689,16 @@ mod tests {
         files.focused = false;
         files.focus_direction('h', 100);
         assert!(!files.visible && !files.focused);
+    }
+    #[test]
+    fn found_document_does_not_require_complete_tree_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("paper.pdf"), "").unwrap();
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        assert_eq!(contains_pdf(dir.path(), 0, &mut 1, &stop), Some(1));
+        std::fs::remove_file(dir.path().join("paper.pdf")).unwrap();
+        std::fs::write(dir.path().join("source.typ"), "").unwrap();
+        assert_eq!(contains_pdf(dir.path(), 0, &mut 1, &stop), Some(2));
     }
     #[test]
     fn panel_fits_small_terminals() {
