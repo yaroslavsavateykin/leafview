@@ -76,7 +76,7 @@ impl CompilerProcess {
     fn compile(
         &mut self,
         generation: u64,
-        stop: &std::sync::atomic::AtomicBool,
+        cancelled: &dyn Fn() -> bool,
     ) -> Result<(CompileReply, PathBuf)> {
         let output = self.directory.path().join("document.pdf");
         let reply = reply_path(&output);
@@ -94,7 +94,7 @@ impl CompilerProcess {
         self.input.flush()?;
         let start = Instant::now();
         while !reply.exists() {
-            if stop.load(Ordering::SeqCst) || start.elapsed() > Duration::from_secs(60) {
+            if cancelled() || start.elapsed() > Duration::from_secs(60) {
                 let _ = self.child.kill();
                 anyhow::bail!("Typst compilation cancelled or timed out");
             }
@@ -125,7 +125,11 @@ struct Finished {
     document: Option<Document>,
 }
 pub struct Live {
-    worker: Worker<u64, Result<Finished>>,
+    worker: Worker<(u64, crate::typst_options::Options), (u64, Result<Finished>)>,
+    publication: Arc<std::sync::Mutex<()>>,
+    options: crate::typst_options::Options,
+    input: PathBuf,
+    pub auto_compile: bool,
     generation: Arc<AtomicU64>,
     pending: bool,
     due: Option<Instant>,
@@ -141,65 +145,89 @@ pub struct Live {
     pub compiling: bool,
 }
 impl Live {
-    pub fn new(input: &Path, options: crate::typst_options::Options) -> Result<Self> {
-        let root = options
-            .root
-            .clone()
-            .unwrap_or_else(|| input.parent().unwrap().to_owned())
-            .canonicalize()?;
-        anyhow::ensure!(
-            input.starts_with(&root),
-            "Typst input must be within TYPST_ROOT"
-        );
-        let generation_counter = Arc::new(AtomicU64::new(1));
+    pub fn new(
+        input: &Path,
+        options: crate::typst_options::Options,
+        revision: u64,
+    ) -> Result<Self> {
+        crate::compile_config::validate(input, &options)?;
+        let generation_counter = Arc::new(AtomicU64::new(revision + 1));
         let desired_generation = generation_counter.clone();
+        let publication = Arc::new(std::sync::Mutex::new(()));
+        let publication_worker = publication.clone();
         let initial_input = input.to_owned();
         let input = input.to_owned();
-        let process = std::sync::Mutex::new(None::<CompilerProcess>);
-        let worker = Worker::new(move |generation, stop| {
-            let mut process = process.lock().unwrap();
-            if process.is_none() {
-                *process = Some(CompilerProcess::new(&input, &root, &options)?);
-            }
-            let result = process.as_mut().unwrap().compile(generation, stop);
-            let (mut reply, output) = match result {
-                Ok(v) => v,
-                Err(e) => {
-                    process.take();
-                    return Err(e);
-                }
-            };
-            let document = if reply.error.is_none() {
-                Some(Document::open_cancel(&output, generation, || {
-                    stop.load(Ordering::SeqCst)
-                })?)
-            } else {
-                None
-            };
-            let stale: Vec<_> = reply
-                .sources
-                .iter()
-                .filter(|(p, s)| std::fs::read_to_string(p).ok().as_ref() != Some(s))
-                .map(|(p, _)| p.clone())
-                .collect();
-            if !options.no_pdf
-                && reply.error.is_none()
-                && stale.is_empty()
-                && desired_generation.load(Ordering::SeqCst) == generation
-            {
-                if let Err(error) = publish_pdf(&output, &input.with_extension("pdf"), || {
-                    !stop.load(Ordering::SeqCst)
+        let current_options = options.clone();
+        let process = std::sync::Mutex::new((
+            None::<CompilerProcess>,
+            None::<crate::typst_options::Options>,
+        ));
+        let worker = Worker::new(
+            move |(generation, options): (u64, crate::typst_options::Options), stop| {
+                let result = (|| -> Result<Finished> {
+                    let cancelled = || {
+                        stop.load(Ordering::SeqCst)
+                            || desired_generation.load(Ordering::SeqCst) != generation
+                    };
+                    anyhow::ensure!(!cancelled(), "superseded compilation");
+                    let root = crate::compile_config::validate(&input, &options)?;
+                    let mut state = process.lock().unwrap();
+                    if state.1.as_ref() != Some(&options) {
+                        state.0.take();
+                        state.1 = Some(options.clone());
+                    }
+                    let process = &mut state.0;
+                    if process.is_none() {
+                        *process = Some(CompilerProcess::new(&input, &root, &options)?);
+                    }
+                    let result = process.as_mut().unwrap().compile(generation, &cancelled);
+                    let (mut reply, output) = match result {
+                        Ok(v) => v,
+                        Err(e) => {
+                            process.take();
+                            return Err(e);
+                        }
+                    };
+                    let document = if reply.error.is_none() {
+                        Some(Document::open_cancel(&output, generation, cancelled)?)
+                    } else {
+                        None
+                    };
+                    let stale: Vec<_> = reply
+                        .sources
+                        .iter()
+                        .filter(|(p, s)| std::fs::read_to_string(p).ok().as_ref() != Some(s))
+                        .map(|(p, _)| p.clone())
+                        .collect();
+                    if !options.no_pdf
+                        && reply.error.is_none()
+                        && stale.is_empty()
                         && desired_generation.load(Ordering::SeqCst) == generation
-                }) {
-                    reply.error = Some(format!("Cannot save PDF: {error:#}"));
+                    {
+                        if let Err(error) = publish_pdf(
+                            &output,
+                            &input.with_extension("pdf"),
+                            &publication_worker,
+                            || {
+                                !stop.load(Ordering::SeqCst)
+                                    && desired_generation.load(Ordering::SeqCst) == generation
+                            },
+                        ) {
+                            reply.error = Some(format!("Cannot save PDF: {error:#}"));
+                        }
+                    }
+                    Ok(Finished {
+                        stale,
+                        reply,
+                        document,
+                    })
+                })();
+                if result.is_err() {
+                    process.lock().unwrap().0.take();
                 }
-            }
-            Ok(Finished {
-                stale,
-                reply,
-                document,
-            })
-        });
+                (generation, result)
+            },
+        );
         let (tx, events) = mpsc::sync_channel(256);
         let overflow = Arc::new(AtomicU64::new(0));
         let overflow_events = overflow.clone();
@@ -221,6 +249,10 @@ impl Live {
         )?;
         Ok(Self {
             worker,
+            publication,
+            options: current_options,
+            input: initial_input.clone(),
+            auto_compile: true,
             generation: generation_counter,
             pending: false,
             due: Some(Instant::now()),
@@ -236,29 +268,46 @@ impl Live {
             compiling: true,
         })
     }
+    pub fn configure(&mut self, settings: &crate::compile_config::Effective) -> Result<()> {
+        crate::compile_config::validate(&self.input, &settings.options)?;
+        let recompile =
+            self.options != settings.options || self.auto_compile != settings.auto_compile;
+        self.options = settings.options.clone();
+        self.auto_sync = settings.auto_sync;
+        self.auto_compile = settings.auto_compile;
+        // Invalidate in-flight results immediately; the owned worker reaps its
+        // old compiler before creating a new one, never on the UI thread.
+        if recompile {
+            self.refresh();
+        }
+        Ok(())
+    }
     pub fn refresh(&mut self) {
+        let _publication = self.publication.lock().unwrap();
         self.generation.fetch_add(1, Ordering::SeqCst);
         self.due = Some(Instant::now());
         self.compiling = true;
     }
     pub fn poll(&mut self) -> Option<Update> {
-        if self.overflow.swap(0, Ordering::Relaxed) > 0 {
+        if self.overflow.swap(0, Ordering::Relaxed) > 0 && self.auto_compile {
             self.refresh();
             self.changed.extend(self.dependencies.iter().cloned());
         }
         while let Ok(path) = self.events.try_recv() {
-            if self.dependencies.contains(&path) {
+            if self.dependencies.contains(&path) && self.auto_compile {
                 self.changed.retain(|p| p != &path);
                 self.changed.push(path);
+                let _publication = self.publication.lock().unwrap();
                 self.generation.fetch_add(1, Ordering::SeqCst);
                 self.due = Some(Instant::now() + Duration::from_millis(200));
                 self.compiling = true;
             }
         }
         let mut update = None;
-        if let Ok(result) = self.worker.output.try_recv() {
+        if let Ok((generation, result)) = self.worker.output.try_recv() {
             self.pending = false;
             match result {
+                _ if generation != self.generation.load(Ordering::SeqCst) => {}
                 Err(e) => {
                     self.compiling = false;
                     update = Some(Update {
@@ -287,6 +336,8 @@ impl Live {
                     let wanted: BTreeSet<_> = reply
                         .dependencies
                         .iter()
+                        .chain(self.dependencies.iter().filter(|_| reply.error.is_some()))
+                        .chain(std::iter::once(&self.input))
                         .filter_map(|p| p.parent().map(Path::to_owned))
                         .collect();
                     let removed: Vec<_> = self.directories.difference(&wanted).cloned().collect();
@@ -294,7 +345,23 @@ impl Live {
                         let _ = self.watcher.unwatch(&path);
                         self.directories.remove(&path);
                     }
-                    self.dependencies = reply.dependencies.iter().cloned().collect();
+                    if reply.error.is_none() {
+                        self.dependencies.clear();
+                    }
+                    self.dependencies.extend(reply.dependencies.iter().cloned());
+                    self.dependencies.insert(self.input.clone());
+                    for path in &self.dependencies {
+                        if let Some(parent) = path.parent() {
+                            if !self.directories.contains(parent)
+                                && self
+                                    .watcher
+                                    .watch(parent, notify::RecursiveMode::NonRecursive)
+                                    .is_ok()
+                            {
+                                self.directories.insert(parent.to_owned());
+                            }
+                        }
+                    }
                     // A dependency may have changed before its parent was watched.
                     // Reject snapshots whose compiled source bytes are no longer current.
                     let stale = finished.stale;
@@ -332,7 +399,7 @@ impl Live {
                 .input
                 .as_ref()
                 .unwrap()
-                .try_send(self.generation.load(Ordering::SeqCst))
+                .try_send((self.generation.load(Ordering::SeqCst), self.options.clone()))
                 .is_ok()
         {
             self.pending = true;
@@ -375,12 +442,19 @@ impl Live {
     }
 }
 /// Stage in the destination directory: rename never exposes a partial PDF.
-fn publish_pdf(source: &Path, destination: &Path, current: impl Fn() -> bool) -> Result<()> {
+fn publish_pdf(
+    source: &Path,
+    destination: &Path,
+    publication: &std::sync::Mutex<()>,
+    current: impl Fn() -> bool,
+) -> Result<()> {
     let mut staged =
         tempfile::NamedTempFile::new_in(destination.parent().context("PDF has no parent")?)?;
     let mut input = std::fs::File::open(source)?;
     std::io::copy(&mut input, &mut staged)?;
     staged.flush()?;
+    // Serialize only the final generation check + rename, never the file copy.
+    let _publication = publication.lock().unwrap();
     if current() {
         staged.persist(destination).map_err(|e| e.error)?;
     }
@@ -425,9 +499,9 @@ mod tests {
         let target = dir.path().join("main.pdf");
         std::fs::write(&source, b"new PDF").unwrap();
         std::fs::write(&target, b"old PDF").unwrap();
-        publish_pdf(&source, &target, || false).unwrap();
+        publish_pdf(&source, &target, &std::sync::Mutex::new(()), || false).unwrap();
         assert_eq!(std::fs::read(&target).unwrap(), b"old PDF");
-        publish_pdf(&source, &target, || true).unwrap();
+        publish_pdf(&source, &target, &std::sync::Mutex::new(()), || true).unwrap();
         assert_eq!(std::fs::read(&target).unwrap(), b"new PDF");
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
     }

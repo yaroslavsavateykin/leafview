@@ -34,7 +34,10 @@ opens a hidden pane.
 The sidebar has two independent panes: the PDF directory tree above and Recent
 below. Each keeps its own selection and scroll position. The focused pane has
 a cyan border and a ● marker in its title; the PDF pane has the same indicator. Only
-PDF files and directories appear; folders expand lazily, sorted before files.
+PDF and Typst files and directories appear; folders expand lazily, sorted before files.
+Enter on `.typ` starts the same embedded Typst Preview with that project's config;
+Enter on `.pdf` returns to PDF mode. The previous PDF remains until the new build
+succeeds. Switching documents reaps the previous compiler and releases its watcher.
 The active PDF is cyan. Enter opens a selected file without leaving LeafView;
 failed opens retain the current document. Recent history contains up to 20 paths
 and is saved atomically to `$XDG_STATE_HOME/leafview/recent.json` (default:
@@ -63,9 +66,9 @@ PDF activates it without following a hyperlink.
 
 The sidebar hides automatically below 48 terminal columns. Symlinked directories
 are not followed; listings are bounded to 5,000 visible entries and 24 levels.
-Tree refresh is manual (`r`); the open PDF still reloads automatically on saves.
-PDF switching is asynchronous and updates the file watcher. Typst live preview
-starts with the sidebar hidden; switching documents from that mode is disabled.
+Tree refresh is manual (`r`); the open document still reloads automatically on saves.
+PDF switching is asynchronous and updates the file watcher. Typst preview starts
+with the sidebar hidden; Esc opens it for switching to PDF or another Typst input.
 
 ## Keys (document focus)
 
@@ -101,7 +104,9 @@ previous: do not mistake it for the requested page.
 ## Typst Live Preview
 
 ```sh
-leafview typst main.typ
+leafview main.typ
+leafview main.typ --profile teacher
+leafview typst main.typ  # legacy syntax remains supported
 leafview typst "./notes with spaces/lecture.typ"
 leafview typst letuchka.typ --root ../..
 leafview typst main.typ --input edition=teacher --font-path ./fonts -j 2
@@ -120,8 +125,8 @@ shows the PDF using the **same renderer and graphics policy** as PDF mode.
 You do not need to run `typst watch`. Its CLI reports compilation status and
 can list dependencies, but does not export source-to-PDF coordinates or the
 changed layout region. LeafView instead reuses an incremental compiler world
-and reads source spans from that same compilation's layout. The installed `typst` command is checked
-at startup; compilation itself uses the pinned **Typst Rust API 0.15.1** bundled
+and reads source spans from that same compilation's layout. No installed `typst`
+CLI is needed: compilation uses the pinned **Typst Rust API 0.15.1** bundled
 with the `typst` feature, not a potentially different CLI version. This adds substantial
 build dependencies and a roughly 47 MiB release executable.
 
@@ -174,8 +179,7 @@ or server features. LeafView does not claim full Typst CLI flag compatibility.
 The status shows `⏳` while compiling or preparing the image, then `✓` once
 loading finishes. Compilation errors appear in a centered reddish bordered
 panel with the source path, line/column, source excerpt/caret and available hints.
-The last successful PDF stays in memory, temporarily hidden to keep terminal
-image placeholders from interfering with the diagnostic panel. A successful
+The last successful PDF stays in memory and remains behind the diagnostic panel. A successful
 recompile automatically closes the panel and restores PDF display.
 
 Source synchronization compares successful source snapshots, selects the last
@@ -199,6 +203,77 @@ graphics by default, including Ghostty+tmux; safe mode is explicit opt-in.
 
 See [TYPST-VERIFICATION.md](TYPST-VERIFICATION.md) for actual tests, measurements
 and remaining gaps. Additional automated check: `python3 scripts/typst-smoke.py`.
+
+### Configuration and profiles
+
+Configuration precedence is **defaults < global < project < CLI < runtime**.
+Global settings live at `$XDG_CONFIG_HOME/leafview/config.json` (normally
+`~/.config/leafview/config.json`). The project file is the nearest ancestor
+`.leafview.json`, or a new file beside the input if none exists. Relative paths
+in each config resolve from that config's directory; CLI paths resolve from the
+launch directory. Environment variables documented above form a CLI-level fallback.
+
+```json
+{
+  "version": 1,
+  "default_profile": "teacher",
+  "profiles": {
+    "teacher": {
+      "inputs": {"mode": "teacher", "solutions": "true"},
+      "jobs": 2,
+      "write_pdf": true
+    },
+    "student": {
+      "inputs": {"mode": "student", "solutions": "false"},
+      "jobs": 2,
+      "write_pdf": false
+    }
+  }
+}
+```
+
+Profiles `default`, `teacher`, `student` and arbitrary names are selectable.
+Built-in names have the normal defaults until configured. Fields omitted in a
+layer inherit; inputs merge by key, arrays replace. `replace_inputs: true`
+clears inherited inputs before applying that profile (runtime snapshots use it
+so deleting an input works). Nullable fields such as `root`, `jobs` and `pages`
+can be cleared with JSON `null`.
+
+All implemented compiler fields are available: `root`, `inputs` (string map),
+`fonts` (path array), `ignore_system`, `ignore_embedded`, `package`, `cache`,
+`cert`, `timestamp`, `jobs` (1–256), `features`, `pretty`, `no_tags`, `standards`,
+`pages`, and `no_pdf`. Prefer `write_pdf` (the inverse of `no_pdf`); if both are
+present, `write_pdf` wins. `auto_compile` and `auto_sync` control live behavior.
+No new Rust dependencies are required.
+
+Press **`o`** in Typst mode to open **Compile Settings**. Tab / Shift+Tab or ↑↓
+select fields; Enter edits values or toggles booleans. Profile ←→ selects an
+existing profile; Enter edits its name to create/select another profile. Values
+use JSON syntax: `{"mode":"teacher"}`, `["/path/to/fonts"]`, `2`, `null`.
+Delete clears the edit buffer; Enter commits the field; Esc cancels the field,
+and a second Esc cancels the panel. PDF shortcuts and mouse actions are blocked
+while the panel is open. Ctrl+C still exits.
+
+Choose **Apply** for memory-only settings, **Save project** or **Save global**
+to persist runtime snapshots atomically, or **Cancel** to discard drafts.
+Selecting a profile prepares a draft; applying it automatically rebuilds.
+The header shows the active profile. Saving retains unrelated on-disk profiles
+and refuses to overwrite malformed JSON. Invalid config files show a warning;
+invalid startup options fall back to safe defaults so the editor can repair them.
+
+Compiler changes invalidate old generations immediately. The existing bounded
+worker kills/reaps its old helper before starting the replacement, and only a
+current successful result may publish PDF. Unchanged compiler options reuse the
+incremental world. Last-good PDF, page, zoom and scroll survive failed changes;
+source synchronization may still follow an off-screen edit. Disabling automatic
+compilation keeps watchers alive; `r` explicitly builds, and applying changed
+settings also builds once. Settings files are loaded on document open and re-read when opening Compile Settings,
+not watched continuously.
+
+Additional real integration check: `python3 scripts/settings-smoke.py` covers
+runtime inputs, profiles, jobs restarts, both save targets, manual compilation,
+failed configuration, last-good PDF, browser switching and child-process cleanup.
+These are headless PTY checks, not native Ghostty/tmux visual certification.
 
 ## PDF hyperlinks
 

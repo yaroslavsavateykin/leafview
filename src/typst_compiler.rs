@@ -356,7 +356,7 @@ pub fn serve() -> Result<()> {
     Ok(())
 }
 
-fn parse_pages(text: &str) -> Result<typst::layout::PageRanges> {
+pub(crate) fn parse_pages(text: &str) -> Result<typst::layout::PageRanges> {
     use std::num::NonZeroUsize;
     let mut ranges = Vec::new();
     for part in text.split(',') {

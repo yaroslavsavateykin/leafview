@@ -1,4 +1,8 @@
 //! Leafview: a small terminal PDF viewer with latest-wins rendering and tmux graphics support.
+#[cfg(feature = "typst")]
+mod compile_config;
+#[cfg(feature = "typst")]
+mod compile_settings;
 mod document;
 mod files;
 mod kitty;
@@ -53,6 +57,10 @@ struct App {
     opening: bool,
     #[cfg(feature = "typst")]
     live: Option<typst_live::Live>,
+    #[cfg(feature = "typst")]
+    session: Option<compile_config::Session>,
+    #[cfg(feature = "typst")]
+    settings: Option<compile_settings::Settings>,
     #[cfg(feature = "typst")]
     compile_millis: u64,
     doc: Arc<Document>,
@@ -206,6 +214,51 @@ impl App {
         if key.kind != KeyEventKind::Press && key.kind != KeyEventKind::Repeat {
             return false;
         }
+        #[cfg(feature = "typst")]
+        if self.settings.is_some() {
+            if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                return true;
+            }
+            let action = self.settings.as_mut().unwrap().key(key, &self.source);
+            match action {
+                compile_settings::Action::Cancel => self.settings = None,
+                compile_settings::Action::Apply(session, value, save) => {
+                    let result = (|| -> Result<()> {
+                        if let Some(global) = save {
+                            session.save(global)?;
+                        }
+                        let profile_changed = self
+                            .session
+                            .as_ref()
+                            .is_none_or(|s| s.selected != session.selected);
+                        let live = self.live.as_mut().context("no live compiler")?;
+                        live.configure(&value)?;
+                        if profile_changed {
+                            live.refresh();
+                        }
+                        let mut session = *session;
+                        session.warning = None;
+                        self.session = Some(session);
+                        Ok(())
+                    })();
+                    match result {
+                        Ok(()) => self.settings = None,
+                        Err(e) => self.settings.as_mut().unwrap().error = Some(format!("{e:#}")),
+                    }
+                }
+                compile_settings::Action::None => {}
+            }
+            self.dirty = true;
+            return false;
+        }
+        #[cfg(feature = "typst")]
+        if key.code == KeyCode::Char('o') && self.live.is_some() {
+            if let Some(session) = &self.session {
+                self.settings = Some(compile_settings::Settings::new(session));
+            }
+            self.dirty = true;
+            return false;
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 KeyCode::Char(direction @ ('h' | 'j' | 'k' | 'l')) => {
@@ -260,13 +313,17 @@ impl App {
         if self.files.focused && self.files.width(self.terminal_size.width) > 0 {
             if let Some(path) = self.files.key(key) {
                 if !self.opening && !self.reload_pending {
-                    #[cfg(feature = "typst")]
-                    let live_mode = self.live.is_some();
-                    #[cfg(not(feature = "typst"))]
-                    let live_mode = false;
-                    if live_mode {
-                        self.files.notice =
-                            Some("Open PDFs in PDF mode, not during Typst preview".into());
+                    if is_typst(&path) {
+                        #[cfg(feature = "typst")]
+                        if let Err(e) = self.open_typst(&path) {
+                            self.files.notice = Some(format!("{e:#}"));
+                        }
+                        #[cfg(not(feature = "typst"))]
+                        {
+                            self.files.notice = Some(
+                                "Typst support is not enabled; build with --features typst".into(),
+                            );
+                        }
                     } else if self
                         .opener
                         .input
@@ -352,6 +409,14 @@ impl App {
             KeyCode::Char('s') if self.live.is_some() => {
                 let live = self.live.as_mut().unwrap();
                 live.auto_sync = !live.auto_sync;
+                if let Some(session) = &mut self.session {
+                    session
+                        .runtime
+                        .profiles
+                        .entry(session.selected.clone())
+                        .or_default()
+                        .auto_sync = Some(live.auto_sync);
+                }
                 self.dirty = true;
             }
             #[cfg(feature = "typst")]
@@ -378,6 +443,28 @@ impl App {
             self.dirty = true;
         }
         false
+    }
+    #[cfg(feature = "typst")]
+    fn open_typst(&mut self, path: &Path) -> Result<()> {
+        let path = path.canonicalize()?;
+        let mut session =
+            compile_config::Session::load(&path, compile_config::Profile::default(), None);
+        let settings = session.initial(&path);
+        let mut live = typst_live::Live::new(&path, settings.options.clone(), self.doc.revision)?;
+        live.configure(&settings)?;
+        // Fully validate/create the new lifecycle before dropping the old one.
+        self.live.take();
+        self.live = Some(live);
+        self.error = session.warning.clone();
+        self.session = Some(session);
+        self.source = path;
+        self.compile_error = None;
+        self.settings = None;
+        self.files.record(&self.source);
+        self.files.notice = None;
+        self.files.focused = false;
+        self.dirty = true;
+        Ok(())
     }
     #[cfg(feature = "typst")]
     fn follow_source(&mut self, location: &typst_live::SourcePoint) {
@@ -425,6 +512,9 @@ impl App {
     }
     #[cfg(feature = "typst")]
     fn consume_live(&mut self) {
+        if self.opening {
+            return;
+        }
         let Some(live) = &mut self.live else {
             return;
         };
@@ -437,7 +527,9 @@ impl App {
         if let Some(update) = update {
             self.compile_millis = update.millis;
             self.compile_error = update.error.clone();
-            self.error = update.error;
+            self.error = update
+                .error
+                .or_else(|| self.session.as_ref().and_then(|s| s.warning.clone()));
             if let Some(doc) = update.document {
                 debug_assert_eq!(doc.revision, update.generation);
                 self.view.set_pages(doc.pages);
@@ -552,6 +644,10 @@ impl App {
             .hint(self.doc.clone(), destination.page, width);
     }
     fn on_mouse(&mut self, event: MouseEvent) {
+        #[cfg(feature = "typst")]
+        if self.settings.is_some() {
+            return;
+        }
         let panel_width = self.files.width(self.terminal_size.width);
         if event.row >= self.terminal_size.height {
             return;
@@ -892,6 +988,12 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
         app.view.pages,
         app.view.zoom * 100.0
     );
+    #[cfg(feature = "typst")]
+    let title = if let Some(session) = &app.session {
+        format!("{title} · {}", links::sanitize(&session.selected))
+    } else {
+        title
+    };
     let notice = if app.files.focused {
         app.files.notice.clone().unwrap_or_default()
     } else if app.error.is_some() || app.hovered.is_some() || !app.jump.is_empty() || app.loading {
@@ -915,7 +1017,7 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
     let compilation_failed = app.compile_error.is_some();
     #[cfg(not(feature = "typst"))]
     let compilation_failed = false;
-    if let Some(image) = app.image.as_ref().filter(|_| !compilation_failed) {
+    if let Some(image) = app.image.as_ref() {
         if screen.width == 0 || screen.height == 0 {
             return;
         }
@@ -937,6 +1039,10 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
     #[cfg(feature = "typst")]
     if let Some(error) = &app.compile_error {
         render_compile_error(f, screen, error);
+    }
+    #[cfg(feature = "typst")]
+    if let Some(settings) = &app.settings {
+        settings.render(f);
     }
 }
 
@@ -1022,6 +1128,7 @@ fn viewer_loop(
     doc: Arc<Document>,
     mut terminal: DefaultTerminal,
     #[cfg(feature = "typst")] live: Option<typst_live::Live>,
+    #[cfg(feature = "typst")] session: Option<compile_config::Session>,
 ) -> Result<()> {
     let tmux =
         env::var_os("TMUX").is_some() || env::var("TERM").is_ok_and(|v| v.starts_with("tmux"));
@@ -1129,6 +1236,10 @@ fn viewer_loop(
         #[cfg(feature = "typst")]
         live,
         #[cfg(feature = "typst")]
+        session,
+        #[cfg(feature = "typst")]
+        settings: None,
+        #[cfg(feature = "typst")]
         compile_millis: 0,
         source: path,
         view: View::new(doc.pages),
@@ -1204,6 +1315,13 @@ fn viewer_loop(
             app.opening = false;
             match result {
                 Ok(doc) => {
+                    #[cfg(feature = "typst")]
+                    {
+                        app.live.take();
+                        app.session = None;
+                        app.settings = None;
+                        app.compile_error = None;
+                    }
                     app.source = path;
                     app.view = View::new(doc.pages);
                     app.doc = Arc::new(doc);
@@ -1224,14 +1342,20 @@ fn viewer_loop(
             app.dirty = true;
         }
         if app.source != watched_path {
-            match watch(&app.source) {
-                Ok((w, r)) => {
-                    watcher = Some(w);
-                    watched = r;
-                }
-                Err(error) => {
-                    watcher = None;
-                    app.error = Some(format!("Watcher: {error}"));
+            if is_typst(&app.source) {
+                watcher = None;
+                let (_, receiver) = mpsc::channel();
+                watched = receiver;
+            } else {
+                match watch(&app.source) {
+                    Ok((w, r)) => {
+                        watcher = Some(w);
+                        watched = r;
+                    }
+                    Err(error) => {
+                        watcher = None;
+                        app.error = Some(format!("Watcher: {error}"));
+                    }
                 }
             }
             watched_path = app.source.clone();
@@ -1315,8 +1439,12 @@ fn main() -> Result<()> {
         return Ok(());
     }
     #[cfg(feature = "typst")]
-    let typst_options = if env::args_os().nth(1).is_some_and(|s| s == "typst") {
-        let args: Vec<_> = env::args_os().skip(2).collect();
+    let typst_options = if env::args_os()
+        .nth(1)
+        .is_some_and(|s| s == "typst" || is_typst(Path::new(&s)))
+    {
+        let explicit = env::args_os().nth(1).is_some_and(|s| s == "typst");
+        let args: Vec<_> = env::args_os().skip(if explicit { 2 } else { 1 }).collect();
         if args.iter().any(|s| s == "--help" || s == "-h") {
             println!("{}", typst_options::HELP);
             return Ok(());
@@ -1325,14 +1453,16 @@ fn main() -> Result<()> {
             println!("LeafView embedded Typst 0.15.1");
             return Ok(());
         }
-        Some(typst_options::Options::parse(args)?)
+        Some(compile_config::parse_cli(args)?)
     } else {
         None
     };
     let mut args = env::args_os();
     let _exe = args.next();
     #[cfg(feature = "typst")]
-    let parsed_typst = typst_options.as_ref().map(|(path, _)| (path.clone(), true));
+    let parsed_typst = typst_options
+        .as_ref()
+        .map(|(path, _, _)| (path.clone(), true));
     #[cfg(not(feature = "typst"))]
     let parsed_typst = None;
     let (path, typst_mode) = if let Some(parsed) = parsed_typst {
@@ -1341,14 +1471,17 @@ fn main() -> Result<()> {
         match (args.next(), args.next(), args.next(), args.next()) {
             (Some(mode), Some(path), None, None) if mode == "typst" => (PathBuf::from(path), true),
             (Some(path), None, None, None) if path == "--help" || path == "-h" => {
-                println!("Usage: leafview [file.pdf|directory]\n       leafview typst <file.typ>\n\nWithout arguments, browse PDFs in the current directory.");
+                println!("Usage: leafview [file.pdf|directory]\n       leafview [typst] <file.typ> [OPTIONS]\n\nWithout arguments, browse PDF/Typst files in the current directory.");
                 return Ok(());
             }
-            (Some(path), None, None, None) => (PathBuf::from(path), false),
+            (Some(path), None, None, None) => {
+                let typst = is_typst(Path::new(&path));
+                (PathBuf::from(path), typst)
+            }
             (None, None, None, None) => (env::current_dir()?, false),
             _ => {
                 eprintln!(
-                "Usage: leafview [file.pdf|directory]\n       leafview typst <file.typ>\n\nRequires Poppler: sudo apt install poppler-utils"
+                "Usage: leafview [file.pdf|directory]\n       leafview [typst] <file.typ> [OPTIONS]\n\nRequires Poppler: sudo apt install poppler-utils"
             );
                 std::process::exit(2)
             }
@@ -1373,11 +1506,18 @@ fn main() -> Result<()> {
         anyhow::bail!("Typst support is not enabled; install with: cargo install --locked --features typst --path .");
     }
     #[cfg(feature = "typst")]
-    let mut live = if typst_mode {
-        if CommandCheck::missing("typst") {
-            anyhow::bail!("required command not found: typst");
-        }
-        Some(typst_live::Live::new(&path, typst_options.unwrap().1)?)
+    let mut session = if typst_mode {
+        let (_, cli, selected) = typst_options.unwrap();
+        Some(compile_config::Session::load(&path, cli, selected))
+    } else {
+        None
+    };
+    #[cfg(feature = "typst")]
+    let mut live = if let Some(session) = &mut session {
+        let settings = session.initial(&path);
+        let mut live = typst_live::Live::new(&path, settings.options.clone(), 1)?;
+        live.configure(&settings)?;
+        Some(live)
     } else {
         None
     };
@@ -1405,7 +1545,14 @@ fn main() -> Result<()> {
         terminal,
         #[cfg(feature = "typst")]
         live.take(),
+        #[cfg(feature = "typst")]
+        session,
     )
+}
+
+fn is_typst(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|s| s.eq_ignore_ascii_case("typ"))
 }
 
 fn initial_placeholder() -> Result<tempfile::NamedTempFile> {

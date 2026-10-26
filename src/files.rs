@@ -60,7 +60,7 @@ impl Files {
             .and_then(|b| serde_json::from_slice::<Vec<PathBuf>>(&b).ok())
             .unwrap_or_default()
             .into_iter()
-            .filter(|p| p.is_absolute() && is_pdf(p))
+            .filter(|p| p.is_absolute() && is_document(p))
             .take(20)
             .collect();
         let mut files = Self {
@@ -145,7 +145,7 @@ impl Files {
         }
     }
     pub fn record(&mut self, path: &Path) {
-        if !path.is_file() || !is_pdf(path) {
+        if !path.is_file() || !is_document(path) {
             return;
         }
         self.recent.retain(|p| p != path);
@@ -347,7 +347,7 @@ impl Files {
             )
             .highlight_symbol(if recent_active { "› " } else { "  " });
         f.render_stateful_widget(recent_list, recent_area, &mut self.recent_state);
-        let current_is_pdf = is_pdf(current);
+        let current_is_pdf = is_document(current);
         let items: Vec<_> = self
             .entries
             .iter()
@@ -496,6 +496,12 @@ fn contains_pdf(
         Some(false)
     }
 }
+fn is_document(path: &Path) -> bool {
+    is_pdf(path)
+        || path
+            .extension()
+            .is_some_and(|s| s.eq_ignore_ascii_case("typ"))
+}
 fn is_pdf(path: &Path) -> bool {
     path.extension()
         .is_some_and(|s| s.eq_ignore_ascii_case("pdf"))
@@ -515,7 +521,7 @@ fn append_directory(
             continue;
         };
         // Never follow directory symlinks (cycles / unexpected trees).
-        if kind.is_dir() || (kind.is_file() && is_pdf(&item.path())) {
+        if kind.is_dir() || (kind.is_file() && is_document(&item.path())) {
             children.push((!kind.is_dir(), item.file_name(), item.path()));
         }
     }
@@ -540,10 +546,16 @@ fn append_directory(
 mod tests {
     use super::*;
     #[test]
-    fn tree_is_pdf_only_sorted_and_lazy() {
+    fn tree_is_pdf_typst_sorted_and_lazy() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("chapter")).unwrap();
-        for name in ["b.PDF", "a.pdf", "ignore.tex", "chapter/nested.pdf"] {
+        for name in [
+            "b.PDF",
+            "a.pdf",
+            "ignore.tex",
+            "chapter/nested.pdf",
+            "chapter/source.typ",
+        ] {
             std::fs::write(dir.path().join(name), "").unwrap();
         }
         let mut entries = Vec::new();
@@ -554,8 +566,9 @@ mod tests {
         let expanded = BTreeSet::from([dir.path().join("chapter")]);
         entries.clear();
         append_directory(dir.path(), 0, &expanded, &mut entries).unwrap();
-        assert_eq!(entries.len(), 4);
+        assert_eq!(entries.len(), 5);
         assert!(entries[1].path.ends_with("nested.pdf"));
+        assert!(entries[2].path.ends_with("source.typ"));
     }
     #[test]
     fn panel_renders_and_history_survives_restart() {

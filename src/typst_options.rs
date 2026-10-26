@@ -2,25 +2,42 @@
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{ffi::OsString, path::PathBuf};
-#[derive(Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct Options {
-    pub root: Option<PathBuf>,
-    pub inputs: Vec<(String, String)>,
-    pub fonts: Vec<PathBuf>,
-    pub ignore_system: bool,
-    pub ignore_embedded: bool,
-    pub package: Option<PathBuf>,
-    pub cache: Option<PathBuf>,
-    pub cert: Option<PathBuf>,
-    pub timestamp: Option<i64>,
-    pub jobs: Option<usize>,
-    pub features: Vec<String>,
-    pub pretty: bool,
-    pub no_tags: bool,
-    pub no_pdf: bool,
-    pub standards: Vec<String>,
-    pub pages: Option<String>,
+fn present<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<T>, D::Error> {
+    T::deserialize(deserializer).map(Some)
+}
+// One field definition drives compiler options and partial configuration layers.
+macro_rules! options {
+    ($($name:ident: $ty:ty),* $(,)?) => {
+        #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+        #[serde(default, deny_unknown_fields)]
+        pub struct Options { pub inputs: Vec<(String, String)>, $(pub $name: $ty,)* }
+        #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+        #[serde(default, deny_unknown_fields)]
+        pub struct Patch {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            pub inputs: Option<std::collections::BTreeMap<String, String>>,
+            $(#[serde(skip_serializing_if = "Option::is_none", deserialize_with = "present")] pub $name: Option<$ty>,)*
+        }
+        impl Patch {
+            pub fn apply(&self, options: &mut Options) {
+                if let Some(inputs) = &self.inputs {
+                    let mut merged: std::collections::BTreeMap<_, _> = options.inputs.iter().cloned().collect();
+                    merged.extend(inputs.clone());
+                    options.inputs = merged.into_iter().collect();
+                }
+                $(if let Some(value) = &self.$name { options.$name = value.clone(); })*
+            }
+        }
+    }
+}
+options! {
+    root: Option<PathBuf>, fonts: Vec<PathBuf>,
+    ignore_system: bool, ignore_embedded: bool, package: Option<PathBuf>,
+    cache: Option<PathBuf>, cert: Option<PathBuf>, timestamp: Option<i64>,
+    jobs: Option<usize>, features: Vec<String>, pretty: bool, no_tags: bool,
+    no_pdf: bool, standards: Vec<String>, pages: Option<String>,
 }
 impl Options {
     pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<(PathBuf, Self)> {
@@ -109,7 +126,7 @@ fn env_bool(key: &str) -> Result<bool> {
         _ => bail!("invalid boolean in {key}"),
     }
 }
-pub const HELP: &str = "Usage: leafview typst [OPTIONS] <file.typ>\n\nCompilation: --root DIR, --input key=value (repeatable), --font-path DIR,\n  --ignore-system-fonts, --ignore-embedded-fonts, --package-path DIR,\n  --package-cache-path DIR, --cert PATH, --creation-timestamp SECONDS,\n  -j/--jobs N, --features LIST, --pdf-standard LIST, --pages RANGES,\n  --no-pdf-tags, --pretty, -f/--format pdf.\nUI diagnostics: --diagnostic-format human|short, --color auto|always|never\n  (accepted; LeafView always sanitizes short status messages).\n--ppi is accepted but affects PNG export only, not PDF.\nExport/server flags --deps, --deps-format, --make-deps, --timings, --open,\n  --no-serve, --no-reload, --port are rejected explicitly.\nSuccessful builds atomically update <input>.pdf beside the input.\nUse --no-pdf to keep output private (existing PDF is left untouched).\n--help/-h shows this help; --version/-V shows the embedded compiler version.";
+pub const HELP: &str = "Usage: leafview [typst] <file.typ> [OPTIONS]\n\nProfiles: --profile NAME; o opens Compile Settings in the viewer.\n\nCompilation: --root DIR, --input key=value (repeatable), --font-path DIR,\n  --ignore-system-fonts, --ignore-embedded-fonts, --package-path DIR,\n  --package-cache-path DIR, --cert PATH, --creation-timestamp SECONDS,\n  -j/--jobs N, --features LIST, --pdf-standard LIST, --pages RANGES,\n  --no-pdf-tags, --pretty, -f/--format pdf.\nUI diagnostics: --diagnostic-format human|short, --color auto|always|never\n  (accepted; LeafView always sanitizes short status messages).\n--ppi is accepted but affects PNG export only, not PDF.\nExport/server flags --deps, --deps-format, --make-deps, --timings, --open,\n  --no-serve, --no-reload, --port are rejected explicitly.\nSuccessful builds atomically update <input>.pdf beside the input.\nUse --no-pdf to keep output private (existing PDF is left untouched).\n--help/-h shows this help; --version/-V shows the embedded compiler version.";
 #[cfg(test)]
 mod tests {
     use super::*;

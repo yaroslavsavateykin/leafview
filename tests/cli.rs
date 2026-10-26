@@ -47,6 +47,21 @@ fn typst_without_feature_explains_installation() {
     assert!(!output.stdout.windows(8).any(|w| w == b"\x1b[?1049h"));
 }
 
+#[cfg(not(feature = "typst"))]
+#[test]
+fn implicit_typst_without_feature_explains_installation() {
+    let output = Command::new(env!("CARGO_BIN_EXE_leafview"))
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/typst-live/main.typ"
+        ))
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--features typst"));
+    assert!(!output.stdout.windows(8).any(|w| w == b"\x1b[?1049h"));
+}
+
 #[test]
 fn missing_document_fails_without_switching_terminal() {
     let output = Command::new(env!("CARGO_BIN_EXE_leafview"))

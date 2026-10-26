@@ -22,3 +22,5 @@ jobs:
       - run: cargo clippy --locked --features '${{ matrix.features }}' --all-targets -- -D warnings
       - run: cargo build --locked --release --features '${{ matrix.features }}'
       - run: python3 scripts/pty-smoke.py
+      - if: matrix.features == 'typst'
+        run: python3 scripts/typst-smoke.py && python3 scripts/settings-smoke.py

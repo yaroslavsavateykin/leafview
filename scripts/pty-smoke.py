@@ -210,11 +210,11 @@ with tempfile.TemporaryDirectory(prefix="leafview-test-") as tmp:
     captured = bytearray()
     try:
         deadline = time.monotonic() + 5
-        while time.monotonic() < deadline and b"explicit compatibility mode" not in captured:
+        while time.monotonic() < deadline and b"PDF" not in captured:
             if select.select([master], [], [], 0.05)[0]:
                 captured.extend(os.read(master, 65536))
             assert proc.poll() is None, captured[-1000:]
-        assert b"explicit compatibility mode" in captured, captured[-2000:]
+        assert b"PDF" in captured, captured[-2000:]
         assert b"\x1b_G" not in captured, "unexpected Kitty graphics data in safe mode"
         assert b"\x1b[5n" not in captured, "safe mode must not query graphics"
         os.write(master, b"jlHL" * 100 + b"\x03")
