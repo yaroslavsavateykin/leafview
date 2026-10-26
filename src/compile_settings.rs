@@ -507,13 +507,11 @@ impl Settings {
                 "Packages, PDF export & experimental flags".into(),
             ));
         }
-        rows.extend([
-            ("Apply, don't save  [Ctrl+A]".into(), "".into()),
-            ("Save for this file  [Ctrl+S]".into(), "".into()),
-            ("Cancel".into(), "".into()),
-        ]);
         let available = parts[2].height.max(1) as usize;
-        let start = self.selected.saturating_sub(available - 1);
+        let start = self
+            .selected
+            .min(rows.len().saturating_sub(1))
+            .saturating_sub(available - 1);
         let lines: Vec<Line<'_>> = rows
             .iter()
             .enumerate()
@@ -567,7 +565,28 @@ impl Settings {
                 })),
             parts[3],
         );
-        f.render_widget(Paragraph::new("Tab/↑↓ select · Enter edit · Esc cancel\nCtrl+A apply · Ctrl+S save · Ctrl+U clear input").style(Style::default().fg(muted)),parts[4]);
+        let first_action = n + usize::from(self.tab == 0);
+        let mut buttons = Vec::new();
+        for (index, label) in ["Apply", "Save", "Cancel"].iter().enumerate() {
+            buttons.push(Span::raw("  "));
+            buttons.push(Span::styled(
+                format!("  {label}  "),
+                if self.selected == first_action + index {
+                    Style::default()
+                        .fg(bg)
+                        .bg(accent)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                        .fg(Color::Rgb(217, 224, 234))
+                        .bg(Color::Rgb(35, 45, 57))
+                },
+            ));
+        }
+        f.render_widget(
+            Paragraph::new(Line::from(buttons)).alignment(ratatui::layout::Alignment::Right),
+            parts[4],
+        );
         if let Some(editor) = &self.inputs {
             editor.render(f, area);
         }
