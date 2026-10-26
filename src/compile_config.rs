@@ -178,6 +178,7 @@ pub struct Session {
     pub project_path: PathBuf,
     pub input: PathBuf,
     pub cli: Flags,
+    cli_base: PathBuf,
     pub warning: Option<String>,
 }
 impl Session {
@@ -227,6 +228,7 @@ impl Session {
             global_path,
             project_path,
             cli,
+            cli_base: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             warning: if warnings.is_empty() {
                 None
             } else {
@@ -279,7 +281,11 @@ impl Session {
                 flags.apply(&mut value);
             }
         }
-        self.cli.apply(&mut value);
+        let mut cli = self.cli.clone();
+        if resolve {
+            cli.resolve_paths(&self.cli_base);
+        }
+        cli.apply(&mut value);
         if let Some(flags) = &self.runtime {
             let mut flags = flags.clone();
             if resolve {
@@ -459,8 +465,7 @@ pub fn parse_cli(args: Vec<OsString>) -> Result<(PathBuf, Flags)> {
             .contains(&text.as_ref())
             && !(text.starts_with("-j") && text.len() > 2 && !text.starts_with("--"));
     }
-    let mut flags: Flags = serde_json::from_value(patch.into())?;
-    flags.resolve_paths(&std::env::current_dir()?);
+    let flags: Flags = serde_json::from_value(patch.into())?;
     Ok((path, flags))
 }
 
@@ -547,7 +552,9 @@ mod tests {
         flags.apply(&mut value);
         assert!(value.options.jobs.is_none() && value.options.inputs.is_empty());
         assert!(parse_cli(["a.typ", "--profile", "teacher"].map(Into::into).into()).is_err());
-        let (_, flags) = parse_cli(["a.typ", "-j2"].map(Into::into).into()).unwrap();
+        let (_, flags) =
+            parse_cli(["a.typ", "-j2", "--root", "../.."].map(Into::into).into()).unwrap();
         assert_eq!(flags.options.jobs, Some(Some(2)));
+        assert_eq!(flags.options.root, Some(Some("../..".into())));
     }
 }

@@ -146,6 +146,7 @@ pub struct Settings {
     selected: usize,
     edit: Option<TextEdit>,
     inputs: Option<InputsEditor>,
+    input_actions: bool,
     pub error: Option<String>,
 }
 impl Settings {
@@ -168,6 +169,7 @@ impl Settings {
             selected: 0,
             edit: None,
             inputs: None,
+            input_actions: false,
         };
         match panel.draft.editable() {
             Ok(v) => panel.value = v,
@@ -295,11 +297,65 @@ impl Settings {
     fn switch_tab(&mut self, right: bool) {
         self.tab = (self.tab + if right { 1 } else { 2 }) % 3;
         self.selected = 0;
+        self.input_actions = false;
         if self.tab == 1 {
             self.inputs = Some(InputsEditor::new(&self.value.options.inputs));
         }
     }
     pub fn key(&mut self, key: KeyEvent, input: &Path) -> Action {
+        if self.tab == 1 && self.input_actions {
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && matches!(key.code, KeyCode::Char('s' | 'a'))
+            {
+                match self.inputs.as_mut().unwrap().finish() {
+                    Ok(values) => {
+                        self.value.options.inputs = values;
+                        return self.apply(input, key.code == KeyCode::Char('s'));
+                    }
+                    Err(e) => {
+                        self.inputs.as_mut().unwrap().error = Some(format!("{e:#}"));
+                        self.input_actions = false;
+                        return Action::None;
+                    }
+                }
+            }
+            match key.code {
+                KeyCode::Left | KeyCode::Char('h') => self.selected = (self.selected + 2) % 3,
+                KeyCode::Right | KeyCode::Char('l') => self.selected = (self.selected + 1) % 3,
+                KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => self.input_actions = false,
+                KeyCode::Tab | KeyCode::Down | KeyCode::Char('j') => {
+                    self.selected = (self.selected + 1) % 3
+                }
+                KeyCode::Enter => {
+                    if self.selected == 2 {
+                        return Action::Cancel;
+                    }
+                    match self.inputs.as_mut().unwrap().finish() {
+                        Ok(values) => {
+                            self.value.options.inputs = values;
+                            return self.apply(input, self.selected == 1);
+                        }
+                        Err(e) => {
+                            self.inputs.as_mut().unwrap().error = Some(format!("{e:#}"));
+                            self.input_actions = false;
+                        }
+                    }
+                }
+                KeyCode::Esc => return Action::Cancel,
+                _ => {}
+            }
+            return Action::None;
+        }
+        if self.tab == 1
+            && self.inputs.as_ref().is_some_and(|e| {
+                e.edit.is_none() && (e.rows.is_empty() || e.row + 1 >= e.rows.len())
+            })
+            && matches!(key.code, KeyCode::Down | KeyCode::Char('j'))
+        {
+            self.input_actions = true;
+            self.selected = 0;
+            return Action::None;
+        }
         if self.tab == 1 && self.inputs.as_ref().is_some_and(|e| e.edit.is_none()) {
             if matches!(key.code, KeyCode::Left | KeyCode::Right) {
                 let result = self.inputs.as_mut().unwrap().finish();
@@ -368,12 +424,21 @@ impl Settings {
         let total = n + 3;
         match key.code {
             KeyCode::Esc => return Action::Cancel,
-            KeyCode::Left | KeyCode::Right => {
-                self.switch_tab(key.code == KeyCode::Right);
+            KeyCode::Left | KeyCode::Right | KeyCode::Char('h' | 'l') => {
+                let right = matches!(key.code, KeyCode::Right | KeyCode::Char('l'));
+                if self.selected >= n {
+                    self.selected = n + (self.selected - n + if right { 1 } else { 2 }) % 3;
+                } else {
+                    self.switch_tab(right);
+                }
                 self.error = None;
             }
-            KeyCode::Tab | KeyCode::Down => self.selected = (self.selected + 1) % total,
-            KeyCode::BackTab | KeyCode::Up => self.selected = (self.selected + total - 1) % total,
+            KeyCode::Tab | KeyCode::Down | KeyCode::Char('j') => {
+                self.selected = (self.selected + 1) % total
+            }
+            KeyCode::BackTab | KeyCode::Up | KeyCode::Char('k') => {
+                self.selected = (self.selected + total - 1) % total
+            }
             KeyCode::Enter | KeyCode::Char(' ') => {
                 if self.selected < n {
                     let field = self.fields()[self.selected];
@@ -423,7 +488,7 @@ impl Settings {
             Constraint::Length(2),
             Constraint::Min(1),
             Constraint::Length(3),
-            Constraint::Length(2),
+            Constraint::Length(3),
         ])
         .split(inner);
         let mut tabs = Vec::new();
@@ -502,7 +567,9 @@ impl Settings {
             .collect();
         f.render_widget(Paragraph::new(lines), parts[2]);
         let help = self.error.clone().unwrap_or_else(|| {
-            if self.selected < n {
+            if self.tab == 1 {
+                String::new()
+            } else if self.selected < n {
                 fields[self.selected].help.into()
             } else {
                 "Apply keeps changes in memory; Save remembers them for this file only.".into()
@@ -518,13 +585,34 @@ impl Settings {
                 })),
             parts[3],
         );
-        let first_action = n;
-        let mut buttons = Vec::new();
-        for (index, label) in ["Apply", "Save", "Cancel"].iter().enumerate() {
-            buttons.push(Span::raw("  "));
-            buttons.push(Span::styled(
-                format!("  {label}  "),
-                if self.selected == first_action + index {
+        if let Some(editor) = &self.inputs {
+            editor.render(f, parts[2]);
+            if let Some(error) = &editor.error {
+                f.render_widget(
+                    Paragraph::new(error.as_str()).style(Style::default().fg(Color::LightRed)),
+                    parts[3],
+                );
+            }
+        }
+        let first_action = if self.tab == 1 { 0 } else { n };
+        let button_width = (parts[4].width / 3).min(20);
+        let row = Layout::horizontal([
+            Constraint::Min(0),
+            Constraint::Length(button_width),
+            Constraint::Length(button_width),
+            Constraint::Length(button_width),
+        ])
+        .split(parts[4]);
+        for (index, (label, caption)) in [
+            ("Apply", "Session · Ctrl+A"),
+            ("Save", "This file · Ctrl+S"),
+            ("Cancel", "Discard · Esc"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let style =
+                if (self.tab != 1 || self.input_actions) && self.selected == first_action + index {
                     Style::default()
                         .fg(bg)
                         .bg(accent)
@@ -533,21 +621,15 @@ impl Settings {
                     Style::default()
                         .fg(Color::Rgb(217, 224, 234))
                         .bg(Color::Rgb(35, 45, 57))
-                },
-            ));
-        }
-        f.render_widget(
-            Paragraph::new(Line::from(buttons)).alignment(ratatui::layout::Alignment::Right),
-            parts[4],
-        );
-        if let Some(editor) = &self.inputs {
-            let body = Rect::new(
-                inner.x,
-                parts[1].y,
-                inner.width,
-                inner.height.saturating_sub(parts[0].height),
+                };
+            f.render_widget(
+                Paragraph::new(vec![
+                    Line::styled(format!(" {label} "), style),
+                    Line::styled(*caption, Style::default().fg(muted)),
+                ])
+                .alignment(ratatui::layout::Alignment::Center),
+                row[index + 1],
             );
-            editor.render(f, body);
         }
     }
 }
@@ -678,8 +760,10 @@ impl InputsEditor {
             return;
         }
         match key.code {
-            KeyCode::Down => self.row = (self.row + 1).min(self.rows.len().saturating_sub(1)),
-            KeyCode::Up => self.row = self.row.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.row = (self.row + 1).min(self.rows.len().saturating_sub(1))
+            }
+            KeyCode::Up | KeyCode::Char('k') => self.row = self.row.saturating_sub(1),
             KeyCode::Left => self.column = 0,
             KeyCode::Right => self.column = 1,
             KeyCode::Tab | KeyCode::BackTab => self.column = 1 - self.column,
@@ -712,24 +796,16 @@ impl InputsEditor {
     }
     fn render(&self, f: &mut Frame<'_>, area: Rect) {
         f.render_widget(Clear, area);
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(" Custom inputs · sys.inputs ")
-            .style(
+        let inner = area;
+        f.render_widget(
+            Block::default().style(
                 Style::default()
                     .bg(Color::Rgb(24, 29, 37))
                     .fg(Color::Rgb(217, 224, 234)),
-            )
-            .border_style(Style::default().fg(Color::LightCyan));
-        let inner = block.inner(area);
-        f.render_widget(block, area);
-        let parts = Layout::vertical([
-            Constraint::Length(2),
-            Constraint::Min(1),
-            Constraint::Length(2),
-            Constraint::Length(3),
-        ])
-        .split(inner);
+            ),
+            area,
+        );
+        let parts = Layout::vertical([Constraint::Length(2), Constraint::Min(1)]).split(inner);
         f.render_widget(
             Paragraph::new("   KEY                          VALUE")
                 .style(Style::default().fg(Color::DarkGray)),
@@ -788,19 +864,6 @@ impl InputsEditor {
                 .collect()
         };
         f.render_widget(Paragraph::new(lines), parts[1]);
-        f.render_widget(
-            Paragraph::new(self.error.clone().unwrap_or_else(|| {
-                "Each input is a string. Empty values are allowed; keys must be unique.".into()
-            }))
-            .style(Style::default().fg(if self.error.is_some() {
-                Color::LightRed
-            } else {
-                Color::DarkGray
-            }))
-            .wrap(Wrap { trim: true }),
-            parts[2],
-        );
-        f.render_widget(Paragraph::new("n add · Delete remove row · ↑↓ select · Tab key/value · Enter edit\n←→ move cursor · Home/End · Ctrl+U clear · Esc cancel\nF2 accept inputs · Ctrl+S save file · Ctrl+A apply without saving").style(Style::default().fg(Color::Rgb(135,148,167))),parts[3]);
     }
 }
 // Keep value presentation explicit without a dependency for a one-off transform.
@@ -836,6 +899,12 @@ mod tests {
         p.key(KeyEvent::from(KeyCode::Right), &s.input);
         assert_eq!(p.tab, 1);
         assert!(p.inputs.is_some());
+        p.key(KeyEvent::from(KeyCode::Down), &s.input);
+        assert!(p.input_actions);
+        p.key(KeyEvent::from(KeyCode::Char('l')), &s.input);
+        assert_eq!(p.selected, 1);
+        p.key(KeyEvent::from(KeyCode::Up), &s.input);
+        assert!(!p.input_actions);
         p.key(KeyEvent::from(KeyCode::Right), &s.input);
         assert_eq!(p.fields().len(), 3);
         assert_eq!(p.tab, 2);
@@ -875,6 +944,25 @@ mod tests {
         assert_eq!(editor.rows.len(), 1);
     }
     #[test]
+    fn action_row_uses_directional_keys() {
+        let d = tempfile::tempdir().unwrap();
+        let s = session(d.path());
+        let mut p = Settings::new(&s);
+        let n = p.fields().len();
+        p.selected = n - 1;
+        p.key(KeyEvent::from(KeyCode::Char('j')), &s.input);
+        assert_eq!(p.selected, n);
+        p.key(KeyEvent::from(KeyCode::Char('l')), &s.input);
+        assert_eq!(p.selected, n + 1);
+        assert_eq!(p.tab, 0);
+        p.key(KeyEvent::from(KeyCode::Right), &s.input);
+        assert_eq!(p.selected, n + 2);
+        p.key(KeyEvent::from(KeyCode::Char('h')), &s.input);
+        assert_eq!(p.selected, n + 1);
+        p.key(KeyEvent::from(KeyCode::Char('k')), &s.input);
+        assert_eq!(p.selected, n);
+    }
+    #[test]
     fn render_tabs() {
         let d = tempfile::tempdir().unwrap();
         let p = Settings::new(&session(d.path()));
@@ -890,7 +978,18 @@ mod tests {
         );
         assert!(text.contains("CA certificate"));
         if let Ok(path) = std::env::var("LEAFVIEW_SETTINGS_SNAPSHOT") {
-            std::fs::write(path, text).unwrap();
+            std::fs::write(&path, text).unwrap();
+            let mut p = p;
+            p.switch_tab(true);
+            t.draw(|f| p.render(f)).unwrap();
+            let b = t.backend().buffer();
+            let text = (0..30)
+                .map(|y| (0..100).map(|x| b[(x, y)].symbol()).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(!text.contains("Custom inputs") && !text.contains("F2 accept"));
+            assert!(text.contains("Ctrl+S"));
+            std::fs::write(format!("{path}.inputs"), text).unwrap();
         }
     }
 }

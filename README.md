@@ -209,7 +209,9 @@ and remaining gaps. Additional automated check: `python3 scripts/typst-smoke.py`
 Press **o** in Typst mode. The **Typst** tab contains every implemented compiler flag; **Document inputs**
 is a separate key/value tab; **LeafView** contains compile-on-save, PDF publication
 and source following.
-Use ←/→ to switch tabs, Tab / Shift+Tab or ↑↓ to select, Enter to edit/toggle.
+Use ←/→ or h/l to switch tabs; Tab / Shift+Tab, ↑↓ or j/k to select,
+Enter to edit/toggle. On the bottom button row, ←/→ and h/l move between
+Apply, Save and Cancel instead of switching tabs. Captions explain each action.
 Package/export flags are shown directly, with no Advanced section. Every field
 has a description identifying the corresponding CLI flag.
 Paths and numbers are plain text; font directories use semicolons, feature/standard
