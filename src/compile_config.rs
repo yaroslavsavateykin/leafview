@@ -250,13 +250,21 @@ impl Session {
         })
     }
     pub fn effective(&self) -> Result<Effective> {
+        self.merge(true)
+    }
+    pub fn editable(&self) -> Result<Effective> {
+        self.merge(false)
+    }
+    fn merge(&self, resolve: bool) -> Result<Effective> {
         let mut value = Effective::default();
         for (config, path) in [
             (&self.global, &self.global_path),
             (&self.project, &self.project_path),
         ] {
             let mut flags = config.flags.clone();
-            flags.resolve_paths(path.parent().unwrap());
+            if resolve {
+                flags.resolve_paths(path.parent().unwrap());
+            }
             flags.apply(&mut value);
         }
         for (config, path) in [
@@ -265,12 +273,18 @@ impl Session {
         ] {
             if let Some(flags) = self.file_entry(config, path) {
                 let mut flags = flags.clone();
-                flags.resolve_paths(path.parent().unwrap());
+                if resolve {
+                    flags.resolve_paths(self.input.parent().unwrap());
+                }
                 flags.apply(&mut value);
             }
         }
         self.cli.apply(&mut value);
         if let Some(flags) = &self.runtime {
+            let mut flags = flags.clone();
+            if resolve {
+                flags.resolve_paths(self.input.parent().unwrap());
+            }
             flags.apply(&mut value);
         }
         validate_values(&value.options)?;
@@ -369,10 +383,12 @@ pub fn validate(input: &Path, o: &Options) -> Result<PathBuf> {
 pub fn parse_cli(args: Vec<OsString>) -> Result<(PathBuf, Flags)> {
     let filtered = args;
     let (path, options) = Options::parse(filtered.clone())?;
-    let all = serde_json::to_value(Flags::snapshot(&Effective {
+    let no_pdf = options.no_pdf;
+    let mut all = serde_json::to_value(Flags::snapshot(&Effective {
         options,
         ..Effective::default()
     })?)?;
+    all["no_pdf"] = serde_json::Value::Bool(no_pdf);
     let mut patch = serde_json::Map::new();
     let mapping = [
         ("--root", "root"),
@@ -486,6 +502,37 @@ mod tests {
         std::fs::write(&global, "{invalid").unwrap();
         assert!(s.save().is_err());
         assert_eq!(std::fs::read_to_string(global).unwrap(), "{invalid");
+    }
+    #[test]
+    fn paths_remain_literal_in_editor_and_saved_file() {
+        let d = tempfile::tempdir().unwrap();
+        let input = d.path().join("a.typ");
+        std::fs::write(&input, "").unwrap();
+        let global = d.path().join("config.json");
+        let mut session = Session::from_paths(
+            input.clone(),
+            global.clone(),
+            d.path().join(".leafview.json"),
+            Flags::default(),
+        );
+        let mut raw = Effective::default();
+        raw.options.root = Some("../..".into());
+        session.runtime = Some(Flags::snapshot(&raw).unwrap());
+        session.save().unwrap();
+        let loaded = Session::from_paths(
+            input,
+            global,
+            d.path().join(".leafview.json"),
+            Flags::default(),
+        );
+        assert_eq!(
+            loaded.editable().unwrap().options.root,
+            Some("../..".into())
+        );
+        assert_eq!(
+            loaded.effective().unwrap().options.root,
+            Some(d.path().join("../.."))
+        );
     }
     #[test]
     fn rejects_metadata_and_bad_values_and_clears_options() {

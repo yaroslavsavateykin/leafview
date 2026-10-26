@@ -1,4 +1,4 @@
-//! Typed, tabbed compile controls. Uncommon flags are tucked behind Advanced.
+//! Typed controls for all supported Typst flags, document inputs and viewer behavior.
 use crate::compile_config::{Effective, Flags, Session};
 use anyhow::{Context, Result};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -23,7 +23,6 @@ enum Kind {
     Text,
     Number,
     List,
-    Inputs,
     Toggle,
     Inverse,
 }
@@ -33,12 +32,6 @@ const TYPST: &[Field] = &[
         label: "Project root",
         help: "--root · Sandbox root containing the input. Empty = input directory.",
         kind: Kind::Text,
-    },
-    Field {
-        key: "inputs",
-        label: "Document inputs",
-        help: "--input · key=value pairs, separated by ; (or a JSON string map).",
-        kind: Kind::Inputs,
     },
     Field {
         key: "fonts",
@@ -61,13 +54,13 @@ const TYPST: &[Field] = &[
     Field {
         key: "ignore_system",
         label: "System fonts",
-        help: "Use fonts installed on this system. Turn off for reproducible builds.",
+        help: "--ignore-system-fonts (inverted) · Use fonts installed on this system.",
         kind: Kind::Inverse,
     },
     Field {
         key: "ignore_embedded",
         label: "Bundled fonts",
-        help: "Use the fonts bundled with the embedded Typst compiler.",
+        help: "--ignore-embedded-fonts (inverted) · Use bundled Typst fonts.",
         kind: Kind::Inverse,
     },
 ];
@@ -117,7 +110,7 @@ const ADVANCED: &[Field] = &[
     Field {
         key: "no_tags",
         label: "PDF accessibility tags",
-        help: "Include PDF accessibility tags. Disable only if needed for compatibility.",
+        help: "--no-pdf-tags (inverted) · Include PDF accessibility tags.",
         kind: Kind::Inverse,
     },
 ];
@@ -150,7 +143,6 @@ pub struct Settings {
     draft: Session,
     value: Effective,
     tab: usize,
-    advanced: bool,
     selected: usize,
     edit: Option<TextEdit>,
     inputs: Option<InputsEditor>,
@@ -173,26 +165,21 @@ impl Settings {
             draft,
             value: Effective::default(),
             tab: 0,
-            advanced: false,
             selected: 0,
             edit: None,
             inputs: None,
         };
-        match panel.draft.effective() {
+        match panel.draft.editable() {
             Ok(v) => panel.value = v,
             Err(e) => panel.error = Some(format!("{e:#}")),
         }
         panel
     }
     fn fields(&self) -> Vec<Field> {
-        if self.tab == 1 {
+        if self.tab == 2 {
             LEAFVIEW.to_vec()
         } else {
-            let mut fields = TYPST.to_vec();
-            if self.advanced {
-                fields.extend_from_slice(ADVANCED);
-            }
-            fields
+            TYPST.iter().chain(ADVANCED.iter()).copied().collect()
         }
     }
     fn json(&self) -> serde_json::Value {
@@ -210,15 +197,6 @@ impl Settings {
                 }
                 if on { "On" } else { "Off" }.into()
             }
-            Kind::Inputs => v
-                .as_object()
-                .map(|m| {
-                    m.iter()
-                        .map(|(k, v)| format!("{k}={}", v.as_str().unwrap_or("")))
-                        .collect::<Vec<_>>()
-                        .join("; ")
-                })
-                .unwrap_or_default(),
             Kind::List => v
                 .as_array()
                 .map(|a| {
@@ -280,27 +258,11 @@ impl Settings {
                     )?
                 }
             }
-            Kind::Inputs => {
-                if text.starts_with('{') {
-                    serde_json::from_str(text)?
-                } else {
-                    let mut map = std::collections::BTreeMap::new();
-                    for part in text.split(';').map(str::trim).filter(|s| !s.is_empty()) {
-                        let (k, v) = part
-                            .split_once('=')
-                            .context("inputs use key=value; other=value")?;
-                        anyhow::ensure!(!k.trim().is_empty(), "input key is empty");
-                        map.insert(k.trim(), v.trim());
-                    }
-                    serde_json::to_value(map)?
-                }
-            }
             _ => serde_json::from_str(text)?,
         };
         let mut json = self.json();
         json[field.key] = v;
-        let mut flags: Flags = serde_json::from_value(json)?;
-        flags.resolve_paths(self.draft.input.parent().unwrap());
+        let flags: Flags = serde_json::from_value(json)?;
         let mut value = Effective::default();
         flags.apply(&mut value);
         crate::compile_config::validate_values(&value.options)?;
@@ -319,18 +281,42 @@ impl Settings {
         true
     }
     fn apply(&mut self, input: &Path, save: bool) -> Action {
-        if let Err(e) = crate::compile_config::validate(input, &self.value.options) {
+        let mut resolved = Flags::snapshot(&self.value).expect("serializable flags");
+        resolved.resolve_paths(input.parent().unwrap());
+        let mut effective = Effective::default();
+        resolved.apply(&mut effective);
+        if let Err(e) = crate::compile_config::validate(input, &effective.options) {
             self.error = Some(format!("{e:#}"));
             return Action::None;
         }
         self.draft.runtime = Some(Flags::snapshot(&self.value).expect("serializable flags"));
-        Action::Apply(
-            Box::new(self.draft.clone()),
-            Box::new(self.value.clone()),
-            save,
-        )
+        Action::Apply(Box::new(self.draft.clone()), Box::new(effective), save)
+    }
+    fn switch_tab(&mut self, right: bool) {
+        self.tab = (self.tab + if right { 1 } else { 2 }) % 3;
+        self.selected = 0;
+        if self.tab == 1 {
+            self.inputs = Some(InputsEditor::new(&self.value.options.inputs));
+        }
     }
     pub fn key(&mut self, key: KeyEvent, input: &Path) -> Action {
+        if self.tab == 1 && self.inputs.as_ref().is_some_and(|e| e.edit.is_none()) {
+            if matches!(key.code, KeyCode::Left | KeyCode::Right) {
+                let result = self.inputs.as_mut().unwrap().finish();
+                match result {
+                    Ok(values) => {
+                        self.value.options.inputs = values;
+                        self.inputs = None;
+                        self.switch_tab(key.code == KeyCode::Right);
+                    }
+                    Err(e) => self.inputs.as_mut().unwrap().error = Some(format!("{e:#}")),
+                }
+                return Action::None;
+            }
+            if key.code == KeyCode::Esc {
+                return Action::Cancel;
+            }
+        }
         if let Some(editor) = &mut self.inputs {
             let save = key.modifiers.contains(KeyModifiers::CONTROL)
                 && matches!(key.code, KeyCode::Char('s' | 'a'));
@@ -339,6 +325,9 @@ impl Settings {
                     Ok(values) => {
                         self.value.options.inputs = values;
                         self.inputs = None;
+                        if !save {
+                            self.tab = 0;
+                        }
                         self.error = None;
                         if save {
                             return self.apply(input, key.code == KeyCode::Char('s'));
@@ -347,7 +336,7 @@ impl Settings {
                     Err(e) => editor.error = Some(format!("{e:#}")),
                 }
             } else if key.code == KeyCode::Esc && editor.edit.is_none() {
-                self.inputs = None;
+                return Action::Cancel;
             } else {
                 editor.key(key);
             }
@@ -375,13 +364,12 @@ impl Settings {
             return Action::None;
         }
         let n = self.fields().len();
-        let extra = usize::from(self.tab == 0);
-        let total = n + extra + 3;
+        let extra = 0;
+        let total = n + 3;
         match key.code {
             KeyCode::Esc => return Action::Cancel,
             KeyCode::Left | KeyCode::Right => {
-                self.tab = 1 - self.tab;
-                self.selected = 0;
+                self.switch_tab(key.code == KeyCode::Right);
                 self.error = None;
             }
             KeyCode::Tab | KeyCode::Down => self.selected = (self.selected + 1) % total,
@@ -394,14 +382,9 @@ impl Settings {
                         if let Err(e) = self.commit_edit(text) {
                             self.error = Some(format!("{e:#}"));
                         }
-                    } else if matches!(field.kind, Kind::Inputs) {
-                        self.inputs = Some(InputsEditor::new(&self.value.options.inputs));
                     } else {
                         self.edit = Some(TextEdit::new(self.display(field, true)));
                     }
-                } else if extra == 1 && self.selected == n {
-                    self.advanced = !self.advanced;
-                    self.selected = TYPST.len();
                 } else {
                     match self.selected - n - extra {
                         0 => return self.apply(input, false),
@@ -417,14 +400,7 @@ impl Settings {
     pub fn render(&self, f: &mut Frame<'_>) {
         let outer = f.area();
         let width = outer.width.saturating_sub(4).min(92);
-        let height = outer
-            .height
-            .saturating_sub(2)
-            .min(if self.advanced && self.tab == 0 {
-                32
-            } else {
-                24
-            });
+        let height = outer.height.saturating_sub(2).min(30);
         let area = Rect::new(
             outer.x + (outer.width - width) / 2,
             outer.y + (outer.height - height) / 2,
@@ -450,10 +426,11 @@ impl Settings {
             Constraint::Length(2),
         ])
         .split(inner);
-        let tabs = Line::from(vec![
-            Span::styled(
-                "  Typst  ",
-                if self.tab == 0 {
+        let mut tabs = Vec::new();
+        for (index, name) in ["Typst", "Document inputs", "LeafView"].iter().enumerate() {
+            tabs.push(Span::styled(
+                format!("  {name}  "),
+                if self.tab == index {
                     Style::default()
                         .fg(bg)
                         .bg(accent)
@@ -461,21 +438,10 @@ impl Settings {
                 } else {
                     Style::default().fg(muted)
                 },
-            ),
-            Span::raw("  "),
-            Span::styled(
-                "  LeafView  ",
-                if self.tab == 1 {
-                    Style::default()
-                        .fg(bg)
-                        .bg(accent)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(muted)
-                },
-            ),
-            Span::styled("    ← → switch", Style::default().fg(muted)),
-        ]);
+            ));
+            tabs.push(Span::raw(" "));
+        }
+        let tabs = Line::from(tabs);
         f.render_widget(Paragraph::new(tabs), parts[0]);
         let name = self
             .draft
@@ -492,21 +458,10 @@ impl Settings {
         );
         let fields = self.fields();
         let n = fields.len();
-        let mut rows: Vec<(String, String)> = fields
+        let rows: Vec<(String, String)> = fields
             .iter()
             .map(|field| (field.label.into(), self.display(*field, false)))
             .collect();
-        if self.tab == 0 {
-            rows.push((
-                if self.advanced {
-                    "▾ Advanced"
-                } else {
-                    "▸ Advanced"
-                }
-                .into(),
-                "Packages, PDF export & experimental flags".into(),
-            ));
-        }
         let available = parts[2].height.max(1) as usize;
         let start = self
             .selected
@@ -549,8 +504,6 @@ impl Settings {
         let help = self.error.clone().unwrap_or_else(|| {
             if self.selected < n {
                 fields[self.selected].help.into()
-            } else if self.selected == n && self.tab == 0 {
-                "Uncommon compiler options. Leave defaults unless your project needs them.".into()
             } else {
                 "Apply keeps changes in memory; Save remembers them for this file only.".into()
             }
@@ -565,7 +518,7 @@ impl Settings {
                 })),
             parts[3],
         );
-        let first_action = n + usize::from(self.tab == 0);
+        let first_action = n;
         let mut buttons = Vec::new();
         for (index, label) in ["Apply", "Save", "Cancel"].iter().enumerate() {
             buttons.push(Span::raw("  "));
@@ -588,7 +541,13 @@ impl Settings {
             parts[4],
         );
         if let Some(editor) = &self.inputs {
-            editor.render(f, area);
+            let body = Rect::new(
+                inner.x,
+                parts[1].y,
+                inner.width,
+                inner.height.saturating_sub(parts[0].height),
+            );
+            editor.render(f, body);
         }
     }
 }
@@ -867,21 +826,19 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let s = session(d.path());
         let mut p = Settings::new(&s);
-        p.selected = 1;
-        p.commit_edit("mode=teacher; solutions=true".into())
-            .unwrap();
-        assert_eq!(p.value.options.inputs.len(), 2);
-        p.commit_edit("".into()).unwrap();
-        assert!(p.value.options.inputs.is_empty());
-        p.selected = 3;
+        assert_eq!(p.fields().len(), 14);
+        p.selected = 2;
         assert!(p.commit_edit("0".into()).is_err());
         p.commit_edit("2".into()).unwrap();
         p.selected = 0;
         p.commit_edit(".".into()).unwrap();
-        assert_eq!(p.value.options.root, Some(d.path().join(".")));
+        assert_eq!(p.value.options.root, Some(".".into()));
+        p.key(KeyEvent::from(KeyCode::Right), &s.input);
+        assert_eq!(p.tab, 1);
+        assert!(p.inputs.is_some());
         p.key(KeyEvent::from(KeyCode::Right), &s.input);
         assert_eq!(p.fields().len(), 3);
-        assert_eq!(p.tab, 1);
+        assert_eq!(p.tab, 2);
         let before = p.value.auto_compile;
         p.key(KeyEvent::from(KeyCode::Enter), &s.input);
         assert_ne!(p.value.auto_compile, before);
@@ -928,8 +885,10 @@ mod tests {
             .map(|y| (0..100).map(|x| b[(x, y)].symbol()).collect::<String>())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(text.contains("Typst") && text.contains("LeafView") && text.contains("Advanced"));
-        assert!(!text.contains("CA certificate"));
+        assert!(
+            text.contains("Typst") && text.contains("LeafView") && text.contains("Document inputs")
+        );
+        assert!(text.contains("CA certificate"));
         if let Ok(path) = std::env::var("LEAFVIEW_SETTINGS_SNAPSHOT") {
             std::fs::write(path, text).unwrap();
         }

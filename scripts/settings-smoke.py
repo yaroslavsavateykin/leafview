@@ -73,14 +73,14 @@ with tempfile.TemporaryDirectory(prefix='leafview-settings-') as tmp:
         wait(lambda: revision() > 0)
         # CLI inputs replace inherited inputs; runtime edits override CLI.
         send(b'+')
-        send(b'o\t\r')  # custom inputs table
+        send(b'o\x1b[C')  # Document inputs tab
         send(b'nmode\t\rRUNTIMX\x1b[DX\x1b[3~\r')
         # Cursor editing is supported; replace the value explicitly and save cells.
         send(b'\r\x15RUNTIME\r\x1bOQ')
         apply_from(1)
         assert 'RUNTIME' in pdf_text()
-        edit(3, '2')
-        apply_from(3, 19)
+        edit(2, '2')
+        apply_from(2, 19)
         global_path = tmp / 'global/leafview/config.json'
         shared = json.loads(global_path.read_text())
         assert set(shared) == {'files'}
@@ -92,7 +92,7 @@ with tempfile.TemporaryDirectory(prefix='leafview-settings-') as tmp:
         pump(.3)
         previous_helpers = {p for p in descendants(proc.pid) if Path(f'/proc/{p}/cmdline').exists()
             and b'--typst-compiler' in Path(f'/proc/{p}/cmdline').read_bytes()}
-        edit(3, '1')
+        edit(2, '1')
         send(b'\x01')
         main.write_text('#sys.inputs.at("mode", default: "DEFAULT")\n')
         old = revision()
@@ -101,12 +101,12 @@ with tempfile.TemporaryDirectory(prefix='leafview-settings-') as tmp:
         assert all(not Path(f'/proc/{p}').exists() for p in previous_helpers)
         good = main.with_suffix('.pdf').read_bytes()
         # Disable publication, save per-file flags.
-        send(b'o\x1b[C\t\r')
+        send(b'o\x1b[C\x1b[C\t\r')
         apply_from(15, 19)
         assert main.with_suffix('.pdf').read_bytes() == good
         assert json.loads(global_path.read_text())['files'][str(main)]['write_pdf'] is False
         # Disable auto compile, then build manually.
-        send(b'o\x1b[C\r')
+        send(b'o\x1b[C\x1b[C\r')
         apply_from(16)
         old = revision()
         main.write_text('Manual only\n')

@@ -206,18 +206,21 @@ and remaining gaps. Additional automated check: `python3 scripts/typst-smoke.py`
 
 ### Editable compilation flags
 
-Press **o** in Typst mode. The **Typst** tab contains compiler flags; the
-**LeafView** tab contains compile-on-save, PDF publication and source following.
+Press **o** in Typst mode. The **Typst** tab contains every implemented compiler flag; **Document inputs**
+is a separate key/value tab; **LeafView** contains compile-on-save, PDF publication
+and source following.
 Use ←/→ to switch tabs, Tab / Shift+Tab or ↑↓ to select, Enter to edit/toggle.
-Uncommon package/export flags are under **Advanced**. Every field has a description.
+Package/export flags are shown directly, with no Advanced section. Every field
+has a description identifying the corresponding CLI flag.
 Paths and numbers are plain text; font directories use semicolons, feature/standard
 lists use commas. Empty = default. No JSON quotes are needed.
 
-**Document inputs** opens a separate key/value table: ↑↓ selects a row, Tab selects
+The **Document inputs** tab contains a key/value table: ↑↓ selects a row, Tab selects
 key/value, Enter edits, **n** adds a pair, Delete removes a row outside text editing.
 Keys must be nonempty and unique; values can be empty and retain exact whitespace.
 **F2** accepts the table into the settings draft; Esc cancels the current edit,
-then the table. Ctrl+S also accepts and saves directly from the table.
+then the panel. Outside text editing ←/→ switches tabs, preserving valid inputs.
+Ctrl+S also accepts and saves directly from the table.
 
 All text fields support ←/→ cursor movement, Home/End, Backspace, Delete and
 **Ctrl+U** to clear. **Ctrl+S saves for this file**, including the current edit;
@@ -245,9 +248,11 @@ There are no profiles, versions or separate per-document JSON files:
 }
 ```
 
-Keys saved by LeafView are canonical absolute paths. Manually written relative
-keys and paths resolve from the config's directory; paths edited in the TUI
-resolve from the input's directory. Saving preserves entries for other files
+File keys saved by LeafView are canonical absolute paths. Relative file keys
+resolve from the config directory. Paths inside file-specific settings resolve
+from the input's directory; top-level defaults resolve from the config directory.
+The editor and JSON retain paths exactly as entered (for example ../..); path
+resolution happens only for compilation, never by rewriting the displayed text. Saving preserves entries for other files
 and refuses to overwrite malformed JSON. Existing profile-based configs must
 be converted to the flat format; they are never silently overwritten.
 
