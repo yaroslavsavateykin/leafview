@@ -62,6 +62,8 @@ struct App {
     #[cfg(feature = "typst")]
     settings: Option<compile_settings::Settings>,
     #[cfg(feature = "typst")]
+    settings_notice: Option<String>,
+    #[cfg(feature = "typst")]
     compile_millis: u64,
     doc: Arc<Document>,
     view: View,
@@ -231,6 +233,18 @@ impl App {
                         live.configure(&value)?;
                         let mut session = *session;
                         session.warning = None;
+                        self.settings_notice = Some(if save {
+                            format!(
+                                "Saved for {} → {}",
+                                self.source
+                                    .file_name()
+                                    .unwrap_or(self.source.as_os_str())
+                                    .to_string_lossy(),
+                                session.global_path.display()
+                            )
+                        } else {
+                            "Applied for this session · not saved".into()
+                        });
                         self.session = Some(session);
                         Ok(())
                     })();
@@ -246,6 +260,7 @@ impl App {
         }
         #[cfg(feature = "typst")]
         if key.code == KeyCode::Char('o') && self.live.is_some() {
+            self.settings_notice = None;
             if let Some(session) = &self.session {
                 self.settings = Some(compile_settings::Settings::new(session));
             }
@@ -978,6 +993,12 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
         app.view.pages,
         app.view.zoom * 100.0
     );
+    #[cfg(feature = "typst")]
+    let title = if let Some(notice) = &app.settings_notice {
+        format!("{title} · {}", links::sanitize(notice))
+    } else {
+        title
+    };
     let notice = if app.files.focused {
         app.files.notice.clone().unwrap_or_default()
     } else if app.error.is_some() || app.hovered.is_some() || !app.jump.is_empty() || app.loading {
@@ -1223,6 +1244,8 @@ fn viewer_loop(
         session,
         #[cfg(feature = "typst")]
         settings: None,
+        #[cfg(feature = "typst")]
+        settings_notice: None,
         #[cfg(feature = "typst")]
         compile_millis: 0,
         source: path,

@@ -206,11 +206,23 @@ and remaining gaps. Additional automated check: `python3 scripts/typst-smoke.py`
 
 ### Editable compilation flags
 
-Press **o** in Typst mode to edit every supported compiler flag. Tab / Shift+Tab
-or ↑↓ selects a field, Enter edits or toggles it, Delete clears the text buffer.
-Values use JSON syntax: "/path/to/root", ["/path/to/fonts"], {"mode":"teacher"},
-2, null. Esc cancels editing; Esc again discards the panel. Mouse/PDF shortcuts
-cannot leak into the viewer while the editor is open.
+Press **o** in Typst mode. The **Typst** tab contains compiler flags; the
+**LeafView** tab contains compile-on-save, PDF publication and source following.
+Use ←/→ to switch tabs, Tab / Shift+Tab or ↑↓ to select, Enter to edit/toggle.
+Uncommon package/export flags are under **Advanced**. Every field has a description.
+Paths and numbers are plain text; font directories use semicolons, feature/standard
+lists use commas. Empty = default. No JSON quotes are needed.
+
+**Document inputs** opens a separate key/value table: ↑↓ selects a row, Tab selects
+key/value, Enter edits, **n** adds a pair, Delete removes a row outside text editing.
+Keys must be nonempty and unique; values can be empty and retain exact whitespace.
+**F2** accepts the table into the settings draft; Esc cancels the current edit,
+then the table. Ctrl+S also accepts and saves directly from the table.
+
+All text fields support ←/→ cursor movement, Home/End, Backspace, Delete and
+**Ctrl+U** to clear. **Ctrl+S saves for this file**, including the current edit;
+**Ctrl+A applies without saving**. A confirmation is shown in the PDF title.
+Esc discards the panel. Mouse/PDF shortcuts cannot leak through the editor.
 
 **Apply** changes this session only. **Save file** applies and remembers the flags
 for the current input in the shared config, normally
