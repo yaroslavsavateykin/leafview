@@ -22,12 +22,19 @@ pub struct Profile {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub replace_inputs: Option<bool>,
 }
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FileConfig {
+    pub default_profile: Option<String>,
+    pub profiles: BTreeMap<String, Profile>,
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub version: u32,
     pub default_profile: String,
     pub profiles: BTreeMap<String, Profile>,
+    pub files: BTreeMap<PathBuf, FileConfig>,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -35,6 +42,7 @@ impl Default for Config {
             version: 1,
             default_profile: "default".into(),
             profiles: BTreeMap::new(),
+            files: BTreeMap::new(),
         }
     }
 }
@@ -128,6 +136,24 @@ impl Config {
             self.profiles.len() <= 128,
             "too many profiles (maximum 128)"
         );
+        anyhow::ensure!(self.files.len() <= 4096, "too many file configurations");
+        for (path, file) in &self.files {
+            anyhow::ensure!(
+                !path.as_os_str().is_empty(),
+                "empty file configuration path"
+            );
+            anyhow::ensure!(
+                file.default_profile
+                    .as_ref()
+                    .is_none_or(|n| !n.trim().is_empty() && n.len() <= 128),
+                "invalid file default profile"
+            );
+            let nested = Self {
+                profiles: file.profiles.clone(),
+                ..Self::default()
+            };
+            nested.check()?;
+        }
         for (name, profile) in &self.profiles {
             anyhow::ensure!(
                 !name.trim().is_empty() && name.len() <= 128,
@@ -169,6 +195,12 @@ impl Config {
         Ok(())
     }
 }
+#[derive(Clone, Copy)]
+pub enum SaveTarget {
+    File,
+    Project,
+    Global,
+}
 #[derive(Clone)]
 pub struct Session {
     pub global: Config,
@@ -179,6 +211,7 @@ pub struct Session {
     pub project_path: PathBuf,
     pub cli: Profile,
     pub warning: Option<String>,
+    pub input: Option<PathBuf>,
 }
 impl Session {
     pub fn load(input: &Path, cli: Profile, selected: Option<String>) -> Self {
@@ -202,7 +235,21 @@ impl Session {
             .map(|p| p.join(".leafview.json"))
             .find(|p| p.is_file())
             .unwrap_or_else(|| input.parent().unwrap().join(".leafview.json"));
-        Self::from_paths(global_path, project_path, cli, selected)
+        let mut session = Self::from_paths(global_path, project_path, cli, selected.clone());
+        session.input = Some(input.canonicalize().unwrap_or_else(|_| input.to_owned()));
+        if selected.is_none() {
+            for (config, path) in [
+                (&session.global, &session.global_path),
+                (&session.project, &session.project_path),
+            ] {
+                if let Some(file) = session.file_entry(config, path) {
+                    if let Some(name) = &file.default_profile {
+                        session.selected = name.clone();
+                    }
+                }
+            }
+        }
+        session
     }
     pub fn from_paths(
         global_path: PathBuf,
@@ -227,6 +274,7 @@ impl Session {
             }
         });
         Self {
+            input: None,
             global,
             project,
             runtime: Config::default(),
@@ -240,6 +288,19 @@ impl Session {
                 Some(warnings.join("\n"))
             },
         }
+    }
+    fn file_entry<'a>(&self, config: &'a Config, config_path: &Path) -> Option<&'a FileConfig> {
+        let input = self.input.as_ref()?;
+        config.files.get(input).or_else(|| {
+            config.files.iter().find_map(|(key, value)| {
+                let path = if key.is_absolute() {
+                    key.clone()
+                } else {
+                    config_path.parent().unwrap().join(key)
+                };
+                (path.canonicalize().ok().as_ref() == Some(input)).then_some(value)
+            })
+        })
     }
     pub fn initial(&mut self, input: &Path) -> Effective {
         match self.effective().and_then(|value| {
@@ -260,6 +321,14 @@ impl Session {
         for config in [&self.global, &self.project, &self.runtime] {
             names.extend(config.profiles.keys().cloned());
         }
+        for (config, path) in [
+            (&self.global, &self.global_path),
+            (&self.project, &self.project_path),
+        ] {
+            if let Some(file) = self.file_entry(config, path) {
+                names.extend(file.profiles.keys().cloned());
+            }
+        }
         names.insert(self.selected.clone());
         names.into_iter().collect()
     }
@@ -279,6 +348,19 @@ impl Session {
                 profile.apply(&mut value);
             }
         }
+        for (config, path) in [
+            (&self.global, &self.global_path),
+            (&self.project, &self.project_path),
+        ] {
+            if let Some(profile) = self
+                .file_entry(config, path)
+                .and_then(|f| f.profiles.get(&self.selected))
+            {
+                let mut profile = profile.clone();
+                profile.resolve_paths(path.parent().unwrap());
+                profile.apply(&mut value);
+            }
+        }
         self.cli.apply(&mut value);
         if let Some(profile) = self.runtime.profiles.get(&self.selected) {
             profile.apply(&mut value);
@@ -290,19 +372,26 @@ impl Session {
         );
         Ok(value)
     }
-    pub fn save(&self, global: bool) -> Result<()> {
-        let (mut config, path) = if global {
-            (self.global.clone(), &self.global_path)
-        } else {
-            (self.project.clone(), &self.project_path)
+    pub fn save(&self, target: SaveTarget) -> Result<()> {
+        let (mut config, path) = match target {
+            SaveTarget::Global | SaveTarget::File => (self.global.clone(), &self.global_path),
+            SaveTarget::Project => (self.project.clone(), &self.project_path),
         };
         // Persist runtime snapshots only; other profiles and their relative paths stay intact.
         // Resolve from disk again so an editor's unrelated changes are not lost.
         if path.exists() {
             config = Config::load(path)?;
         }
-        config.profiles.extend(self.runtime.profiles.clone());
-        config.default_profile = self.selected.clone();
+        if matches!(target, SaveTarget::File) {
+            let input = self.input.as_ref().context("no input file selected")?;
+            // Store only this document's runtime snapshots; preserve all other entries.
+            let file = config.files.entry(input.clone()).or_default();
+            file.profiles.extend(self.runtime.profiles.clone());
+            file.default_profile = Some(self.selected.clone());
+        } else {
+            config.profiles.extend(self.runtime.profiles.clone());
+            config.default_profile = self.selected.clone();
+        }
         config.save(path)
     }
 }
@@ -495,7 +584,7 @@ mod tests {
             .profiles
             .insert("teacher".into(), Profile::snapshot(&v).unwrap());
         assert_eq!(s.effective().unwrap().options.jobs, Some(4));
-        s.save(false).unwrap();
+        s.save(SaveTarget::Project).unwrap();
         assert_eq!(Config::load(&project).unwrap().default_profile, "teacher");
         s.selected = "student".into();
         assert!(s.effective().unwrap().options.no_pdf);
@@ -527,7 +616,7 @@ mod tests {
         assert!(
             v.options.jobs.is_none() && v.options.pages.is_none() && v.options.inputs.is_empty()
         );
-        s.save(false).unwrap();
+        s.save(SaveTarget::Project).unwrap();
         let reloaded = Session::from_paths(
             s.global_path.clone(),
             s.project_path.clone(),
@@ -548,8 +637,49 @@ mod tests {
             None,
         );
         assert!(s.warning.is_some());
-        assert!(s.save(false).is_err());
+        assert!(s.save(SaveTarget::Project).is_err());
         assert_eq!(std::fs::read_to_string(p).unwrap(), "{bad");
+    }
+    #[test]
+    fn shared_file_entries_are_independent_and_round_trip() {
+        let d = tempfile::tempdir().unwrap();
+        let a = d.path().join("a.typ");
+        let b = d.path().join("b.typ");
+        std::fs::write(&a, "A").unwrap();
+        std::fs::write(&b, "B").unwrap();
+        let global = d.path().join("config.json");
+        let project = d.path().join(".leafview.json");
+        let mut session =
+            Session::from_paths(global.clone(), project.clone(), Profile::default(), None);
+        session.input = Some(a.clone());
+        session.selected = "teacher".into();
+        let mut value = Effective::default();
+        value.options.jobs = Some(3);
+        session
+            .runtime
+            .profiles
+            .insert("teacher".into(), Profile::snapshot(&value).unwrap());
+        session.save(SaveTarget::File).unwrap();
+        session.input = Some(b.clone());
+        session.selected = "student".into();
+        session.runtime.profiles.clear();
+        value.options.jobs = Some(1);
+        session
+            .runtime
+            .profiles
+            .insert("student".into(), Profile::snapshot(&value).unwrap());
+        session.save(SaveTarget::File).unwrap();
+        let config = Config::load(&global).unwrap();
+        assert_eq!(config.files.len(), 2);
+        assert!(config.profiles.is_empty());
+        assert_eq!(config.files[&a].default_profile.as_deref(), Some("teacher"));
+        let mut loaded =
+            Session::from_paths(global, project, Profile::default(), Some("teacher".into()));
+        loaded.input = Some(a);
+        assert_eq!(loaded.effective().unwrap().options.jobs, Some(3));
+        loaded.input = Some(b);
+        loaded.selected = "student".into();
+        assert_eq!(loaded.effective().unwrap().options.jobs, Some(1));
     }
     #[test]
     fn malformed_values_and_cli() {

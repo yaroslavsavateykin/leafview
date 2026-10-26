@@ -206,7 +206,8 @@ and remaining gaps. Additional automated check: `python3 scripts/typst-smoke.py`
 
 ### Configuration and profiles
 
-Configuration precedence is **defaults < global < project < CLI < runtime**.
+Configuration precedence is **defaults < global profiles < project profiles <
+global file entry < project file entry < CLI < runtime**.
 Global settings live at `$XDG_CONFIG_HOME/leafview/config.json` (normally
 `~/.config/leafview/config.json`). The project file is the nearest ancestor
 `.leafview.json`, or a new file beside the input if none exists. Relative paths
@@ -246,6 +247,39 @@ All implemented compiler fields are available: `root`, `inputs` (string map),
 present, `write_pdf` wins. `auto_compile` and `auto_sync` control live behavior.
 No new Rust dependencies are required.
 
+#### Defaults for individual files
+
+**Save file** stores settings in the same global `config.json`, under `files`.
+No sidecar files are created. Each document has its own default profile and
+profile parameters; settings for other documents remain untouched:
+
+```json
+{
+  "version": 1,
+  "files": {
+    "/home/user/course/lecture.typ": {
+      "default_profile": "teacher",
+      "profiles": {
+        "teacher": {"inputs": {"solutions": "true"}, "jobs": 2}
+      }
+    },
+    "/home/user/course/exam.typ": {
+      "default_profile": "student",
+      "profiles": {
+        "student": {"inputs": {"solutions": "false"}, "write_pdf": false}
+      }
+    }
+  }
+}
+```
+
+Open the document, press `o`, edit settings, then choose **Save file**.
+Next time its default profile/settings load automatically, including when opened
+from the file browser. Saved keys use canonical absolute paths, avoiding collisions
+between identically named files. Manually written relative keys are resolved from
+the config directory; this also works in a project's `.leafview.json`.
+`--profile` overrides the saved default profile.
+
 Press **`o`** in Typst mode to open **Compile Settings**. Tab / Shift+Tab or ↑↓
 select fields; Enter edits values or toggles booleans. Profile ←→ selects an
 existing profile; Enter edits its name to create/select another profile. Values
@@ -254,7 +288,8 @@ Delete clears the edit buffer; Enter commits the field; Esc cancels the field,
 and a second Esc cancels the panel. PDF shortcuts and mouse actions are blocked
 while the panel is open. Ctrl+C still exits.
 
-Choose **Apply** for memory-only settings, **Save project** or **Save global**
+Choose **Apply** for memory-only settings, **Save file** for this document only,
+**Save project** or **Save global**
 to persist runtime snapshots atomically, or **Cancel** to discard drafts.
 Selecting a profile prepares a draft; applying it automatically rebuilds.
 The header shows the active profile. Saving retains unrelated on-disk profiles

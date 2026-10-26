@@ -111,6 +111,12 @@ with tempfile.TemporaryDirectory(prefix='leafview-settings-') as tmp:
         apply_from(0, 20)
         assert main.with_suffix('.pdf').read_bytes() == good
         assert json.loads(config.read_text())['default_profile'] == 'student'
+        # Save only this file in the shared global files map.
+        edit(4, '2')
+        apply_from(4, 22)
+        shared = json.loads(global_path.read_text())
+        assert shared['files'][str(main)]['default_profile'] == 'student'
+        assert shared['files'][str(main)]['profiles']['student']['jobs'] == 2
         # New profile is a draft until Apply; create it and return to student.
         send(b'o\r\x1b[3~custom\r')
         apply_from(0)
@@ -148,6 +154,11 @@ with tempfile.TemporaryDirectory(prefix='leafview-settings-') as tmp:
         send(b'\x08\x0bG\r')
         wait(lambda: Path(json.loads(history.read_text())[0]).name == 'main.typ')
         pump(1)
+        send(b'o' + b'\t' * 4 + b'\r')
+        # Reopened Typst loaded the per-file jobs value; cancel the field/panel.
+        assert b'2' in output
+        send(b'\x1b')
+        send(b'\x1b')
         send(b'\x08\x0brGkk\r')
         wait(lambda: history.exists() and Path(json.loads(history.read_text())[0]).name == 'a.pdf')
         assert not any(' --typst-compiler ' in Path(f'/proc/{p}/cmdline').read_bytes().replace(b'\0', b' ').decode(errors='replace')

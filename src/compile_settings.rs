@@ -1,5 +1,5 @@
 //! Keyboard-only settings editor; drafts never touch the running compiler.
-use crate::compile_config::{Effective, Profile, Session};
+use crate::compile_config::{Effective, Profile, SaveTarget, Session};
 use anyhow::{Context, Result};
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
@@ -33,12 +33,13 @@ const FIELDS: &[&str] = &[
     "Apply",
     "Save project",
     "Save global",
+    "Save file",
     "Cancel",
 ];
 pub enum Action {
     None,
     Cancel,
-    Apply(Box<Session>, Box<Effective>, Option<bool>),
+    Apply(Box<Session>, Box<Effective>, Option<SaveTarget>),
 }
 pub struct Settings {
     pub draft: Session,
@@ -197,8 +198,9 @@ impl Settings {
                         return Action::None;
                     }
                     let save = match self.selected {
-                        20 => Some(false),
-                        21 => Some(true),
+                        20 => Some(SaveTarget::Project),
+                        21 => Some(SaveTarget::Global),
+                        22 => Some(SaveTarget::File),
                         _ => None,
                     };
                     return Action::Apply(
