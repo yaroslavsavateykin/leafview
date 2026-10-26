@@ -1,5 +1,6 @@
 //! Leafview: a small terminal PDF viewer with latest-wins rendering and tmux graphics support.
 mod document;
+mod files;
 mod kitty;
 #[cfg(test)]
 mod link_tests;
@@ -46,6 +47,10 @@ use view::{raster_width, View, Viewport};
 use workers::Worker;
 
 struct App {
+    files: files::Files,
+    terminal_size: Size,
+    opener: Worker<(PathBuf, u64), (PathBuf, Result<Document>)>,
+    opening: bool,
     #[cfg(feature = "typst")]
     live: Option<typst_live::Live>,
     #[cfg(feature = "typst")]
@@ -177,8 +182,9 @@ impl App {
         });
     }
     fn geometry(&mut self, screen: ratatui::layout::Size) {
+        self.terminal_size = screen;
         let area = Viewport {
-            width: u32::from(screen.width)
+            width: u32::from(screen.width.saturating_sub(self.files.width(screen.width)))
                 .saturating_mul(self.font_width)
                 .clamp(1, 3400),
             height: u32::from(screen.height.saturating_sub(1))
@@ -193,6 +199,55 @@ impl App {
     }
     fn on_key(&mut self, key: KeyEvent) -> bool {
         if key.kind != KeyEventKind::Press && key.kind != KeyEventKind::Repeat {
+            return false;
+        }
+        if key.code == KeyCode::F(2) {
+            self.files.visible = !self.files.visible;
+            self.files.focused = self.files.visible;
+            self.image = None;
+            self.geometry(self.terminal_size);
+            self.dirty = true;
+            return false;
+        }
+        if key.code == KeyCode::Tab
+            && self.files.visible
+            && self.files.width(self.terminal_size.width) > 0
+        {
+            self.files.focused = !self.files.focused;
+            self.dirty = true;
+            return false;
+        }
+        if self.files.focused && self.files.width(self.terminal_size.width) > 0 {
+            if key.code == KeyCode::Char('q')
+                || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
+            {
+                return true;
+            }
+            if key.code == KeyCode::Esc {
+                self.files.focused = false;
+            } else if let Some(path) = self.files.key(key) {
+                if !self.opening && !self.reload_pending {
+                    #[cfg(feature = "typst")]
+                    let live_mode = self.live.is_some();
+                    #[cfg(not(feature = "typst"))]
+                    let live_mode = false;
+                    if live_mode {
+                        self.files.notice =
+                            Some("Open PDFs in PDF mode, not during Typst preview".into());
+                    } else if self
+                        .opener
+                        .input
+                        .as_ref()
+                        .unwrap()
+                        .try_send((path, self.doc.revision + 1))
+                        .is_ok()
+                    {
+                        self.opening = true;
+                        self.files.notice = Some("Opening PDF…".into());
+                    }
+                }
+            }
+            self.dirty = true;
             return false;
         }
         let mut request = false;
@@ -374,6 +429,9 @@ impl App {
         }
     }
     fn reload(&mut self) {
+        if self.opening {
+            return;
+        }
         if self.reload_pending {
             self.reload_again = true;
             return;
@@ -468,6 +526,13 @@ impl App {
             .hint(self.doc.clone(), destination.page, width);
     }
     fn on_mouse(&mut self, event: MouseEvent) {
+        let panel_width = self.files.width(self.terminal_size.width);
+        if panel_width > 0 && event.column < panel_width {
+            self.files.focused = true;
+            self.dirty = true;
+            return;
+        }
+        self.files.focused = false;
         self.pointer = Some((event.column, event.row));
         self.hover_at(event.column, event.row);
         let changed = match event.kind {
@@ -490,7 +555,8 @@ impl App {
                     });
                 if let Some(aspect) = aspect {
                     let anchor = (
-                        f64::from(event.column) * f64::from(self.font_width)
+                        f64::from(event.column.saturating_sub(panel_width))
+                            * f64::from(self.font_width)
                             + f64::from(self.font_width) / 2.,
                         f64::from(event.row) * f64::from(self.font_height)
                             + f64::from(self.font_height) / 2.,
@@ -757,7 +823,13 @@ fn abbreviate(text: &str, max_chars: usize) -> String {
 
 fn ui(f: &mut Frame<'_>, app: &mut App) {
     let parts = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(f.area());
-    let screen = parts[0];
+    let panel_width = app.files.width(parts[0].width);
+    let columns =
+        Layout::horizontal([Constraint::Length(panel_width), Constraint::Min(1)]).split(parts[0]);
+    if panel_width > 0 {
+        app.files.render(f, columns[0], &app.source);
+    }
+    let screen = columns[1];
     f.render_widget(
         Block::new().style(Style::default().bg(Color::Rgb(20, 22, 26))),
         screen,
@@ -790,7 +862,9 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
         render_compile_error(f, screen, error);
     }
     f.render_widget(
-        Paragraph::new(links::sanitize(&app.status())).style(
+        Paragraph::new(links::sanitize(&if app.files.focused && panel_width > 0 {
+            app.files.notice.clone().unwrap_or_else(|| " Files · ↑↓/jk select · ←→/hl folders · Enter open · Backspace parent · r refresh · Tab document".into())
+        } else { app.status() })).style(
             Style::default()
                 .fg(if app.hovered.is_some() {
                     Color::LightCyan
@@ -965,15 +1039,30 @@ fn viewer_loop(
     let pdf_mode = true;
     #[cfg(feature = "typst")]
     let pdf_mode = live.is_none();
-    let (watcher, watched) = if pdf_mode {
+    let (watcher, watched) = if pdf_mode && path.is_file() {
         let (w, r) = watch(&path)?;
         (Some(w), r)
     } else {
         let (_, r) = mpsc::channel();
         (None, r)
     };
-    let _watcher = watcher; // Keep the OS watcher alive for the duration of the viewer.
+    let mut watcher = watcher;
+    let mut watched = watched;
+    let mut watched_path = path.clone();
+    let mut files = files::Files::new(&path, pdf_mode);
+    if pdf_mode {
+        files.record(&path);
+    }
     let mut app = App {
+        files,
+        terminal_size: Size::default(),
+        opener: Worker::new(|(path, revision): (PathBuf, u64), stop| {
+            let result = Document::open_cancel(&path, revision, || {
+                stop.load(std::sync::atomic::Ordering::SeqCst)
+            });
+            (path, result)
+        }),
+        opening: false,
         #[cfg(feature = "typst")]
         live,
         #[cfg(feature = "typst")]
@@ -1045,6 +1134,44 @@ fn viewer_loop(
         app.consume_live();
         app.flush_render();
         app.consume();
+        if let Ok((path, result)) = app.opener.output.try_recv() {
+            app.opening = false;
+            match result {
+                Ok(doc) => {
+                    app.source = path;
+                    app.view = View::new(doc.pages);
+                    app.doc = Arc::new(doc);
+                    app.history.clear();
+                    app.destination = None;
+                    app.image = None;
+                    app.displayed = None;
+                    app.pointer = None;
+                    app.error = app.doc.links.error.clone();
+                    app.files.notice = None;
+                    app.files.record(&app.source);
+                    app.files.focused = false;
+                    app.jump.clear();
+                    app.schedule();
+                }
+                Err(error) => app.files.notice = Some(format!("Cannot open PDF: {error:#}")),
+            }
+            app.dirty = true;
+        }
+        if app.source != watched_path {
+            match watch(&app.source) {
+                Ok((w, r)) => {
+                    watcher = Some(w);
+                    watched = r;
+                }
+                Err(error) => {
+                    watcher = None;
+                    app.error = Some(format!("Watcher: {error}"));
+                }
+            }
+            watched_path = app.source.clone();
+            reload_due = None;
+        }
+        let _keep_watcher_alive = &watcher;
         app.maybe_hint();
         while let Ok(event) = watched.try_recv() {
             match event {
@@ -1150,7 +1277,7 @@ fn main() -> Result<()> {
             (Some(path), None, None, None) => (PathBuf::from(path), false),
             _ => {
                 eprintln!(
-                "Usage: leafview <file.pdf>\n       leafview typst <file.typ>\n\nRequires Poppler: sudo apt install poppler-utils"
+                "Usage: leafview <file.pdf|directory>\n       leafview typst <file.typ>\n\nRequires Poppler: sudo apt install poppler-utils"
             );
                 std::process::exit(2)
             }
@@ -1160,8 +1287,8 @@ fn main() -> Result<()> {
     let path = path
         .canonicalize()
         .with_context(|| format!("cannot open {}", path.display()))?;
-    if !path.is_file() {
-        anyhow::bail!("not a file: {}", path.display());
+    if !path.is_file() && !(path.is_dir() && !typst_mode) {
+        anyhow::bail!("not a file or PDF directory: {}", path.display());
     }
     for program in ["pdfinfo", "pdftoppm", "prlimit"] {
         if CommandCheck::missing(program) {
@@ -1186,9 +1313,14 @@ fn main() -> Result<()> {
     // Initial compilation runs in its owned worker before terminal entry. Errors
     // still enter the viewer with a placeholder, allowing edit/retry and quit.
     #[cfg(not(feature = "typst"))]
-    let doc = Arc::new(Document::open(&path, 1)?);
+    let doc = if path.is_dir() {
+        let placeholder = initial_placeholder()?;
+        Arc::new(Document::open(placeholder.path(), 0)?)
+    } else {
+        Arc::new(Document::open(&path, 1)?)
+    };
     #[cfg(feature = "typst")]
-    let doc = if typst_mode {
+    let doc = if typst_mode || path.is_dir() {
         let placeholder = initial_placeholder()?;
         Arc::new(Document::open(placeholder.path(), 0)?)
     } else {
@@ -1205,7 +1337,6 @@ fn main() -> Result<()> {
     )
 }
 
-#[cfg(feature = "typst")]
 fn initial_placeholder() -> Result<tempfile::NamedTempFile> {
     // Poppler-valid blank PDF, held only long enough for Document's snapshot.
     let mut pdf = lopdf::Document::with_version("1.5");

@@ -21,7 +21,36 @@ Or `cargo build --locked --release` and run `./target/release/leafview document.
 Use a current stable Rust toolchain: the lockfile includes recent Ratatui/image
 versions, not the old Rust shipped by some distribution packages.
 
-## Keys
+## PDF library browser (`fileview` branch)
+
+Open a PDF or a directory: `leafview ./papers` or `leafview ./papers/report.pdf`.
+A compact sidebar shows recent PDFs first (◷), then the directory tree. Only
+PDF files and directories appear; folders expand lazily, sorted before files.
+The active PDF is cyan. Enter opens a selected file without leaving LeafView;
+failed opens retain the current document. Recent history contains up to 20 paths
+and is saved atomically to `$XDG_STATE_HOME/leafview/recent.json` (default:
+`~/.local/state/leafview/recent.json`). No document contents are stored.
+
+| Browser key | Action |
+| --- | --- |
+| `Tab` | Switch focus between tree and document |
+| `F2` | Show / hide sidebar |
+| `↑` / `↓`, `j` / `k` | Select entry |
+| `→` / `l` | Expand directory |
+| `←` / `h` | Collapse directory or select parent |
+| `Enter` | Open PDF / toggle directory |
+| `Backspace` | Browse parent directory |
+| `g` / `G`, Home / End | First / last entry |
+| `r` | Refresh directory listing |
+| `Esc` | Return focus to document |
+
+The sidebar hides automatically below 48 terminal columns. Symlinked directories
+are not followed; listings are bounded to 5,000 visible entries and 24 levels.
+Tree refresh is manual (`r`); the open PDF still reloads automatically on saves.
+PDF switching is asynchronous and updates the file watcher. Typst live preview
+starts with the sidebar hidden; switching documents from that mode is disabled.
+
+## Keys (document focus)
 
 | Key | Action |
 | --- | --- |

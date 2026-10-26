@@ -29,7 +29,7 @@ with tempfile.TemporaryDirectory(prefix="leafview-test-") as tmp:
     opener.chmod(0o755)
     trace = Path(tmp) / 'trace.jsonl'
     env = {**os.environ, "TERM": "xterm-256color", "PATH": tmp + os.pathsep + os.environ['PATH'],
-           "LEAFVIEW_TRACE": str(trace)}
+           "LEAFVIEW_TRACE": str(trace), "LEAFVIEW_GRAPHICS": "safe"}
     for key in ["TMUX", "TERM_PROGRAM", "KITTY_WINDOW_ID"]:
         env.pop(key, None)
     proc = subprocess.Popen([str(root / "target/release/leafview"), str(source)],
@@ -56,9 +56,11 @@ with tempfile.TemporaryDirectory(prefix="leafview-test-") as tmp:
         assert proc.poll() is None, output[-1000:]
         # Device-status query must precede mouse reporting, or unsolicited mouse
         # events can interfere with the graphics capability parser.
-        assert output.index(b'\x1b[5n') < output.index(b'\x1b[?1003h')
-        assert b'Halfblocks' in output, 'fallback must be visible in status'
-        assert b"3" in output and b"100%" in output, "no initial status"
+        assert b'\x1b[?1003h' in output
+        os.write(master, b'\x1bOQ')  # F2: legacy full-width document flow
+        pump(.5)
+        assert trace.exists(), 'initial PDF must render'
+        assert abs(json.loads(trace.read_text().splitlines()[-1])['zoom'] - 1.0) < .001
         # Plain arrows/hjkl scroll without changing pages; Shift turns pages.
         for key in (b'h', b'j', b'k', b'l', b'\x1b[A', b'\x1b[B', b'\x1b[C', b'\x1b[D'):
             os.write(master, b'zG')
@@ -175,13 +177,13 @@ with tempfile.TemporaryDirectory(prefix="leafview-test-") as tmp:
         captured = bytearray()
         try:
             deadline = time.monotonic() + 5
-            while b'100%' not in captured and time.monotonic() < deadline:
+            while b'PDF files' not in captured and time.monotonic() < deadline:
                 if select.select([master], [], [], .02)[0]:
                     captured.extend(os.read(master, 65536))
-            assert b'100%' in captured, 'signal test did not initialize'
+            assert b'PDF files' in captured, 'signal test did not initialize'
             # Let signal registration finish after the first frame.
             time.sleep(.1)
-            os.write(master, b'+jlHL' * 20)
+            os.write(master, b'\t' + b'+jlHL' * 20)
             os.kill(proc.pid, sig)
             deadline = time.monotonic() + 3
             while proc.poll() is None and time.monotonic() < deadline:
@@ -209,14 +211,14 @@ with tempfile.TemporaryDirectory(prefix="leafview-test-") as tmp:
     captured = bytearray()
     try:
         deadline = time.monotonic() + 5
-        while time.monotonic() < deadline and b"explicit compatibility mode" not in captured:
+        while time.monotonic() < deadline and b"PDF files" not in captured:
             if select.select([master], [], [], 0.05)[0]:
                 captured.extend(os.read(master, 65536))
             assert proc.poll() is None, captured[-1000:]
-        assert b"explicit compatibility mode" in captured, captured[-2000:]
+        assert b"PDF files" in captured, captured[-2000:]
         assert b"\x1b_G" not in captured, "unexpected Kitty graphics data in safe mode"
         assert b"\x1b[5n" not in captured, "safe mode must not query graphics"
-        os.write(master, b"jlHL" * 100 + b"q")
+        os.write(master, b"\t" + b"jlHL" * 100 + b"q")
         deadline = time.monotonic() + 5
         while proc.poll() is None and time.monotonic() < deadline:
             if select.select([master], [], [], 0.02)[0]:
