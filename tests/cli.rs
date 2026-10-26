@@ -20,12 +20,13 @@ fn extracts_snapshot_links_in_bounded_helper() {
 }
 
 #[test]
-fn prints_usage_without_arguments() {
+fn prints_help() {
     let output = Command::new(env!("CARGO_BIN_EXE_leafview"))
+        .arg("--help")
         .output()
         .expect("start leafview");
-    assert_eq!(output.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("Usage: leafview"));
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Usage: leafview"));
 }
 
 #[cfg(not(feature = "typst"))]

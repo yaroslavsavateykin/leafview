@@ -109,6 +109,7 @@ impl Renderer {
         let raster_key = Arc::new(Mutex::new(None));
         let desired_raster = raster_key.clone();
         let hint_pending = Arc::new(AtomicUsize::new(0));
+        let prefetch_busy = Arc::new(AtomicBool::new(false));
         let cache: Arc<Mutex<Cache>> = Arc::new(Mutex::new(Cache::new(96 * 1024 * 1024)));
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(2)
@@ -256,7 +257,9 @@ impl Renderer {
                         .map(|(&k, _)| k)
                         .filter(|k| {
                             k.revision != key.revision
-                                || k.width != key.width
+                                || (k.width != key.width
+                                    && (k.page != key.page
+                                        || k.width.abs_diff(key.width) > req.viewport.width / 5))
                                 || k.page.abs_diff(key.page) > 3
                         })
                         .collect();
@@ -266,24 +269,33 @@ impl Renderer {
                         }
                     }
                 }
-                // Complete each distance before starting the next: Rayon scopes alone
-                // do not guarantee FIFO priority. At most two renders run concurrently.
-                for distance in 1..=3 {
-                    if cancelled() {
-                        break;
-                    }
-                    pool.scope(|scope| {
-                        for page in neighbors(req.page, req.doc.pages, distance)
-                            .into_iter()
-                            .flatten()
-                        {
-                            let cache = &wc;
-                            let cancelled = &cancelled;
-                            let path = req.doc.snapshot_path();
-                            scope.spawn(move |_| {
-                                let _ = prefetch(cache, Key { page, ..key }, key, path, cancelled);
+                // Never block the foreground mailbox on speculation. Two bounded
+                // background workers can run Poppler alongside the visible render.
+                // A new request cancels obsolete work; only one batch is queued.
+                if !prefetch_busy.swap(true, Ordering::SeqCst) {
+                    let (cache, stopped, generation, busy) =
+                        (wc.clone(), ws.clone(), wg.clone(), prefetch_busy.clone());
+                    pool.spawn(move || {
+                        let cancelled = || {
+                            stopped.load(Ordering::SeqCst)
+                                || generation.load(Ordering::SeqCst) != req.generation
+                        };
+                        let targets = speculative_keys(key, req.doc.pages, req.viewport.width);
+                        for pair in targets.chunks(2) {
+                            if cancelled() {
+                                break;
+                            }
+                            rayon::scope(|scope| {
+                                for &target in pair {
+                                    let (cache, cancelled, path) =
+                                        (&cache, &cancelled, req.doc.snapshot_path());
+                                    scope.spawn(move |_| {
+                                        let _ = prefetch(cache, target, key, path, cancelled);
+                                    });
+                                }
                             });
                         }
+                        busy.store(false, Ordering::SeqCst);
                     });
                 }
             }
@@ -358,6 +370,31 @@ fn neighbors(page: u32, pages: u32, distance: u32) -> [Option<u32>; 2] {
     ]
 }
 
+fn speculative_keys(key: Key, pages: u32, viewport_width: u32) -> Vec<Key> {
+    let mut targets = Vec::new();
+    // Adjacent pages first, then the next keyboard/wheel zoom in either direction.
+    for page in neighbors(key.page, pages, 1).into_iter().flatten() {
+        targets.push(Key { page, ..key });
+    }
+    let step = ((viewport_width as f64 * 0.05).round() as u32).max(1);
+    let min_width = (viewport_width / 2).clamp(100, 3400);
+    let max_width = viewport_width.saturating_mul(3).clamp(100, 3400);
+    for width in [
+        key.width.saturating_add(step).min(max_width),
+        key.width.saturating_sub(step).max(min_width),
+    ] {
+        if width != key.width {
+            targets.push(Key { width, ..key });
+        }
+    }
+    for distance in 2..=3 {
+        for page in neighbors(key.page, pages, distance).into_iter().flatten() {
+            targets.push(Key { page, ..key });
+        }
+    }
+    targets
+}
+
 fn prefetch(
     cache: &Mutex<Cache>,
     key: Key,
@@ -375,10 +412,10 @@ fn prefetch(
         }
         // Use the current raster as a conservative estimate before doing work.
         // Exact admission below also handles mixed-size/orientation pages.
-        let estimate = cache
-            .images
-            .peek(&current)
-            .map_or(0, |img| img.as_bytes().len());
+        let estimate = cache.images.peek(&current).map_or(0, |img| {
+            let ratio = key.width as f64 / current.width.max(1) as f64;
+            (img.as_bytes().len() as f64 * ratio * ratio).ceil() as usize
+        });
         if cache.images.len() == 8 || cache.bytes.saturating_add(estimate) > cache.limit {
             return Ok(());
         }
@@ -606,6 +643,51 @@ mod tests {
             y += 1;
             thread::sleep(Duration::from_millis(2));
         }
+    }
+    #[test]
+    fn background_prefetch_warms_pages_and_zoom() {
+        use std::time::{Duration, Instant};
+        let doc = Arc::new(Document::open(&fixture(), 1).unwrap());
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let renderer = Renderer::new(tx).unwrap();
+        let mut request = Request {
+            generation: 0,
+            destination: None,
+            doc,
+            page: 0,
+            width: 800,
+            viewport: Viewport {
+                width: 800,
+                height: 600,
+            },
+            x: 0,
+            y: 0,
+        };
+        let start = Instant::now();
+        renderer.request(request.clone());
+        assert!(rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .image
+            .is_ok());
+        let cold = start.elapsed();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !renderer.cache_contains(1, 0, 840) || !renderer.cache_contains(1, 1, 800) {
+            assert!(Instant::now() < deadline, "page/zoom prefetch missing");
+            thread::sleep(Duration::from_millis(5));
+        }
+        request.width = 840;
+        let start = Instant::now();
+        renderer.request(request);
+        assert!(rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .image
+            .is_ok());
+        println!(
+            "foreground cold raster+crop: {cold:?}; prefetched +5% zoom+crop: {:?}",
+            start.elapsed()
+        );
     }
     #[test]
     fn hover_hint_warms_cache() {

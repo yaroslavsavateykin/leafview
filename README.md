@@ -21,10 +21,19 @@ Or `cargo build --locked --release` and run `./target/release/leafview document.
 Use a current stable Rust toolchain: the lockfile includes recent Ratatui/image
 versions, not the old Rust shipped by some distribution packages.
 
-## PDF library browser (`fileview` branch)
+## PDF library browser
 
-Open a PDF or a directory: `leafview ./papers` or `leafview ./papers/report.pdf`.
-A compact sidebar shows recent PDFs first (◷), then the directory tree. Only
+Launch modes:
+
+- `leafview ./papers/report.pdf` — document only, sidebar hidden.
+- `leafview ./papers` — browse the specified directory with the sidebar open.
+- `leafview` — browse PDFs in the current working directory.
+
+Use `Esc` (or `F2`) to show the sidebar while reading a PDF. Directional focus never
+opens a hidden pane.
+The sidebar has two independent panes: the PDF directory tree above and Recent
+below. Each keeps its own selection and scroll position. The focused pane has
+a cyan border and a ● marker in its title; the PDF pane has the same indicator. Only
 PDF files and directories appear; folders expand lazily, sorted before files.
 The active PDF is cyan. Enter opens a selected file without leaving LeafView;
 failed opens retain the current document. Recent history contains up to 20 paths
@@ -33,8 +42,13 @@ and is saved atomically to `$XDG_STATE_HOME/leafview/recent.json` (default:
 
 | Browser key | Action |
 | --- | --- |
-| `Tab` | Switch focus between tree and document |
-| `F2` | Show / hide sidebar |
+| `Ctrl+h` / `Ctrl+l` | Focus left sidebar / PDF |
+| `Ctrl+j` / `Ctrl+k` | Focus Recent below / tree above (inside sidebar) |
+| `Ctrl+←` / `Ctrl+→` | Move the vertical split left / right (1 column) |
+| `Ctrl+↑` / `Ctrl+↓` | Move the tree/Recent split up / down (1 row, sidebar focus) |
+| `Tab` | Cycle focus: tree → Recent → PDF → tree |
+| Left click | Activate the clicked pane (hover never changes focus) |
+| `Esc` / `F2` | Show / hide sidebar |
 | `↑` / `↓`, `j` / `k` | Select entry |
 | `→` / `l` | Expand directory |
 | `←` / `h` | Collapse directory or select parent |
@@ -42,7 +56,10 @@ and is saved atomically to `$XDG_STATE_HOME/leafview/recent.json` (default:
 | `Backspace` | Browse parent directory |
 | `g` / `G`, Home / End | First / last entry |
 | `r` | Refresh directory listing |
-| `Esc` | Return focus to document |
+
+A pane must be activated by click, Tab or directional focus before it accepts
+input. Hover and wheel events never move focus; the first click in an inactive
+PDF activates it without following a hyperlink.
 
 The sidebar hides automatically below 48 terminal columns. Symlinked directories
 are not followed; listings are bounded to 5,000 visible entries and 24 levels.
@@ -67,7 +84,8 @@ starts with the sidebar hidden; switching documents from that mode is disabled.
 | Backspace / Esc while entering digits | Edit / cancel page input |
 | `r` | Reload PDF |
 | `b` | Back to previous internal-link location |
-| `q`, Esc with no page input | Quit |
+| `Esc` (no page input) / `F2` | Show / hide sidebar |
+| `Ctrl+C` | Quit (`q` does not quit) |
 
 Trackpad gestures work when the terminal/tmux forwards SGR wheel events;
 LeafView cannot read raw touchpad/pinch gestures. Zoom uses small discrete steps
@@ -76,7 +94,7 @@ the 3400-pixel raster cap the pointer anchor is clamped. Arrows and `hjkl` scrol
 within the page; hold Shift to turn pages instead. Horizontal gesture direction follows
 the ScrollLeft/ScrollRight events supplied by your natural-scroll settings.
 
-One status bar shows the requested page, zoom, loading or error state. While
+The PDF frame title shows the filename, requested page, zoom and loading or error state. While
 loading, **the previous image remains visible** and is explicitly labelled as
 previous: do not mistake it for the requested page.
 
@@ -205,7 +223,7 @@ scroll and image centering are included in the transform. The viewer still
 renders the MediaBox, matching its existing Poppler configuration; CropBox is
 not silently substituted. Nonrectangular QuadPoints links are currently skipped.
 
-Hover changes only the status bar: no Poppler render, image encoding or overlay
+Hover changes only the PDF frame title: no Poppler render, image encoding or overlay
 is performed. This avoids corrupting Kitty placeholders in tmux. Pixel mouse mode
 1016 and a hand cursor are not implemented. Mouse capture is restored on exit.
 Tmux normally forwards application-requested mouse events; depending on your
@@ -245,7 +263,7 @@ LEAFVIEW_DEBUG=1 leafview document.pdf         # inspect selected backend
 Ghostty/tmux exception. Explicit safe mode deliberately skips graphics
 capability negotiation. Navigation/render requests are coalesced to at most
 one every 75 ms during key repeats; the final viewport is always scheduled.
-Ctrl-C is handled as an ordinary clean exit, like `q` or Esc. A system-level
+Ctrl-C is handled as an ordinary clean exit. A system-level
 SIGKILL, OOM kill, or a crash inside Ghostty itself cannot be handled by an
 application's cleanup code.
 
@@ -348,7 +366,7 @@ The Leafview repository itself is now public by the author's choice.
   or press `r`. Check outer-terminal graphics support and tmux passthrough policy.
 - Low-resolution colored blocks: capability negotiation selected halfblocks.
 - SIGKILL cannot run cleanup in any application. If externally killed, use
-  `reset` if necessary; normal `q`/Esc exit restores the terminal.
+  `reset` if necessary; normal `Ctrl+C` exit restores the terminal.
 
 ## License
 

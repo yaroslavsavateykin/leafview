@@ -52,8 +52,8 @@ with tempfile.TemporaryDirectory(prefix='leafview-live-') as tmp:
         replacement.replace(target)
     try:
         pump(2)
-        assert '✓'.encode() in output, output[-2000:]
-        assert '⏳'.encode() in output, 'missing loading indicator'
+        assert trace.exists(), 'initial PDF must render without a bottom status bar'
+        assert b'PDF' in output, 'missing PDF frame title'
         assert b'Typst ready' not in output
         def current():
             return json.loads(trace.read_text().splitlines()[-1])
@@ -116,7 +116,7 @@ with tempfile.TemporaryDirectory(prefix='leafview-live-') as tmp:
         os.write(master, b'f')
         pump(1)
         assert current()['page'] == 6, 'manual follow must work with sync disabled'
-        os.write(master, b'q')
+        os.write(master, b'\x03')
         deadline = time.monotonic() + 3
         while proc.poll() is None and time.monotonic() < deadline:
             if select.select([master], [], [], .01)[0]:

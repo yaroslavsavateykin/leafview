@@ -25,11 +25,11 @@ use document::Document;
 use links::{Destination, LinkAction, RenderGeometry};
 use notify::Watcher;
 #[cfg(feature = "typst")]
-use ratatui::widgets::{Borders, Clear, Wrap};
+use ratatui::widgets::{Borders, Clear, Paragraph, Wrap};
 use ratatui::{
     layout::{Constraint, Layout, Size},
     style::{Color, Style},
-    widgets::{Block, Paragraph},
+    widgets::Block,
     DefaultTerminal, Frame,
 };
 use ratatui_image::{picker::Picker, protocol::Protocol, Image, Resize};
@@ -152,7 +152,7 @@ impl App {
         self.loading = true;
         self.hovered = None;
         self.hover_deadline = None;
-        const MIN_INTERVAL: Duration = Duration::from_millis(75);
+        const MIN_INTERVAL: Duration = Duration::from_millis(25);
         if let Some(last) = self.last_render_at {
             let earliest = last + MIN_INTERVAL;
             if Instant::now() < earliest {
@@ -184,10 +184,15 @@ impl App {
     fn geometry(&mut self, screen: ratatui::layout::Size) {
         self.terminal_size = screen;
         let area = Viewport {
-            width: u32::from(screen.width.saturating_sub(self.files.width(screen.width)))
-                .saturating_mul(self.font_width)
-                .clamp(1, 3400),
-            height: u32::from(screen.height.saturating_sub(1))
+            width: u32::from(
+                screen
+                    .width
+                    .saturating_sub(self.files.width(screen.width))
+                    .saturating_sub(2),
+            )
+            .saturating_mul(self.font_width)
+            .clamp(1, 3400),
+            height: u32::from(screen.height.saturating_sub(2))
                 .saturating_mul(self.font_height)
                 .clamp(1, 2400),
         };
@@ -201,7 +206,42 @@ impl App {
         if key.kind != KeyEventKind::Press && key.kind != KeyEventKind::Repeat {
             return false;
         }
-        if key.code == KeyCode::F(2) {
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Char(direction @ ('h' | 'j' | 'k' | 'l')) => {
+                    self.files
+                        .focus_direction(direction, self.terminal_size.width);
+                }
+                KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down => {
+                    self.files.resize(
+                        key.code,
+                        self.terminal_size.width,
+                        self.terminal_size.height,
+                    );
+                    // Moving the tree/Recent divider does not resize the PDF.
+                    // Keep its image; geometry schedules a new render only when
+                    // the document viewport actually changes.
+                    self.geometry(self.terminal_size);
+                }
+                _ => {
+                    return self.on_non_focus_key(key);
+                }
+            }
+            self.dirty = true;
+            return false;
+        }
+        self.on_non_focus_key(key)
+    }
+    fn on_non_focus_key(&mut self, key: KeyEvent) -> bool {
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            return true;
+        }
+        if key.code == KeyCode::Esc && !self.jump.is_empty() {
+            self.jump.clear();
+            self.dirty = true;
+            return false;
+        }
+        if matches!(key.code, KeyCode::Esc | KeyCode::F(2)) {
             self.files.visible = !self.files.visible;
             self.files.focused = self.files.visible;
             self.image = None;
@@ -213,19 +253,12 @@ impl App {
             && self.files.visible
             && self.files.width(self.terminal_size.width) > 0
         {
-            self.files.focused = !self.files.focused;
+            self.files.cycle_focus(self.terminal_size.width);
             self.dirty = true;
             return false;
         }
         if self.files.focused && self.files.width(self.terminal_size.width) > 0 {
-            if key.code == KeyCode::Char('q')
-                || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
-            {
-                return true;
-            }
-            if key.code == KeyCode::Esc {
-                self.files.focused = false;
-            } else if let Some(path) = self.files.key(key) {
+            if let Some(path) = self.files.key(key) {
                 if !self.opening && !self.reload_pending {
                     #[cfg(feature = "typst")]
                     let live_mode = self.live.is_some();
@@ -252,13 +285,6 @@ impl App {
         }
         let mut request = false;
         match key.code {
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
-            KeyCode::Char('q') => return true,
-            KeyCode::Esc if self.jump.is_empty() => return true,
-            KeyCode::Esc => {
-                self.jump.clear();
-                self.dirty = true;
-            }
             KeyCode::Char(c @ '0'..='9') => {
                 if self.jump.len() < 8 {
                     self.jump.push(c);
@@ -293,19 +319,19 @@ impl App {
             KeyCode::Char('g') | KeyCode::Home => request = self.view.go_to(1),
             KeyCode::Char('G') | KeyCode::End => request = self.view.go_to(self.view.pages),
             KeyCode::Char('j') | KeyCode::Down => {
-                self.view.scroll(0, 110);
+                self.view.scroll(0, 30);
                 request = true;
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                self.view.scroll(0, -110);
+                self.view.scroll(0, -30);
                 request = true;
             }
             KeyCode::Char('h') | KeyCode::Left => {
-                self.view.scroll(-100, 0);
+                self.view.scroll(-30, 0);
                 request = true;
             }
             KeyCode::Char('l') | KeyCode::Right => {
-                self.view.scroll(100, 0);
+                self.view.scroll(30, 0);
                 request = true;
             }
             KeyCode::Char('+') | KeyCode::Char('=') => request = self.view.adjust_zoom(0.05),
@@ -527,12 +553,38 @@ impl App {
     }
     fn on_mouse(&mut self, event: MouseEvent) {
         let panel_width = self.files.width(self.terminal_size.width);
-        if panel_width > 0 && event.column < panel_width {
-            self.files.focused = true;
-            self.dirty = true;
+        if event.row >= self.terminal_size.height {
             return;
         }
-        self.files.focused = false;
+        let click = event.kind == MouseEventKind::Down(MouseButton::Left);
+        if panel_width > 0 && event.column < panel_width {
+            if click {
+                self.files.focused = true;
+                let panels = self.files.panels(ratatui::layout::Rect::new(
+                    0,
+                    0,
+                    panel_width,
+                    self.terminal_size.height,
+                ));
+                self.files.recent_focused = event.row >= panels[1].y;
+                self.pointer = None;
+                self.hovered = None;
+                self.hover_deadline = None;
+                self.dirty = true;
+            }
+            return;
+        }
+        if self.files.focused {
+            if !click {
+                return;
+            }
+            self.files.focused = false;
+            self.pointer = Some((event.column, event.row));
+            self.hover_at(event.column, event.row);
+            self.dirty = true;
+            // The first click activates the PDF, without following a link.
+            return;
+        }
         self.pointer = Some((event.column, event.row));
         self.hover_at(event.column, event.row);
         let changed = match event.kind {
@@ -555,10 +607,10 @@ impl App {
                     });
                 if let Some(aspect) = aspect {
                     let anchor = (
-                        f64::from(event.column.saturating_sub(panel_width))
+                        f64::from(event.column.saturating_sub(panel_width).saturating_sub(1))
                             * f64::from(self.font_width)
                             + f64::from(self.font_width) / 2.,
-                        f64::from(event.row) * f64::from(self.font_height)
+                        f64::from(event.row.saturating_sub(1)) * f64::from(self.font_height)
                             + f64::from(self.font_height) / 2.,
                     );
                     // Five percentage points per terminal wheel tick; existing
@@ -801,7 +853,7 @@ impl App {
             ""
         };
         format!(
-            " {}  {}/{}   {:.0}%   {}{}hjkl/↑↓←→ scroll · Shift pages · +/- 5% · r reload · q quit",
+            " {}  {}/{}   {:.0}%   {}{}",
             name,
             self.view.page + 1,
             self.view.pages,
@@ -822,14 +874,39 @@ fn abbreviate(text: &str, max_chars: usize) -> String {
 }
 
 fn ui(f: &mut Frame<'_>, app: &mut App) {
-    let parts = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(f.area());
-    let panel_width = app.files.width(parts[0].width);
+    let panel_width = app.files.width(f.area().width);
     let columns =
-        Layout::horizontal([Constraint::Length(panel_width), Constraint::Min(1)]).split(parts[0]);
+        Layout::horizontal([Constraint::Length(panel_width), Constraint::Min(1)]).split(f.area());
     if panel_width > 0 {
         app.files.render(f, columns[0], &app.source);
     }
-    let screen = columns[1];
+    let name = links::sanitize(
+        &app.source
+            .file_name()
+            .unwrap_or(app.source.as_os_str())
+            .to_string_lossy(),
+    );
+    let title = format!(
+        "PDF · {name} · {}/{} · {:.0}%",
+        app.view.page + 1,
+        app.view.pages,
+        app.view.zoom * 100.0
+    );
+    let notice = if app.files.focused {
+        app.files.notice.clone().unwrap_or_default()
+    } else if app.error.is_some() || app.hovered.is_some() || !app.jump.is_empty() || app.loading {
+        app.status()
+    } else {
+        String::new()
+    };
+    let title = if notice.is_empty() {
+        title
+    } else {
+        format!("{title} · {}", links::sanitize(&notice))
+    };
+    let pdf_block = files::panel_block(&title, !app.files.focused || panel_width == 0);
+    let screen = pdf_block.inner(columns[1]);
+    f.render_widget(pdf_block, columns[1]);
     f.render_widget(
         Block::new().style(Style::default().bg(Color::Rgb(20, 22, 26))),
         screen,
@@ -861,20 +938,6 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
     if let Some(error) = &app.compile_error {
         render_compile_error(f, screen, error);
     }
-    f.render_widget(
-        Paragraph::new(links::sanitize(&if app.files.focused && panel_width > 0 {
-            app.files.notice.clone().unwrap_or_else(|| " Files · ↑↓/jk select · ←→/hl folders · Enter open · Backspace parent · r refresh · Tab document".into())
-        } else { app.status() })).style(
-            Style::default()
-                .fg(if app.hovered.is_some() {
-                    Color::LightCyan
-                } else {
-                    Color::Rgb(195, 199, 208)
-                })
-                .bg(Color::Rgb(35, 38, 44)),
-        ),
-        parts[1],
-    );
 }
 
 #[cfg(feature = "typst")]
@@ -1049,7 +1112,7 @@ fn viewer_loop(
     let mut watcher = watcher;
     let mut watched = watched;
     let mut watched_path = path.clone();
-    let mut files = files::Files::new(&path, pdf_mode);
+    let mut files = files::Files::new(&path, pdf_mode && path.is_dir());
     if pdf_mode {
         files.record(&path);
     }
@@ -1132,6 +1195,9 @@ fn viewer_loop(
         }
         #[cfg(feature = "typst")]
         app.consume_live();
+        if app.files.poll() {
+            app.dirty = true;
+        }
         app.flush_render();
         app.consume();
         if let Ok((path, result)) = app.opener.output.try_recv() {
@@ -1196,7 +1262,7 @@ fn viewer_loop(
             terminal.draw(|f| ui(f, &mut app))?;
             app.dirty = false;
         }
-        if event::poll(Duration::from_millis(30))? {
+        if event::poll(Duration::from_millis(10))? {
             match event::read()? {
                 Event::Key(key) => {
                     if app.on_key(key) {
@@ -1274,10 +1340,15 @@ fn main() -> Result<()> {
     } else {
         match (args.next(), args.next(), args.next(), args.next()) {
             (Some(mode), Some(path), None, None) if mode == "typst" => (PathBuf::from(path), true),
+            (Some(path), None, None, None) if path == "--help" || path == "-h" => {
+                println!("Usage: leafview [file.pdf|directory]\n       leafview typst <file.typ>\n\nWithout arguments, browse PDFs in the current directory.");
+                return Ok(());
+            }
             (Some(path), None, None, None) => (PathBuf::from(path), false),
+            (None, None, None, None) => (env::current_dir()?, false),
             _ => {
                 eprintln!(
-                "Usage: leafview <file.pdf|directory>\n       leafview typst <file.typ>\n\nRequires Poppler: sudo apt install poppler-utils"
+                "Usage: leafview [file.pdf|directory]\n       leafview typst <file.typ>\n\nRequires Poppler: sudo apt install poppler-utils"
             );
                 std::process::exit(2)
             }

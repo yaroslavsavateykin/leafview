@@ -1,13 +1,13 @@
 //! PDF-only, lazy directory browser and bounded persistent recent-file history.
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
-    layout::Rect,
+    layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     widgets::{Block, Borders, List, ListItem, ListState},
     Frame,
 };
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
 };
 
@@ -22,6 +22,11 @@ struct Entry {
 pub struct Files {
     pub visible: bool,
     pub focused: bool,
+    pub recent_focused: bool,
+    sidebar_width: Option<u16>,
+    tree_height: Option<u16>,
+    recent_selected: usize,
+    recent_state: ListState,
     root: PathBuf,
     expanded: BTreeSet<PathBuf>,
     entries: Vec<Entry>,
@@ -30,6 +35,10 @@ pub struct Files {
     recent: Vec<PathBuf>,
     history_path: Option<PathBuf>,
     pub notice: Option<String>,
+    pdf_folders: BTreeMap<PathBuf, Option<bool>>,
+    folder_scanner: crate::workers::Worker<Vec<PathBuf>, Vec<(PathBuf, Option<bool>)>>,
+    scan_pending: bool,
+    scan_due: bool,
 }
 impl Files {
     pub fn new(input: &Path, enabled: bool) -> Self {
@@ -57,6 +66,11 @@ impl Files {
         let mut files = Self {
             visible: enabled,
             focused: enabled,
+            recent_focused: false,
+            sidebar_width: None,
+            tree_height: None,
+            recent_selected: 0,
+            recent_state: ListState::default(),
             root,
             expanded: BTreeSet::new(),
             entries: Vec::new(),
@@ -65,15 +79,69 @@ impl Files {
             recent,
             history_path,
             notice: None,
+            pdf_folders: BTreeMap::new(),
+            folder_scanner: crate::workers::Worker::new(|paths: Vec<PathBuf>, stop| {
+                paths
+                    .into_iter()
+                    .map(|path| {
+                        let mut budget = 20000;
+                        let found = contains_pdf(&path, 0, &mut budget, stop);
+                        (path, found)
+                    })
+                    .collect()
+            }),
+            scan_pending: false,
+            scan_due: true,
         };
         files.refresh();
         files
     }
     pub fn width(&self, width: u16) -> u16 {
         if self.visible && width >= 48 {
-            (width / 3).clamp(22, 38)
+            self.sidebar_width
+                .unwrap_or((width / 3).clamp(22, 38))
+                .clamp(16, width.saturating_sub(24))
         } else {
             0
+        }
+    }
+    pub fn cycle_focus(&mut self, width: u16) {
+        if self.width(width) == 0 {
+            return;
+        }
+        if !self.focused {
+            self.focused = true;
+            self.recent_focused = false;
+        } else if !self.recent_focused {
+            self.recent_focused = true;
+        } else {
+            self.focused = false;
+        }
+    }
+    pub fn focus_direction(&mut self, direction: char, width: u16) {
+        if self.width(width) == 0 {
+            return;
+        }
+        match direction {
+            'h' => self.focused = true,
+            'l' => self.focused = false,
+            'j' if self.focused => self.recent_focused = true,
+            'k' if self.focused => self.recent_focused = false,
+            _ => {}
+        }
+    }
+    pub fn resize(&mut self, direction: KeyCode, width: u16, height: u16) {
+        let current = self.width(width);
+        if current == 0 {
+            return;
+        }
+        let tree_height = self.panels(Rect::new(0, 0, current, height))[0].height;
+        match direction {
+            KeyCode::Left => self.sidebar_width = Some(current.saturating_sub(1)),
+            KeyCode::Right => self.sidebar_width = Some(current.saturating_add(1)),
+            KeyCode::Up if self.focused => self.tree_height = Some(tree_height.saturating_sub(1)),
+            KeyCode::Down if self.focused => self.tree_height = Some(tree_height.saturating_add(1)),
+            _ => {}
         }
     }
     pub fn record(&mut self, path: &Path) {
@@ -100,20 +168,41 @@ impl Files {
         }
         self.refresh();
     }
+    pub fn poll(&mut self) -> bool {
+        let mut changed = false;
+        if let Ok(results) = self.folder_scanner.output.try_recv() {
+            self.scan_pending = false;
+            self.pdf_folders.extend(results);
+            changed = true;
+        }
+        if self.scan_due && !self.scan_pending {
+            let paths: Vec<_> = self
+                .entries
+                .iter()
+                .filter(|e| e.directory)
+                .map(|e| e.path.clone())
+                .collect();
+            if self
+                .folder_scanner
+                .input
+                .as_ref()
+                .unwrap()
+                .try_send(paths)
+                .is_ok()
+            {
+                self.scan_pending = true;
+                self.scan_due = false;
+            }
+        }
+        changed
+    }
     fn refresh(&mut self) {
+        self.scan_due = true;
         let selection = self
             .entries
             .get(self.selected)
             .map(|e| (e.path.clone(), e.recent));
         self.entries.clear();
-        for path in &self.recent {
-            self.entries.push(Entry {
-                path: path.clone(),
-                depth: 0,
-                directory: false,
-                recent: true,
-            });
-        }
         self.entries.push(Entry {
             path: self.root.clone(),
             depth: 0,
@@ -133,6 +222,24 @@ impl Files {
             .min(self.entries.len().saturating_sub(1));
     }
     pub fn key(&mut self, key: KeyEvent) -> Option<PathBuf> {
+        if self.recent_focused {
+            match key.code {
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.recent_selected =
+                        (self.recent_selected + 1).min(self.recent.len().saturating_sub(1))
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.recent_selected = self.recent_selected.saturating_sub(1)
+                }
+                KeyCode::Home | KeyCode::Char('g') => self.recent_selected = 0,
+                KeyCode::End | KeyCode::Char('G') => {
+                    self.recent_selected = self.recent.len().saturating_sub(1)
+                }
+                KeyCode::Enter => return self.recent.get(self.recent_selected).cloned(),
+                _ => {}
+            }
+            return None;
+        }
         match key.code {
             KeyCode::Down | KeyCode::Char('j') => {
                 self.selected = (self.selected + 1).min(self.entries.len().saturating_sub(1))
@@ -191,7 +298,56 @@ impl Files {
         }
         None
     }
+    pub fn panels(&self, area: Rect) -> [Rect; 2] {
+        let minimum = area.height.min(3);
+        let tree_height = self
+            .tree_height
+            .unwrap_or((u32::from(area.height) * 65 / 100) as u16)
+            .clamp(minimum, area.height.saturating_sub(minimum).max(minimum));
+        let parts =
+            Layout::vertical([Constraint::Length(tree_height), Constraint::Min(0)]).split(area);
+        [parts[0], parts[1]]
+    }
     pub fn render(&mut self, f: &mut Frame<'_>, area: Rect, current: &Path) {
+        let [tree_area, recent_area] = self.panels(area);
+        let recent_items: Vec<_> = self
+            .recent
+            .iter()
+            .map(|path| {
+                let name = path
+                    .file_name()
+                    .unwrap_or(path.as_os_str())
+                    .to_string_lossy();
+                ListItem::new(crate::links::sanitize(&format!("◷ {name}"))).style(
+                    Style::default().fg(if path == current {
+                        Color::LightCyan
+                    } else {
+                        Color::Rgb(214, 217, 224)
+                    }),
+                )
+            })
+            .collect();
+        self.recent_state.select(if self.recent.is_empty() {
+            None
+        } else {
+            Some(self.recent_selected.min(self.recent.len() - 1))
+        });
+        let recent_active = self.focused && self.recent_focused;
+        let recent_list = List::new(recent_items)
+            .block(panel_block("Recent", recent_active))
+            .style(Style::default().bg(Color::Rgb(25, 29, 36)))
+            .highlight_style(
+                Style::default()
+                    .bg(if recent_active {
+                        Color::Rgb(42, 67, 80)
+                    } else {
+                        Color::Rgb(32, 39, 48)
+                    })
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol(if recent_active { "› " } else { "  " });
+        f.render_stateful_widget(recent_list, recent_area, &mut self.recent_state);
+        let current_is_pdf = is_pdf(current);
         let items: Vec<_> = self
             .entries
             .iter()
@@ -212,6 +368,12 @@ impl Files {
                     .file_name()
                     .unwrap_or(entry.path.as_os_str())
                     .to_string_lossy();
+                let current_folder = entry.directory
+                    && current_is_pdf
+                    && current.parent() == Some(entry.path.as_path());
+                let ancestor =
+                    entry.directory && current_is_pdf && current.starts_with(&entry.path);
+                let marker = if current_folder { "●" } else { marker };
                 let label = if entry.recent {
                     format!(
                         "{marker} {name} — {}",
@@ -220,43 +382,118 @@ impl Files {
                 } else {
                     format!("{}{marker} {name}", "  ".repeat(entry.depth.min(24)))
                 };
-                ListItem::new(crate::links::sanitize(&label)).style(Style::default().fg(
-                    if entry.path == current {
-                        Color::LightCyan
-                    } else if entry.directory {
-                        Color::Rgb(180, 192, 211)
-                    } else {
-                        Color::Rgb(214, 217, 224)
-                    },
+                ListItem::new(crate::links::sanitize(&label)).style(tree_entry_style(
+                    entry,
+                    current,
+                    current_folder,
+                    ancestor,
+                    self.pdf_folders.get(&entry.path).copied().flatten(),
                 ))
             })
             .collect();
         self.state.select(Some(self.selected));
-        let title = if self.focused {
-            " PDF files • focused "
-        } else {
-            " PDF files "
-        };
+        let active = self.focused && !self.recent_focused;
         let list = List::new(items)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(title)
-                    .title_bottom(" Tab focus · F2 hide ")
-                    .border_style(Style::default().fg(if self.focused {
-                        Color::Cyan
-                    } else {
-                        Color::DarkGray
-                    })),
-            )
+            .block(panel_block("PDF tree", active))
             .style(Style::default().bg(Color::Rgb(25, 29, 36)))
             .highlight_style(
                 Style::default()
-                    .bg(Color::Rgb(42, 57, 72))
+                    .bg(if active {
+                        Color::Rgb(42, 67, 80)
+                    } else {
+                        Color::Rgb(32, 39, 48)
+                    })
                     .add_modifier(Modifier::BOLD),
             )
-            .highlight_symbol("› ");
-        f.render_stateful_widget(list, area, &mut self.state);
+            .highlight_symbol(if active { "› " } else { "  " });
+        f.render_stateful_widget(list, tree_area, &mut self.state);
+    }
+}
+fn tree_entry_style(
+    entry: &Entry,
+    current: &Path,
+    current_folder: bool,
+    ancestor: bool,
+    contains: Option<bool>,
+) -> Style {
+    if current_folder {
+        Style::default()
+            .fg(Color::Rgb(110, 240, 225))
+            .bg(Color::Rgb(24, 61, 65))
+            .add_modifier(Modifier::BOLD)
+    } else if ancestor {
+        Style::default()
+            .fg(Color::Rgb(100, 196, 202))
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(if entry.path == current {
+            Color::LightCyan
+        } else if entry.directory {
+            match contains {
+                Some(true) => Color::Rgb(125, 201, 160),
+                Some(false) => Color::Rgb(100, 108, 122),
+                None => Color::Rgb(180, 192, 211),
+            }
+        } else {
+            Color::Rgb(214, 217, 224)
+        })
+    }
+}
+pub fn panel_block(title: &str, active: bool) -> Block<'static> {
+    Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" {}{} ", if active { "● " } else { "" }, title))
+        .border_style(Style::default().fg(if active {
+            Color::Cyan
+        } else {
+            Color::Rgb(65, 73, 85)
+        }))
+}
+// Bounded recursive check off the UI thread. Unknown is distinct from empty.
+fn contains_pdf(
+    path: &Path,
+    depth: usize,
+    budget: &mut usize,
+    stop: &std::sync::atomic::AtomicBool,
+) -> Option<bool> {
+    use std::sync::atomic::Ordering;
+    if depth > 24 || *budget == 0 || stop.load(Ordering::Relaxed) {
+        return None;
+    }
+    let entries = std::fs::read_dir(path).ok()?;
+    let mut directories = Vec::new();
+    let mut unknown = false;
+    for item in entries {
+        if *budget == 0 || stop.load(Ordering::Relaxed) {
+            return None;
+        }
+        *budget -= 1;
+        let Ok(item) = item else {
+            unknown = true;
+            continue;
+        };
+        let Ok(kind) = item.file_type() else {
+            unknown = true;
+            continue;
+        };
+        if kind.is_file() && is_pdf(&item.path()) {
+            return Some(true);
+        }
+        if kind.is_dir() {
+            directories.push(item.path());
+        }
+    }
+    for path in directories {
+        match contains_pdf(&path, depth + 1, budget, stop) {
+            Some(true) => return Some(true),
+            None => unknown = true,
+            _ => {}
+        }
+    }
+    if unknown {
+        None
+    } else {
+        Some(false)
     }
 }
 fn is_pdf(path: &Path) -> bool {
@@ -344,9 +581,71 @@ mod tests {
         if let Ok(path) = std::env::var("LEAFVIEW_PANEL_SNAPSHOT") {
             std::fs::write(path, &rendered).unwrap();
         }
-        assert!(rendered.contains("PDF files"));
+        assert!(rendered.contains("PDF tree"));
+        assert!(rendered.contains("Recent"));
         assert!(rendered.contains("Research notes.pdf"));
-        assert!(rendered.contains("Tab focus"));
+        assert!(!rendered.contains("Ctrl+"));
+    }
+    #[test]
+    fn folder_pdf_scan_distinguishes_nested_empty_and_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        std::fs::create_dir(dir.path().join("nested")).unwrap();
+        assert_eq!(contains_pdf(dir.path(), 0, &mut 100, &stop), Some(false));
+        std::fs::write(dir.path().join("nested/paper.PDF"), "pdf").unwrap();
+        assert_eq!(contains_pdf(dir.path(), 0, &mut 100, &stop), Some(true));
+        assert_eq!(contains_pdf(dir.path(), 0, &mut 0, &stop), None);
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(contains_pdf(dir.path(), 0, &mut 100, &stop), None);
+    }
+    #[test]
+    fn tab_cycles_all_panes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut files = Files::new(dir.path(), true);
+        files.cycle_focus(100);
+        assert!(files.focused && files.recent_focused);
+        files.cycle_focus(100);
+        assert!(!files.focused);
+        files.cycle_focus(100);
+        assert!(files.focused && !files.recent_focused);
+        files.visible = false;
+        files.focused = false;
+        files.cycle_focus(100);
+        assert!(!files.focused);
+    }
+    #[test]
+    fn directional_focus_and_split_resize() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut files = Files::new(dir.path(), true);
+        files.focus_direction('j', 100);
+        assert!(files.focused && files.recent_focused);
+        files.focus_direction('l', 100);
+        assert!(!files.focused);
+        files.focus_direction('k', 100);
+        assert!(!files.focused); // No window above the full-height PDF.
+        files.focus_direction('h', 100);
+        assert!(files.focused && files.recent_focused);
+        files.focus_direction('k', 100);
+        assert!(!files.recent_focused);
+        let width = files.width(100);
+        files.resize(KeyCode::Right, 100, 40);
+        assert_eq!(files.width(100), width + 1);
+        files.resize(KeyCode::Left, 100, 40);
+        assert_eq!(files.width(100), width);
+        let rect = Rect::new(0, 0, width, 40);
+        let before = files.panels(rect)[0].height;
+        files.resize(KeyCode::Down, 100, 40);
+        assert_eq!(files.panels(rect)[0].height, before + 1);
+        for _ in 0..100 {
+            files.resize(KeyCode::Left, 100, 40);
+            files.resize(KeyCode::Up, 100, 40);
+        }
+        assert_eq!(files.width(100), 16);
+        assert_eq!(files.panels(rect)[0].height, 3);
+        files.visible = false;
+        files.focused = false;
+        files.focus_direction('h', 100);
+        assert!(!files.visible && !files.focused);
     }
     #[test]
     fn panel_fits_small_terminals() {
