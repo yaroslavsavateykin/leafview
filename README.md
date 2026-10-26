@@ -25,13 +25,13 @@ versions, not the old Rust shipped by some distribution packages.
 
 | Key | Action |
 | --- | --- |
-| `h` / `l`, Left / Right, `p` / `n` | Previous / next page |
-| PageUp / PageDown, Space | Previous / next page (Space: next) |
-| `j` / `k`, Down / Up | Vertical scroll |
-| `H` / `L` | Horizontal scroll |
+| `h` / `l`, Left / Right | Horizontal scroll within the page |
+| `j` / `k`, Down / Up | Vertical scroll within the page |
+| Shift + arrows or `H` / `J` / `K` / `L` | Previous page: Left / Up / H / K; next page: Right / Down / L / J |
+| `p` / `n`, PageUp / PageDown, Space | Previous / next page (Space: next) |
 | Wheel/trackpad up / down | Zoom in / out by 5 percentage points around the pointer |
 | Wheel/trackpad right / left | Next / previous page (at most one turn per 250 ms) |
-| `+` / `-` (also `=` / `_`) | Zoom, 50–300% of pane width |
+| `+` / `-` (also `=` / `_`) | Zoom by 5 percentage points, 50–300% of pane width |
 | `z` | Reset zoom and scroll |
 | `g` / `G`, Home / End | First / last page |
 | Digits + Enter | Jump to page (one-based) |
@@ -43,8 +43,8 @@ versions, not the old Rust shipped by some distribution packages.
 Trackpad gestures work when the terminal/tmux forwards SGR wheel events;
 LeafView cannot read raw touchpad/pinch gestures. Zoom uses small discrete steps
 coalesced by the existing renderer, not pixel-level animation. At page edges or
-the 3400-pixel raster cap the pointer anchor is clamped. `j/k` still scroll the
-page vertically; `H/L` scroll horizontally. Horizontal gesture direction follows
+the 3400-pixel raster cap the pointer anchor is clamped. Arrows and `hjkl` scroll
+within the page; hold Shift to turn pages instead. Horizontal gesture direction follows
 the ScrollLeft/ScrollRight events supplied by your natural-scroll settings.
 
 One status bar shows the requested page, zoom, loading or error state. While

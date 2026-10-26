@@ -4,6 +4,7 @@ Not a substitute for visual Kitty/Ghostty validation. Linux + Python standard li
 """
 import fcntl
 import os
+import json
 from pathlib import Path
 import pty
 import select
@@ -26,7 +27,9 @@ with tempfile.TemporaryDirectory(prefix="leafview-test-") as tmp:
     opened = Path(tmp) / "opened-url"
     opener.write_text('#!/usr/bin/env python3\nimport sys\nfrom pathlib import Path\nPath(' + repr(str(opened)) + ').write_text(sys.argv[1])\n')
     opener.chmod(0o755)
-    env = {**os.environ, "TERM": "xterm-256color", "PATH": tmp + os.pathsep + os.environ['PATH']}
+    trace = Path(tmp) / 'trace.jsonl'
+    env = {**os.environ, "TERM": "xterm-256color", "PATH": tmp + os.pathsep + os.environ['PATH'],
+           "LEAFVIEW_TRACE": str(trace)}
     for key in ["TMUX", "TERM_PROGRAM", "KITTY_WINDOW_ID"]:
         env.pop(key, None)
     proc = subprocess.Popen([str(root / "target/release/leafview"), str(source)],
@@ -56,13 +59,37 @@ with tempfile.TemporaryDirectory(prefix="leafview-test-") as tmp:
         assert output.index(b'\x1b[5n') < output.index(b'\x1b[?1003h')
         assert b'Halfblocks' in output, 'fallback must be visible in status'
         assert b"3" in output and b"100%" in output, "no initial status"
-        # Over 1000 key events; then finish on page 3 at 125%.
+        # Plain arrows/hjkl scroll without changing pages; Shift turns pages.
+        for key in (b'h', b'j', b'k', b'l', b'\x1b[A', b'\x1b[B', b'\x1b[C', b'\x1b[D'):
+            os.write(master, b'zG')
+            pump(.3)
+            os.write(master, b'g' + key)
+            pump(.5)
+            assert json.loads(trace.read_text().splitlines()[-1])['page'] == 0
+        for key in (b'L', b'J', b'\x1b[1;2C', b'\x1b[1;2B'):
+            os.write(master, b'g')
+            pump(.3)
+            os.write(master, key)
+            pump(.5)
+            assert json.loads(trace.read_text().splitlines()[-1])['page'] == 1
+        for key in (b'H', b'K', b'\x1b[1;2D', b'\x1b[1;2A'):
+            os.write(master, b'G')
+            pump(.3)
+            os.write(master, key)
+            pump(.5)
+            assert json.loads(trace.read_text().splitlines()[-1])['page'] == 1
+        # Over 1000 key events; then finish on page 3 at 105%.
         os.write(master, b"lh+-jkHL" * 140)
         pump(6)
+        start = len(output)
         os.write(master, b"zG+")
         pump(2)
         assert proc.poll() is None
-        assert b"25" in output, output[-1000:]
+        assert abs(json.loads(trace.read_text().splitlines()[-1])['zoom'] - 1.05) < .001
+        start = len(output)
+        os.write(master, b"-")
+        pump(.3)
+        assert abs(json.loads(trace.read_text().splitlines()[-1])['zoom'] - 1.0) < .001
         # A failed reload must retain the previous document.
         source.write_bytes(b"broken PDF")
         pump(1)

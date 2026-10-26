@@ -221,14 +221,20 @@ impl App {
                 self.jump.clear();
                 self.dirty = true;
             }
-            KeyCode::Char('l')
-            | KeyCode::Char('n')
-            | KeyCode::Right
-            | KeyCode::PageDown
-            | KeyCode::Char(' ') => request = self.view.step_page(1),
-            KeyCode::Char('h') | KeyCode::Char('p') | KeyCode::Left | KeyCode::PageUp => {
+            KeyCode::Right | KeyCode::Down | KeyCode::Char('l' | 'j')
+                if key.modifiers.contains(KeyModifiers::SHIFT) =>
+            {
+                request = self.view.step_page(1)
+            }
+            KeyCode::Left | KeyCode::Up | KeyCode::Char('h' | 'k')
+                if key.modifiers.contains(KeyModifiers::SHIFT) =>
+            {
                 request = self.view.step_page(-1)
             }
+            KeyCode::Char('L' | 'J' | 'n' | ' ') | KeyCode::PageDown => {
+                request = self.view.step_page(1)
+            }
+            KeyCode::Char('H' | 'K' | 'p') | KeyCode::PageUp => request = self.view.step_page(-1),
             KeyCode::Char('g') | KeyCode::Home => request = self.view.go_to(1),
             KeyCode::Char('G') | KeyCode::End => request = self.view.go_to(self.view.pages),
             KeyCode::Char('j') | KeyCode::Down => {
@@ -239,16 +245,16 @@ impl App {
                 self.view.scroll(0, -110);
                 request = true;
             }
-            KeyCode::Char('H') => {
+            KeyCode::Char('h') | KeyCode::Left => {
                 self.view.scroll(-100, 0);
                 request = true;
             }
-            KeyCode::Char('L') => {
+            KeyCode::Char('l') | KeyCode::Right => {
                 self.view.scroll(100, 0);
                 request = true;
             }
-            KeyCode::Char('+') | KeyCode::Char('=') => request = self.view.adjust_zoom(0.25),
-            KeyCode::Char('-') | KeyCode::Char('_') => request = self.view.adjust_zoom(-0.25),
+            KeyCode::Char('+') | KeyCode::Char('=') => request = self.view.adjust_zoom(0.05),
+            KeyCode::Char('-') | KeyCode::Char('_') => request = self.view.adjust_zoom(-0.05),
             KeyCode::Char('z') => {
                 self.view.zoom = 1.0;
                 self.view.x = 0;
@@ -729,7 +735,7 @@ impl App {
             ""
         };
         format!(
-            " {}  {}/{}   {:.0}%   {}{}j/k scroll · h/l pages · +/- zoom · r reload · q quit",
+            " {}  {}/{}   {:.0}%   {}{}hjkl/↑↓←→ scroll · Shift pages · +/- 5% · r reload · q quit",
             name,
             self.view.page + 1,
             self.view.pages,
