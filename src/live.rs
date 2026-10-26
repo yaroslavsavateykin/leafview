@@ -7,7 +7,6 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     io::Write,
     path::{Path, PathBuf},
-    process::{Child, ChildStdin, Command, Stdio},
     sync::{
         atomic::{AtomicU64, Ordering},
         mpsc, Arc,
@@ -15,6 +14,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(feature = "typst")]
 #[derive(Serialize, Deserialize)]
 pub struct CompileRequest {
     pub generation: u64,
@@ -37,80 +37,14 @@ pub struct CompileReply {
     pub points: Vec<SourcePoint>,
     pub error: Option<String>,
     pub millis: u64,
+    #[serde(default)]
+    pub stale: Vec<PathBuf>,
+    #[serde(default)]
+    pub synctex_coordinates: bool,
 }
+#[cfg(feature = "typst")]
 pub fn reply_path(output: &Path) -> PathBuf {
     output.with_extension("json")
-}
-struct CompilerProcess {
-    child: Child,
-    input: ChildStdin,
-    directory: tempfile::TempDir,
-}
-impl Drop for CompilerProcess {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-impl CompilerProcess {
-    fn new(input: &Path, root: &Path, options: &crate::typst_options::Options) -> Result<Self> {
-        let directory = tempfile::tempdir()?;
-        let mut child = Command::new("prlimit")
-            .args(["--as=3221225472", "--"])
-            .arg(std::env::current_exe()?)
-            .arg("--typst-compiler")
-            .arg(input)
-            .arg(root)
-            .arg(serde_json::to_string(options)?)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()?;
-        let input = child.stdin.take().context("compiler stdin")?;
-        Ok(Self {
-            child,
-            input,
-            directory,
-        })
-    }
-    fn compile(
-        &mut self,
-        generation: u64,
-        stop: &std::sync::atomic::AtomicBool,
-    ) -> Result<(CompileReply, PathBuf)> {
-        let output = self.directory.path().join("document.pdf");
-        let reply = reply_path(&output);
-        if reply.exists() {
-            std::fs::remove_file(&reply)?;
-        }
-        serde_json::to_writer(
-            &mut self.input,
-            &CompileRequest {
-                generation,
-                output: output.clone(),
-            },
-        )?;
-        self.input.write_all(b"\n")?;
-        self.input.flush()?;
-        let start = Instant::now();
-        while !reply.exists() {
-            if stop.load(Ordering::SeqCst) || start.elapsed() > Duration::from_secs(60) {
-                let _ = self.child.kill();
-                anyhow::bail!("Typst compilation cancelled or timed out");
-            }
-            anyhow::ensure!(
-                self.child.try_wait()?.is_none(),
-                "Typst compiler stopped (resource limit or internal error)"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        anyhow::ensure!(
-            std::fs::metadata(&reply)?.len() <= 96 * 1024 * 1024,
-            "source map exceeds 96 MiB"
-        );
-        let result = serde_json::from_reader(std::fs::File::open(reply)?)?;
-        Ok((result, output))
-    }
 }
 pub struct Update {
     pub generation: u64,
@@ -125,7 +59,8 @@ struct Finished {
     document: Option<Document>,
 }
 pub struct Live {
-    worker: Worker<u64, Result<Finished>>,
+    worker: Worker<(u64, BTreeMap<PathBuf, String>), Result<Finished>>,
+    label: &'static str,
     generation: Arc<AtomicU64>,
     pending: bool,
     due: Option<Instant>,
@@ -141,34 +76,33 @@ pub struct Live {
     pub compiling: bool,
 }
 impl Live {
-    pub fn new(input: &Path, options: crate::typst_options::Options) -> Result<Self> {
-        let root = options
-            .root
-            .clone()
-            .unwrap_or_else(|| input.parent().unwrap().to_owned())
-            .canonicalize()?;
-        anyhow::ensure!(
-            input.starts_with(&root),
-            "Typst input must be within TYPST_ROOT"
-        );
+    pub fn new(
+        input: &Path,
+        no_pdf: bool,
+        label: &'static str,
+        mut compile: impl FnMut(
+                u64,
+                &dyn Fn() -> bool,
+                &BTreeMap<PathBuf, String>,
+            ) -> Result<(CompileReply, PathBuf)>
+            + Send
+            + 'static,
+    ) -> Result<Self> {
         let generation_counter = Arc::new(AtomicU64::new(1));
         let desired_generation = generation_counter.clone();
         let initial_input = input.to_owned();
         let input = input.to_owned();
-        let process = std::sync::Mutex::new(None::<CompilerProcess>);
-        let worker = Worker::new(move |generation, stop| {
-            let mut process = process.lock().unwrap();
-            if process.is_none() {
-                *process = Some(CompilerProcess::new(&input, &root, &options)?);
-            }
-            let result = process.as_mut().unwrap().compile(generation, stop);
-            let (mut reply, output) = match result {
-                Ok(v) => v,
-                Err(e) => {
-                    process.take();
-                    return Err(e);
-                }
+        let compile = std::sync::Mutex::new(
+            move |generation, cancelled: &dyn Fn() -> bool, sources: &BTreeMap<PathBuf, String>| {
+                compile(generation, cancelled, sources)
+            },
+        );
+        let worker = Worker::new(move |(generation, sources), stop| {
+            let cancelled = || {
+                stop.load(Ordering::SeqCst)
+                    || desired_generation.load(Ordering::SeqCst) != generation
             };
+            let (mut reply, output) = compile.lock().unwrap()(generation, &cancelled, &sources)?;
             let document = if reply.error.is_none() {
                 Some(Document::open_cancel(&output, generation, || {
                     stop.load(Ordering::SeqCst)
@@ -176,13 +110,33 @@ impl Live {
             } else {
                 None
             };
-            let stale: Vec<_> = reply
+            if reply.synctex_coordinates {
+                reply.points.retain_mut(|p| {
+                    let Some(space) = document
+                        .as_ref()
+                        .and_then(|d| d.links.pages.get(p.page as usize))
+                        .and_then(|p| p.as_ref())
+                        .map(|p| p.space)
+                    else {
+                        return false;
+                    };
+                    let (x, y) = space.to_display(space.media.x0 + p.x, space.media.y1 - p.y);
+                    if !(0. ..=1.).contains(&x) || !(0. ..=1.).contains(&y) {
+                        return false;
+                    }
+                    p.x = x;
+                    p.y = y;
+                    true
+                });
+            }
+            let mut stale: Vec<_> = reply
                 .sources
                 .iter()
                 .filter(|(p, s)| std::fs::read_to_string(p).ok().as_ref() != Some(s))
                 .map(|(p, _)| p.clone())
                 .collect();
-            if !options.no_pdf
+            stale.append(&mut reply.stale);
+            if !no_pdf
                 && reply.error.is_none()
                 && stale.is_empty()
                 && desired_generation.load(Ordering::SeqCst) == generation
@@ -221,6 +175,7 @@ impl Live {
         )?;
         Ok(Self {
             worker,
+            label,
             generation: generation_counter,
             pending: false,
             due: Some(Instant::now()),
@@ -260,14 +215,16 @@ impl Live {
             self.pending = false;
             match result {
                 Err(e) => {
-                    self.compiling = false;
-                    update = Some(Update {
-                        generation: self.generation.load(Ordering::SeqCst),
-                        document: None,
-                        location: None,
-                        error: Some(format!("Typst: {e:#}")),
-                        millis: 0,
-                    });
+                    self.compiling = self.due.is_some();
+                    if self.due.is_none() {
+                        update = Some(Update {
+                            generation: self.generation.load(Ordering::SeqCst),
+                            document: None,
+                            location: None,
+                            error: Some(format!("{}: {e:#}", self.label)),
+                            millis: 0,
+                        });
+                    }
                 }
                 Ok(finished) => {
                     let reply = finished.reply;
@@ -318,7 +275,7 @@ impl Live {
                             generation: reply.generation,
                             document: finished.document,
                             location,
-                            error: reply.error.map(|e| format!("Typst: {e}")),
+                            error: reply.error.map(|e| format!("{}: {e}", self.label)),
                             millis: reply.millis,
                         });
                     }
@@ -332,7 +289,7 @@ impl Live {
                 .input
                 .as_ref()
                 .unwrap()
-                .try_send(self.generation.load(Ordering::SeqCst))
+                .try_send((self.generation.load(Ordering::SeqCst), self.sources.clone()))
                 .is_ok()
         {
             self.pending = true;

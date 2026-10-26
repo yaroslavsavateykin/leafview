@@ -1,5 +1,5 @@
 //! Private compiler process: PDF and source coordinates come from one layout.
-use crate::typst_live::{reply_path, CompileReply, CompileRequest, SourcePoint};
+use crate::live::{reply_path, CompileReply, CompileRequest, SourcePoint};
 use anyhow::{Context, Result};
 use std::{collections::BTreeMap, io::BufRead, path::PathBuf};
 use typst::{
@@ -163,6 +163,8 @@ impl Compiler {
             dependencies: deps.into_iter().map(|(_, p)| p).collect(),
             sources,
             points: Vec::new(),
+            stale: Vec::new(),
+            synctex_coordinates: false,
             error: None,
             millis: 0,
         };

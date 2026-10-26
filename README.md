@@ -73,8 +73,7 @@ shows the PDF using the **same renderer and graphics policy** as PDF mode.
 You do not need to run `typst watch`. Its CLI reports compilation status and
 can list dependencies, but does not export source-to-PDF coordinates or the
 changed layout region. LeafView instead reuses an incremental compiler world
-and reads source spans from that same compilation's layout. The installed `typst` command is checked
-at startup; compilation itself uses the pinned **Typst Rust API 0.15.1** bundled
+and reads source spans from that same compilation's layout. Compilation uses the pinned **Typst Rust API 0.15.1** bundled
 with the `typst` feature, not a potentially different CLI version. This adds substantial
 build dependencies and a roughly 47 MiB release executable.
 
@@ -127,9 +126,13 @@ or server features. LeafView does not claim full Typst CLI flag compatibility.
 The status shows `⏳` while compiling or preparing the image, then `✓` once
 loading finishes. Compilation errors appear in a centered reddish bordered
 panel with the source path, line/column, source excerpt/caret and available hints.
-The last successful PDF stays in memory, temporarily hidden to keep terminal
-image placeholders from interfering with the diagnostic panel. A successful
-recompile automatically closes the panel and restores PDF display.
+The last successful PDF stays in memory and remains behind the diagnostic
+panel. A successful recompile automatically closes the panel. While a diagnostic
+is shown, mouse capture is released so the terminal can select text normally
+(in tmux, hold Shift if tmux itself captures the mouse). Press `y` to copy the
+**full diagnostic**, including off-screen lines, through OSC 52. Your terminal
+must permit clipboard writes; tmux passthrough may need to be enabled. The
+status confirms sending the request, not that the terminal accepted it.
 
 Source synchronization compares successful source snapshots, selects the last
 changed character/token in the most recently changed source file, then uses
@@ -152,6 +155,63 @@ graphics by default, including Ghostty+tmux; safe mode is explicit opt-in.
 
 See [TYPST-VERIFICATION.md](TYPST-VERIFICATION.md) for actual tests, measurements
 and remaining gaps. Additional automated check: `python3 scripts/typst-smoke.py`.
+
+## Tectonic Live Preview (LaTeX)
+
+Tectonic support is included in the lightweight default build; it adds **no Rust
+TeX engine dependencies**. Install the external `tectonic` CLI and, for forward
+search, `synctex` (Ubuntu: `texlive-binaries`). Poppler and util-linux are still
+required. Prepare/warm Tectonic's bundle first: the initial package/format download
+can exceed the live compiler's 60-second limit. Its normal user configuration and
+cache are honored.
+
+```sh
+cargo install --locked --path .
+leafview tectonic main.tex
+leafview tectonic "./project with spaces/main document.tex"
+leafview tectonic main.tex --no-pdf
+```
+
+The entry file's directory is the compiler working directory. Each job runs
+`tectonic -X compile` with `--synctex --keep-logs --keep-intermediates`,
+a private output directory and `--makefile-rules`. Shell escape is disabled
+with `--untrusted`. No shell is used to assemble commands. Arbitrary Tectonic
+CLI options are not forwarded.
+
+Like Typst, saves are debounced for 200 ms; dependency parent directories are
+watched, including atomic rename saves. Compiler-discovered TeX inputs, images,
+bibliographies and other resources trigger rebuilds. Tectonic 0.17's unescaped
+Makefile paths and output-directory-relative dependency names are handled.
+New dependencies cause one verification rebuild before publication, to avoid
+publishing a file that changed before its parent was watched. Previously known
+dependencies remain watched after errors, including deletion/recreation.
+
+The common live lifecycle handles rendering, latest-wins generations, snapshots,
+atomic PDF publication and the `s` / `f` / `r` keys described above. By default
+successful current results replace the PDF beside the entry source; `--no-pdf`
+leaves existing PDFs untouched. Failed builds show a sanitized diagnostic panel;
+the last successful document is retained. Zoom and manual scroll position survive
+recompiles unless automatic synchronization finds an off-screen edit.
+
+Forward search compares successful source snapshots, selects the last changed
+character in the latest edited TeX file, and calls
+`synctex view -i line:column:file -o document.pdf` **in the background**, against
+that job's own PDF/SyncTeX pair. Coordinates are converted with the viewer's
+existing page-origin/rotation transform. Multiple distinct results are rejected,
+not chosen arbitrarily. Missing SyncTeX, no mapping, preamble-only, deletion-only,
+bibliography/image-only edits do not force a jump. SyncTeX mappings are often
+line/box-level, not exact glyph selections; macros, repeated inputs and generated
+content may be unmapped or ambiguous. A target already visible does not scroll.
+
+One compilation runs at a time; a new generation cancels the old process group
+and shutdown kills/reaps children. Limits: 60 seconds wall/CPU time, 3 GiB address
+space, 90 MiB per output file, 1 MiB compiler chatter, 32 MiB text snapshots.
+Forward-search subprocesses have a shared 3-second budget. Temporary logs,
+intermediates and SyncTeX are private and removed at shutdown, not published.
+
+Real integration check (requires a working Tectonic bundle):
+`python3 scripts/tectonic-smoke.py` and the same command with `--no-pdf`.
+See [TECTONIC-VERIFICATION.md](TECTONIC-VERIFICATION.md) for the tests actually run.
 
 ## PDF hyperlinks
 

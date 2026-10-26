@@ -1,17 +1,20 @@
 //! Leafview: a small terminal PDF viewer with latest-wins rendering and tmux graphics support.
+mod clipboard;
 mod document;
 mod kitty;
 #[cfg(test)]
 mod link_tests;
 mod links;
+mod live;
 mod process;
 mod render;
+mod tectonic;
 #[cfg(feature = "typst")]
 mod typst_compiler;
 #[cfg(feature = "typst")]
-mod typst_live;
-#[cfg(feature = "typst")]
 mod typst_options;
+#[cfg(feature = "typst")]
+mod typst_process;
 mod view;
 mod workers;
 
@@ -23,7 +26,6 @@ use crossterm::event::{
 use document::Document;
 use links::{Destination, LinkAction, RenderGeometry};
 use notify::Watcher;
-#[cfg(feature = "typst")]
 use ratatui::widgets::{Borders, Clear, Wrap};
 use ratatui::{
     layout::{Constraint, Layout, Size},
@@ -46,9 +48,7 @@ use view::{raster_width, View, Viewport};
 use workers::Worker;
 
 struct App {
-    #[cfg(feature = "typst")]
-    live: Option<typst_live::Live>,
-    #[cfg(feature = "typst")]
+    live: Option<live::Live>,
     compile_millis: u64,
     doc: Arc<Document>,
     view: View,
@@ -77,8 +77,8 @@ struct App {
     encode_latest: Option<EncodeInput>,
     jump: String,
     error: Option<String>,
-    #[cfg(feature = "typst")]
     compile_error: Option<String>,
+    diagnostic_notice: Option<String>,
     dirty: bool,
     loading: bool,
     backend: ratatui_image::picker::ProtocolType,
@@ -197,6 +197,15 @@ impl App {
         }
         let mut request = false;
         match key.code {
+            KeyCode::Char('y') if self.compile_error.is_some() => {
+                self.diagnostic_notice = Some(
+                    match clipboard::copy(self.compile_error.as_ref().unwrap()) {
+                        Ok(()) => "Sent to clipboard (OSC 52)".to_owned(),
+                        Err(e) => format!("Copy failed: {e}"),
+                    },
+                );
+                self.dirty = true;
+            }
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
             KeyCode::Char('q') => return true,
             KeyCode::Esc if self.jump.is_empty() => return true,
@@ -261,20 +270,17 @@ impl App {
                     request = true;
                 }
             }
-            #[cfg(feature = "typst")]
             KeyCode::Char('s') if self.live.is_some() => {
                 let live = self.live.as_mut().unwrap();
                 live.auto_sync = !live.auto_sync;
                 self.dirty = true;
             }
-            #[cfg(feature = "typst")]
             KeyCode::Char('f') if self.live.is_some() => {
                 if let Some(location) = self.live.as_ref().and_then(|l| l.last.clone()) {
                     self.follow_source(&location);
                 }
             }
             KeyCode::Char('r') => {
-                #[cfg(feature = "typst")]
                 if let Some(live) = &mut self.live {
                     live.refresh();
                     self.dirty = true;
@@ -292,8 +298,7 @@ impl App {
         }
         false
     }
-    #[cfg(feature = "typst")]
-    fn follow_source(&mut self, location: &typst_live::SourcePoint) {
+    fn follow_source(&mut self, location: &live::SourcePoint) {
         if location.page >= self.doc.pages {
             return;
         }
@@ -336,7 +341,6 @@ impl App {
         self.schedule();
         self.dirty = true;
     }
-    #[cfg(feature = "typst")]
     fn consume_live(&mut self) {
         let Some(live) = &mut self.live else {
             return;
@@ -349,6 +353,17 @@ impl App {
         let auto_sync = live.auto_sync;
         if let Some(update) = update {
             self.compile_millis = update.millis;
+            let failed = update.error.is_some();
+            if failed != self.compile_error.is_some() {
+                let result = if failed {
+                    crossterm::execute!(std::io::stdout(), event::DisableMouseCapture)
+                } else {
+                    crossterm::execute!(std::io::stdout(), event::EnableMouseCapture)
+                };
+                self.diagnostic_notice = result.err().map(|e| format!("Mouse mode: {e}"));
+            } else {
+                self.diagnostic_notice = None;
+            }
             self.compile_error = update.error.clone();
             self.error = update.error;
             if let Some(doc) = update.document {
@@ -660,6 +675,14 @@ impl App {
         }
     }
     fn status(&self) -> String {
+        if self.compile_error.is_some() {
+            return format!(
+                " {} · y copy full error · select with mouse (tmux: Shift) · r retry · q quit",
+                self.diagnostic_notice
+                    .as_deref()
+                    .unwrap_or("Compilation failed")
+            );
+        }
         if let Some(action) = self.hovered.and_then(|i| {
             self.displayed
                 .as_ref()?
@@ -691,16 +714,26 @@ impl App {
         }
         if let Some(err) = &self.error {
             return format!(
-                " {}  {}/{}  ERROR: {}",
+                " {}  {}/{}  {}{}ERROR: {}",
                 name,
                 self.view.page + 1,
                 self.view.pages,
+                if self.live.as_ref().is_some_and(|l| l.compiling) {
+                    "⏳ · "
+                } else {
+                    ""
+                },
+                self.live
+                    .as_ref()
+                    .map(|l| format!(
+                        "sync {} · {}ms · ",
+                        if l.auto_sync { "on" } else { "off" },
+                        self.compile_millis
+                    ))
+                    .unwrap_or_default(),
                 abbreviate(err, 110)
             );
         }
-        #[cfg(not(feature = "typst"))]
-        let live_state = "";
-        #[cfg(feature = "typst")]
         let live_state = self
             .live
             .as_ref()
@@ -756,11 +789,8 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
         Block::new().style(Style::default().bg(Color::Rgb(20, 22, 26))),
         screen,
     );
-    #[cfg(feature = "typst")]
     let compilation_failed = app.compile_error.is_some();
-    #[cfg(not(feature = "typst"))]
-    let compilation_failed = false;
-    if let Some(image) = app.image.as_ref().filter(|_| !compilation_failed) {
+    if let Some(image) = app.image.as_ref() {
         if screen.width == 0 || screen.height == 0 {
             return;
         }
@@ -779,7 +809,6 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
     } else if let Some((x, y)) = app.pointer {
         app.hover_at(x, y);
     }
-    #[cfg(feature = "typst")]
     if let Some(error) = &app.compile_error {
         render_compile_error(f, screen, error);
     }
@@ -797,7 +826,6 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
     );
 }
 
-#[cfg(feature = "typst")]
 fn render_compile_error(f: &mut Frame<'_>, screen: ratatui::layout::Rect, error: &str) {
     let width = screen
         .width
@@ -837,7 +865,8 @@ fn render_compile_error(f: &mut Frame<'_>, screen: ratatui::layout::Rect, error:
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title(" Typst — compilation error ")
+                    .title(" Live preview — compilation error ")
+                    .title_bottom(" y copy full error · mouse select · r retry ")
                     .border_style(Style::default().fg(Color::Rgb(220, 100, 115)))
                     .padding(ratatui::widgets::Padding::uniform(1)),
             ),
@@ -878,7 +907,7 @@ fn viewer_loop(
     path: PathBuf,
     doc: Arc<Document>,
     mut terminal: DefaultTerminal,
-    #[cfg(feature = "typst")] live: Option<typst_live::Live>,
+    live: Option<live::Live>,
 ) -> Result<()> {
     let tmux =
         env::var_os("TMUX").is_some() || env::var("TERM").is_ok_and(|v| v.starts_with("tmux"));
@@ -955,9 +984,6 @@ fn viewer_loop(
             stop.load(std::sync::atomic::Ordering::SeqCst)
         })
     });
-    #[cfg(not(feature = "typst"))]
-    let pdf_mode = true;
-    #[cfg(feature = "typst")]
     let pdf_mode = live.is_none();
     let (watcher, watched) = if pdf_mode {
         let (w, r) = watch(&path)?;
@@ -968,9 +994,7 @@ fn viewer_loop(
     };
     let _watcher = watcher; // Keep the OS watcher alive for the duration of the viewer.
     let mut app = App {
-        #[cfg(feature = "typst")]
         live,
-        #[cfg(feature = "typst")]
         compile_millis: 0,
         source: path,
         view: View::new(doc.pages),
@@ -1002,8 +1026,8 @@ fn viewer_loop(
         encode_latest: None,
         jump: String::new(),
         error: doc.links.error.clone(),
-        #[cfg(feature = "typst")]
         compile_error: None,
+        diagnostic_notice: None,
         dirty: true,
         loading: false,
         backend,
@@ -1035,7 +1059,6 @@ fn viewer_loop(
         if stopping.load(std::sync::atomic::Ordering::Relaxed) {
             break;
         }
-        #[cfg(feature = "typst")]
         app.consume_live();
         app.flush_render();
         app.consume();
@@ -1136,7 +1159,11 @@ fn main() -> Result<()> {
     let parsed_typst = typst_options.as_ref().map(|(path, _)| (path.clone(), true));
     #[cfg(not(feature = "typst"))]
     let parsed_typst = None;
-    let (path, typst_mode) = if let Some(parsed) = parsed_typst {
+    let tectonic_options = tectonic::parse(env::args_os().skip(1))?;
+    let tectonic_mode = tectonic_options.is_some();
+    let (path, typst_mode) = if let Some((path, _)) = &tectonic_options {
+        (path.clone(), false)
+    } else if let Some(parsed) = parsed_typst {
         parsed
     } else {
         match (args.next(), args.next(), args.next(), args.next()) {
@@ -1144,7 +1171,7 @@ fn main() -> Result<()> {
             (Some(path), None, None, None) => (PathBuf::from(path), false),
             _ => {
                 eprintln!(
-                "Usage: leafview <file.pdf>\n       leafview typst <file.typ>\n\nRequires Poppler: sudo apt install poppler-utils"
+                "Usage: leafview <file.pdf>\n       leafview typst <file.typ>\n       leafview tectonic <file.tex> [--no-pdf]\n\nRequires Poppler: sudo apt install poppler-utils"
             );
                 std::process::exit(2)
             }
@@ -1168,21 +1195,49 @@ fn main() -> Result<()> {
     if typst_mode {
         anyhow::bail!("Typst support is not enabled; install with: cargo install --locked --features typst --path .");
     }
-    #[cfg(feature = "typst")]
-    let mut live = if typst_mode {
-        if CommandCheck::missing("typst") {
-            anyhow::bail!("required command not found: typst");
+    let mut live = if let Some((_, no_pdf)) = tectonic_options {
+        if CommandCheck::missing("tectonic") {
+            anyhow::bail!("required command not found: tectonic");
         }
-        Some(typst_live::Live::new(&path, typst_options.unwrap().1)?)
+        let mut backend = tectonic::Compiler::new(&path)?;
+        Some(live::Live::new(
+            &path,
+            no_pdf,
+            "Tectonic",
+            move |g, c, s| backend.compile(g, c, s),
+        )?)
     } else {
         None
     };
-    // Initial compilation runs in its owned worker before terminal entry. Errors
-    // still enter the viewer with a placeholder, allowing edit/retry and quit.
-    #[cfg(not(feature = "typst"))]
-    let doc = Arc::new(Document::open(&path, 1)?);
     #[cfg(feature = "typst")]
-    let doc = if typst_mode {
+    if typst_mode {
+        let options = typst_options.unwrap().1;
+        let root = options
+            .root
+            .clone()
+            .unwrap_or_else(|| path.parent().unwrap().to_owned())
+            .canonicalize()?;
+        anyhow::ensure!(
+            path.starts_with(&root),
+            "Typst input must be within TYPST_ROOT"
+        );
+        let mut process = None;
+        let input = path.clone();
+        let no_pdf = options.no_pdf;
+        live = Some(live::Live::new(&path, no_pdf, "Typst", move |g, c, _| {
+            if process.is_none() {
+                process = Some(typst_process::CompilerProcess::new(
+                    &input, &root, &options,
+                )?);
+            }
+            let result = process.as_mut().unwrap().compile(g, c);
+            if result.is_err() {
+                process.take();
+            }
+            result
+        })?);
+    }
+    let doc = if typst_mode || tectonic_mode {
         let placeholder = initial_placeholder()?;
         Arc::new(Document::open(placeholder.path(), 0)?)
     } else {
@@ -1190,16 +1245,9 @@ fn main() -> Result<()> {
     };
     let terminal = ratatui::try_init()?;
     let _restore = TerminalRestore;
-    viewer_loop(
-        path,
-        doc,
-        terminal,
-        #[cfg(feature = "typst")]
-        live.take(),
-    )
+    viewer_loop(path, doc, terminal, live.take())
 }
 
-#[cfg(feature = "typst")]
 fn initial_placeholder() -> Result<tempfile::NamedTempFile> {
     // Poppler-valid blank PDF, held only long enough for Document's snapshot.
     let mut pdf = lopdf::Document::with_version("1.5");
