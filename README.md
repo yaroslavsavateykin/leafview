@@ -105,7 +105,7 @@ previous: do not mistake it for the requested page.
 
 ```sh
 leafview main.typ
-leafview main.typ --profile teacher
+leafview main.typ --input mode=teacher
 leafview typst main.typ  # legacy syntax remains supported
 leafview typst "./notes with spaces/lecture.typ"
 leafview typst letuchka.typ --root ../..
@@ -204,111 +204,62 @@ graphics by default, including Ghostty+tmux; safe mode is explicit opt-in.
 See [TYPST-VERIFICATION.md](TYPST-VERIFICATION.md) for actual tests, measurements
 and remaining gaps. Additional automated check: `python3 scripts/typst-smoke.py`.
 
-### Configuration and profiles
+### Editable compilation flags
 
-Configuration precedence is **defaults < global profiles < project profiles <
-global file entry < project file entry < CLI < runtime**.
-Global settings live at `$XDG_CONFIG_HOME/leafview/config.json` (normally
-`~/.config/leafview/config.json`). The project file is the nearest ancestor
-`.leafview.json`, or a new file beside the input if none exists. Relative paths
-in each config resolve from that config's directory; CLI paths resolve from the
-launch directory. Environment variables documented above form a CLI-level fallback.
+Press **o** in Typst mode to edit every supported compiler flag. Tab / Shift+Tab
+or ↑↓ selects a field, Enter edits or toggles it, Delete clears the text buffer.
+Values use JSON syntax: "/path/to/root", ["/path/to/fonts"], {"mode":"teacher"},
+2, null. Esc cancels editing; Esc again discards the panel. Mouse/PDF shortcuts
+cannot leak into the viewer while the editor is open.
+
+**Apply** changes this session only. **Save file** applies and remembers the flags
+for the current input in the shared config, normally
+~/.config/leafview/config.json (or $XDG_CONFIG_HOME/leafview/config.json).
+There are no profiles, versions or separate per-document JSON files:
 
 ```json
 {
-  "version": 1,
-  "default_profile": "teacher",
-  "profiles": {
-    "teacher": {
+  "files": {
+    "/home/user/lecture.typ": {
       "inputs": {"mode": "teacher", "solutions": "true"},
       "jobs": 2,
       "write_pdf": true
     },
-    "student": {
-      "inputs": {"mode": "student", "solutions": "false"},
-      "jobs": 2,
+    "/home/user/exam.typ": {
+      "inputs": {"solutions": "false"},
       "write_pdf": false
     }
   }
 }
 ```
 
-Profiles `default`, `teacher`, `student` and arbitrary names are selectable.
-Built-in names have the normal defaults until configured. Fields omitted in a
-layer inherit; inputs merge by key, arrays replace. `replace_inputs: true`
-clears inherited inputs before applying that profile (runtime snapshots use it
-so deleting an input works). Nullable fields such as `root`, `jobs` and `pages`
-can be cleared with JSON `null`.
+Keys saved by LeafView are canonical absolute paths. Manually written relative
+keys and paths resolve from the config's directory; paths edited in the TUI
+resolve from the input's directory. Saving preserves entries for other files
+and refuses to overwrite malformed JSON. Existing profile-based configs must
+be converted to the flat format; they are never silently overwritten.
 
-All implemented compiler fields are available: `root`, `inputs` (string map),
-`fonts` (path array), `ignore_system`, `ignore_embedded`, `package`, `cache`,
-`cert`, `timestamp`, `jobs` (1–256), `features`, `pretty`, `no_tags`, `standards`,
-`pages`, and `no_pdf`. Prefer `write_pdf` (the inverse of `no_pdf`); if both are
-present, `write_pdf` wins. `auto_compile` and `auto_sync` control live behavior.
-No new Rust dependencies are required.
+Supported fields: root, inputs (string map), fonts (path array), jobs (1–256),
+package, cache, cert, timestamp, features, standards, pages, ignore_system,
+ignore_embedded, pretty, no_tags, write_pdf, auto_compile, auto_sync.
+The legacy no_pdf flag is accepted, but saved JSON uses write_pdf only.
+Nullable fields accept null; an explicit inputs object replaces inherited inputs.
 
-#### Defaults for individual files
+Top-level flags supply shared defaults. The nearest ancestor .leafview.json may
+also contain the same flat format. Priority: defaults < global flags < project
+flags < global file entry < project file entry < CLI < runtime.
+Configuration is loaded on open and re-read when opening settings.
 
-**Save file** stores settings in the same global `config.json`, under `files`.
-No sidecar files are created. Each document has its own default profile and
-profile parameters; settings for other documents remain untouched:
+Changing compiler flags invalidates old generations and safely kills/reaps the
+old helper before replacement. Unchanged compiler flags reuse the incremental
+world. Last-good PDF, page, zoom and scroll survive failed changes. Disabling
+auto_compile keeps watchers alive; r builds manually. No extra Rust dependencies
+or independent typst watch process are used.
 
-```json
-{
-  "version": 1,
-  "files": {
-    "/home/user/course/lecture.typ": {
-      "default_profile": "teacher",
-      "profiles": {
-        "teacher": {"inputs": {"solutions": "true"}, "jobs": 2}
-      }
-    },
-    "/home/user/course/exam.typ": {
-      "default_profile": "student",
-      "profiles": {
-        "student": {"inputs": {"solutions": "false"}, "write_pdf": false}
-      }
-    }
-  }
-}
-```
-
-Open the document, press `o`, edit settings, then choose **Save file**.
-Next time its default profile/settings load automatically, including when opened
-from the file browser. Saved keys use canonical absolute paths, avoiding collisions
-between identically named files. Manually written relative keys are resolved from
-the config directory; this also works in a project's `.leafview.json`.
-`--profile` overrides the saved default profile.
-
-Press **`o`** in Typst mode to open **Compile Settings**. Tab / Shift+Tab or ↑↓
-select fields; Enter edits values or toggles booleans. Profile ←→ selects an
-existing profile; Enter edits its name to create/select another profile. Values
-use JSON syntax: `{"mode":"teacher"}`, `["/path/to/fonts"]`, `2`, `null`.
-Delete clears the edit buffer; Enter commits the field; Esc cancels the field,
-and a second Esc cancels the panel. PDF shortcuts and mouse actions are blocked
-while the panel is open. Ctrl+C still exits.
-
-Choose **Apply** for memory-only settings, **Save file** for this document only,
-**Save project** or **Save global**
-to persist runtime snapshots atomically, or **Cancel** to discard drafts.
-Selecting a profile prepares a draft; applying it automatically rebuilds.
-The header shows the active profile. Saving retains unrelated on-disk profiles
-and refuses to overwrite malformed JSON. Invalid config files show a warning;
-invalid startup options fall back to safe defaults so the editor can repair them.
-
-Compiler changes invalidate old generations immediately. The existing bounded
-worker kills/reaps its old helper before starting the replacement, and only a
-current successful result may publish PDF. Unchanged compiler options reuse the
-incremental world. Last-good PDF, page, zoom and scroll survive failed changes;
-source synchronization may still follow an off-screen edit. Disabling automatic
-compilation keeps watchers alive; `r` explicitly builds, and applying changed
-settings also builds once. Settings files are loaded on document open and re-read when opening Compile Settings,
-not watched continuously.
-
-Additional real integration check: `python3 scripts/settings-smoke.py` covers
-runtime inputs, profiles, jobs restarts, both save targets, manual compilation,
-failed configuration, last-good PDF, browser switching and child-process cleanup.
-These are headless PTY checks, not native Ghostty/tmux visual certification.
+Real integration check: python3 scripts/settings-smoke.py covers runtime inputs,
+jobs restarts, file-specific persistence, manual builds, invalid configuration,
+last-good PDF and document switching/child cleanup. These are headless PTY tests,
+not native Ghostty/tmux visual certification.
 
 ## PDF hyperlinks
 

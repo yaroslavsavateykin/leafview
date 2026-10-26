@@ -224,18 +224,11 @@ impl App {
                 compile_settings::Action::Cancel => self.settings = None,
                 compile_settings::Action::Apply(session, value, save) => {
                     let result = (|| -> Result<()> {
-                        if let Some(global) = save {
-                            session.save(global)?;
+                        if save {
+                            session.save()?;
                         }
-                        let profile_changed = self
-                            .session
-                            .as_ref()
-                            .is_none_or(|s| s.selected != session.selected);
                         let live = self.live.as_mut().context("no live compiler")?;
                         live.configure(&value)?;
-                        if profile_changed {
-                            live.refresh();
-                        }
                         let mut session = *session;
                         session.warning = None;
                         self.session = Some(session);
@@ -412,9 +405,7 @@ impl App {
                 if let Some(session) = &mut self.session {
                     session
                         .runtime
-                        .profiles
-                        .entry(session.selected.clone())
-                        .or_default()
+                        .get_or_insert_with(Default::default)
                         .auto_sync = Some(live.auto_sync);
                 }
                 self.dirty = true;
@@ -447,8 +438,7 @@ impl App {
     #[cfg(feature = "typst")]
     fn open_typst(&mut self, path: &Path) -> Result<()> {
         let path = path.canonicalize()?;
-        let mut session =
-            compile_config::Session::load(&path, compile_config::Profile::default(), None);
+        let mut session = compile_config::Session::load(&path, compile_config::Flags::default());
         let settings = session.initial(&path);
         let mut live = typst_live::Live::new(&path, settings.options.clone(), self.doc.revision)?;
         live.configure(&settings)?;
@@ -988,12 +978,6 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
         app.view.pages,
         app.view.zoom * 100.0
     );
-    #[cfg(feature = "typst")]
-    let title = if let Some(session) = &app.session {
-        format!("{title} · {}", links::sanitize(&session.selected))
-    } else {
-        title
-    };
     let notice = if app.files.focused {
         app.files.notice.clone().unwrap_or_default()
     } else if app.error.is_some() || app.hovered.is_some() || !app.jump.is_empty() || app.loading {
@@ -1460,9 +1444,7 @@ fn main() -> Result<()> {
     let mut args = env::args_os();
     let _exe = args.next();
     #[cfg(feature = "typst")]
-    let parsed_typst = typst_options
-        .as_ref()
-        .map(|(path, _, _)| (path.clone(), true));
+    let parsed_typst = typst_options.as_ref().map(|(path, _)| (path.clone(), true));
     #[cfg(not(feature = "typst"))]
     let parsed_typst = None;
     let (path, typst_mode) = if let Some(parsed) = parsed_typst {
@@ -1507,8 +1489,8 @@ fn main() -> Result<()> {
     }
     #[cfg(feature = "typst")]
     let mut session = if typst_mode {
-        let (_, cli, selected) = typst_options.unwrap();
-        Some(compile_config::Session::load(&path, cli, selected))
+        let (_, cli) = typst_options.unwrap();
+        Some(compile_config::Session::load(&path, cli))
     } else {
         None
     };

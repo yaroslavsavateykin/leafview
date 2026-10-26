@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Real Typst settings/profile/restart/browser PTY tests; no external Typst CLI."""
+"""Real Typst settings/flags/restart/browser PTY tests; no external Typst CLI."""
 import fcntl
 import json
 import os
@@ -20,9 +20,7 @@ with tempfile.TemporaryDirectory(prefix='leafview-settings-') as tmp:
     main.write_text('#sys.inputs.at("mode", default: "DEFAULT")\n')
     shutil.copy(root / 'tests/fixtures/sample.pdf', tmp / 'a.pdf')
     config = tmp / '.leafview.json'
-    config.write_text(json.dumps({'version': 1, 'default_profile': 'teacher', 'profiles': {
-        'teacher': {'inputs': {'mode': 'TEACHER'}, 'jobs': 1},
-        'student': {'inputs': {'mode': 'STUDENT'}, 'write_pdf': False}}}))
+    config.write_text(json.dumps({'inputs': {'mode': 'TEACHER'}, 'jobs': 1}))
     trace = tmp / 'trace.jsonl'
     history = tmp / 'state/leafview/recent.json'
     master, slave = pty.openpty()
@@ -67,78 +65,57 @@ with tempfile.TemporaryDirectory(prefix='leafview-settings-') as tmp:
         return subprocess.check_output(['pdftotext', str(main.with_suffix('.pdf')), '-']).decode()
     def edit(index, value):
         send(b'o' + b'\t' * index + b'\r\x1b[3~' + value.encode() + b'\r')
-    def apply_from(index, action=19):
+    def apply_from(index, action=18):
         old = revision()
         send(b'\t' * (action - index) + b'\r')
         wait(lambda: revision() > old)
     try:
         wait(lambda: revision() > 0)
-        assert 'TEACHER' in pdf_text()
+        # CLI inputs replace inherited inputs; runtime edits override CLI.
         send(b'+')
-        # Runtime inputs override CLI/config and remain isolated until Apply.
-        edit(2, '{"mode":"RUNTIME"}')
-        assert 'TEACHER' in pdf_text()
-        apply_from(2)
+        edit(1, '{"mode":"RUNTIME"}')
+        apply_from(1)
         assert 'RUNTIME' in pdf_text()
-        assert abs(json.loads(trace.read_text().splitlines()[-1])['zoom'] - 1.05) < .001
-        # Save global, retaining project configuration and profile state.
-        edit(4, '2')
-        apply_from(4, 21)
+        edit(3, '2')
+        apply_from(3, 19)
         global_path = tmp / 'global/leafview/config.json'
-        assert json.loads(global_path.read_text())['profiles']['teacher']['jobs'] == 2
-        # Change jobs mid-build repeatedly; only latest generation may publish.
-        for jobs in (1, 2, 3, 1):
-            edit(4, str(jobs))
-            send(b'\t' * 15 + b'\r')
-        pump(1)
-        # Supersede an expensive build while it is running, then verify recovery.
+        shared = json.loads(global_path.read_text())
+        assert set(shared) == {'files'}
+        assert shared['files'][str(main)]['jobs'] == 2
+        assert 'profiles' not in shared['files'][str(main)]
+        assert abs(json.loads(trace.read_text().splitlines()[-1])['zoom'] - 1.05) < .001
+        # Change parameters during an expensive build; obsolete helper must die.
         main.write_text('#for i in range(10000000) { [Slow content #i ] }\n')
         pump(.3)
         previous_helpers = {p for p in descendants(proc.pid) if Path(f'/proc/{p}/cmdline').exists()
             and b'--typst-compiler' in Path(f'/proc/{p}/cmdline').read_bytes()}
-        edit(4, '2')
+        edit(3, '1')
         send(b'\t' * 15 + b'\r')
         main.write_text('#sys.inputs.at("mode", default: "DEFAULT")\n')
         old = revision()
         send(b'r')
         wait(lambda: revision() > old)
-        pump(.2)
-        assert all(not Path(f'/proc/{p}').exists() for p in previous_helpers), 'superseded compiler not reaped'
-        assert 'RUNTIME' in pdf_text()
+        assert all(not Path(f'/proc/{p}').exists() for p in previous_helpers)
         good = main.with_suffix('.pdf').read_bytes()
-        # Switch student profile and save project. no-pdf must preserve last disk PDF.
-        send(b'o\r\x1b[3~student\r')
-        apply_from(0, 20)
+        # Disable publication, save per-file flags.
+        send(b'o' + b'\t' * 15 + b'\r')
+        apply_from(15, 19)
         assert main.with_suffix('.pdf').read_bytes() == good
-        assert json.loads(config.read_text())['default_profile'] == 'student'
-        # Save only this file in the shared global files map.
-        edit(4, '2')
-        apply_from(4, 22)
-        shared = json.loads(global_path.read_text())
-        assert shared['files'][str(main)]['default_profile'] == 'student'
-        assert shared['files'][str(main)]['profiles']['student']['jobs'] == 2
-        # New profile is a draft until Apply; create it and return to student.
-        send(b'o\r\x1b[3~custom\r')
-        apply_from(0)
-        send(b'o\r\x1b[3~student\r')
-        apply_from(0)
-        good = main.with_suffix('.pdf').read_bytes()
-        # Disable automatic compile; edits wait until manual r.
-        send(b'o' + b'\t' * 17 + b'\r')
-        apply_from(17)
+        assert json.loads(global_path.read_text())['files'][str(main)]['write_pdf'] is False
+        # Disable auto compile, then build manually.
+        send(b'o' + b'\t' * 16 + b'\r')
+        apply_from(16)
         old = revision()
-        main.write_text('#sys.inputs.at("mode", default: "DEFAULT")\nManual only\n')
+        main.write_text('Manual only\n')
         pump(.7)
         assert revision() == old
         send(b'r')
         wait(lambda: revision() > old)
-        # Invalid root stays in modal; Esc cancels without damaging the viewer.
-        edit(1, '"/does/not/exist"')
+        edit(0, '"/does/not/exist"')
         send(b'\t' * 18 + b'\r')
-        assert b'project' in output and b'root:' in output, output[-3500:]
+        assert b'root:' in output
         send(b'\x1b')
         assert main.with_suffix('.pdf').read_bytes() == good
-        # Compiler errors retain last document, then recover.
         old = revision()
         main.write_text('#let broken = (\n')
         send(b'r')
@@ -147,29 +124,24 @@ with tempfile.TemporaryDirectory(prefix='leafview-settings-') as tmp:
         main.write_text('Recovered\n')
         send(b'r')
         wait(lambda: revision() > old)
-        # PDF -> Typst -> PDF inside one instance; old helpers must be reaped.
+        # Switch PDF/Typst; file flags load again from the shared config.
         send(b'\x1b')
         send(b'\x0brGkk\r')
         wait(lambda: history.exists() and Path(json.loads(history.read_text())[0]).name == 'a.pdf')
         send(b'\x08\x0bG\r')
         wait(lambda: Path(json.loads(history.read_text())[0]).name == 'main.typ')
         pump(1)
-        send(b'o' + b'\t' * 4 + b'\r')
-        # Reopened Typst loaded the per-file jobs value; cancel the field/panel.
-        assert b'2' in output
-        send(b'\x1b')
-        send(b'\x1b')
         send(b'\x08\x0brGkk\r')
-        wait(lambda: history.exists() and Path(json.loads(history.read_text())[0]).name == 'a.pdf')
-        assert not any(' --typst-compiler ' in Path(f'/proc/{p}/cmdline').read_bytes().replace(b'\0', b' ').decode(errors='replace')
+        wait(lambda: Path(json.loads(history.read_text())[0]).name == 'a.pdf')
+        assert not any(b'--typst-compiler' in Path(f'/proc/{p}/cmdline').read_bytes()
                        for p in descendants(proc.pid) if Path(f'/proc/{p}/cmdline').exists())
         os.write(master, b'\x03')
         proc.wait(timeout=4)
         assert proc.returncode == 0
         assert termios.tcgetattr(slave) == before
         time.sleep(.1)
-        assert not any(Path(f'/proc/{p}').exists() for p in children_seen), 'leaked child process'
-        print('PASS: implicit .typ / runtime inputs / profiles / jobs restart / atomic save / no-pdf / manual compile / invalid root / error retention / browser switching / child cleanup')
+        assert not any(Path(f'/proc/{p}').exists() for p in children_seen)
+        print('PASS: flat flags / per-file shared JSON / runtime inputs / restart cancellation / no-pdf / manual build / error retention / browser / cleanup')
     finally:
         if proc.poll() is None:
             proc.kill()

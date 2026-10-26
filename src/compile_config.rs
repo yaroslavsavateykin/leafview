@@ -1,4 +1,4 @@
-//! Versioned configuration layers. Compiler fields come from typst_options::Patch.
+//! Flat, editable compiler flags with per-document overrides in one shared JSON.
 use crate::typst_options::{Options, Patch};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -10,7 +10,7 @@ use std::{
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct Profile {
+pub struct Flags {
     #[serde(flatten)]
     pub options: Patch,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -19,31 +19,31 @@ pub struct Profile {
     pub auto_compile: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auto_sync: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub replace_inputs: Option<bool>,
 }
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct FileConfig {
-    pub default_profile: Option<String>,
-    pub profiles: BTreeMap<String, Profile>,
-}
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct Config {
-    pub version: u32,
-    pub default_profile: String,
-    pub profiles: BTreeMap<String, Profile>,
-    pub files: BTreeMap<PathBuf, FileConfig>,
+    #[serde(flatten)]
+    pub flags: Flags,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub files: BTreeMap<PathBuf, Flags>,
 }
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            version: 1,
-            default_profile: "default".into(),
-            profiles: BTreeMap::new(),
-            files: BTreeMap::new(),
-        }
+impl<'de> Deserialize<'de> for Config {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        use serde::de::Error;
+        let mut value = serde_json::Value::deserialize(deserializer)?;
+        let object = value
+            .as_object_mut()
+            .ok_or_else(|| D::Error::custom("config must be an object"))?;
+        let files = object
+            .remove("files")
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(D::Error::custom)?
+            .unwrap_or_default();
+        let flags = serde_json::from_value(value).map_err(D::Error::custom)?;
+        Ok(Self { flags, files })
     }
 }
 #[derive(Clone, Debug, PartialEq)]
@@ -61,20 +61,21 @@ impl Default for Effective {
         }
     }
 }
-impl Profile {
-    fn apply(&self, target: &mut Effective) {
-        if self.replace_inputs == Some(true) {
-            target.options.inputs.clear();
+impl Flags {
+    pub fn apply(&self, value: &mut Effective) {
+        // An explicit inputs object replaces the inherited map, so deleting keys works.
+        if self.options.inputs.is_some() {
+            value.options.inputs.clear();
         }
-        self.options.apply(&mut target.options);
+        self.options.apply(&mut value.options);
         if let Some(write) = self.write_pdf {
-            target.options.no_pdf = !write;
+            value.options.no_pdf = !write;
         }
         if let Some(auto) = self.auto_compile {
-            target.auto_compile = auto;
+            value.auto_compile = auto;
         }
         if let Some(sync) = self.auto_sync {
-            target.auto_sync = sync;
+            value.auto_sync = sync;
         }
     }
     pub fn snapshot(value: &Effective) -> Result<Self> {
@@ -87,13 +88,13 @@ impl Profile {
                 .cloned()
                 .collect::<BTreeMap<_, _>>(),
         )?;
+        json.as_object_mut().unwrap().remove("no_pdf");
         let options = serde_json::from_value(json)?;
         Ok(Self {
             options,
             write_pdf: Some(!value.options.no_pdf),
             auto_compile: Some(value.auto_compile),
             auto_sync: Some(value.auto_sync),
-            replace_inputs: Some(true),
         })
     }
     pub fn resolve_paths(&mut self, base: &Path) {
@@ -122,49 +123,6 @@ impl Profile {
     }
 }
 impl Config {
-    fn check(&self) -> Result<()> {
-        anyhow::ensure!(
-            self.version == 1,
-            "unsupported LeafView config version {}",
-            self.version
-        );
-        anyhow::ensure!(
-            !self.default_profile.trim().is_empty(),
-            "default_profile is empty"
-        );
-        anyhow::ensure!(
-            self.profiles.len() <= 128,
-            "too many profiles (maximum 128)"
-        );
-        anyhow::ensure!(self.files.len() <= 4096, "too many file configurations");
-        for (path, file) in &self.files {
-            anyhow::ensure!(
-                !path.as_os_str().is_empty(),
-                "empty file configuration path"
-            );
-            anyhow::ensure!(
-                file.default_profile
-                    .as_ref()
-                    .is_none_or(|n| !n.trim().is_empty() && n.len() <= 128),
-                "invalid file default profile"
-            );
-            let nested = Self {
-                profiles: file.profiles.clone(),
-                ..Self::default()
-            };
-            nested.check()?;
-        }
-        for (name, profile) in &self.profiles {
-            anyhow::ensure!(
-                !name.trim().is_empty() && name.len() <= 128,
-                "invalid profile name"
-            );
-            let mut value = Effective::default();
-            profile.apply(&mut value);
-            validate_values(&value.options)?;
-        }
-        Ok(())
-    }
     pub fn load(path: &Path) -> Result<Self> {
         if !path.exists() {
             return Ok(Self::default());
@@ -178,6 +136,19 @@ impl Config {
         config.check()?;
         Ok(config)
     }
+    fn check(&self) -> Result<()> {
+        anyhow::ensure!(self.files.len() <= 4096, "too many file entries");
+        for flags in std::iter::once(&self.flags).chain(self.files.values()) {
+            let mut value = Effective::default();
+            flags.apply(&mut value);
+            validate_values(&value.options)?;
+        }
+        anyhow::ensure!(
+            self.files.keys().all(|p| !p.as_os_str().is_empty()),
+            "empty file key"
+        );
+        Ok(())
+    }
     pub fn save(&self, path: &Path) -> Result<()> {
         use std::io::Write;
         self.check()?;
@@ -189,32 +160,28 @@ impl Config {
         std::fs::create_dir_all(parent)?;
         let mut temp = tempfile::NamedTempFile::new_in(parent)?;
         serde_json::to_writer_pretty(&mut temp, self)?;
-        temp.write_all(b"\n")?;
+        temp.write_all(
+            b"
+",
+        )?;
         temp.as_file().sync_all()?;
         temp.persist(path).map_err(|e| e.error)?;
         Ok(())
     }
 }
-#[derive(Clone, Copy)]
-pub enum SaveTarget {
-    File,
-    Project,
-    Global,
-}
 #[derive(Clone)]
 pub struct Session {
     pub global: Config,
     pub project: Config,
-    pub runtime: Config,
-    pub selected: String,
+    pub runtime: Option<Flags>,
     pub global_path: PathBuf,
     pub project_path: PathBuf,
-    pub cli: Profile,
+    pub input: PathBuf,
+    pub cli: Flags,
     pub warning: Option<String>,
-    pub input: Option<PathBuf>,
 }
 impl Session {
-    pub fn load(input: &Path, cli: Profile, selected: Option<String>) -> Self {
+    pub fn load(input: &Path, cli: Flags) -> Self {
         let global_path = std::env::var_os("XDG_CONFIG_HOME")
             .filter(|p| !p.is_empty())
             .map(PathBuf::from)
@@ -235,164 +202,102 @@ impl Session {
             .map(|p| p.join(".leafview.json"))
             .find(|p| p.is_file())
             .unwrap_or_else(|| input.parent().unwrap().join(".leafview.json"));
-        let mut session = Self::from_paths(global_path, project_path, cli, selected.clone());
-        session.input = Some(input.canonicalize().unwrap_or_else(|_| input.to_owned()));
-        if selected.is_none() {
-            for (config, path) in [
-                (&session.global, &session.global_path),
-                (&session.project, &session.project_path),
-            ] {
-                if let Some(file) = session.file_entry(config, path) {
-                    if let Some(name) = &file.default_profile {
-                        session.selected = name.clone();
-                    }
-                }
-            }
-        }
-        session
+        Self::from_paths(input.to_owned(), global_path, project_path, cli)
     }
     pub fn from_paths(
+        input: PathBuf,
         global_path: PathBuf,
         project_path: PathBuf,
-        cli: Profile,
-        selected: Option<String>,
+        cli: Flags,
     ) -> Self {
         let mut warnings = Vec::new();
-        let mut load = |path: &Path| {
-            Config::load(path).unwrap_or_else(|e| {
+        let mut load = |p: &Path| {
+            Config::load(p).unwrap_or_else(|e| {
                 warnings.push(format!("{e:#}"));
                 Config::default()
             })
         };
         let global = load(&global_path);
         let project = load(&project_path);
-        let chosen = selected.unwrap_or_else(|| {
-            if project_path.exists() {
-                project.default_profile.clone()
-            } else {
-                global.default_profile.clone()
-            }
-        });
         Self {
-            input: None,
+            input: input.canonicalize().unwrap_or(input),
             global,
             project,
-            runtime: Config::default(),
-            selected: chosen,
+            runtime: None,
             global_path,
             project_path,
             cli,
             warning: if warnings.is_empty() {
                 None
             } else {
-                Some(warnings.join("\n"))
+                Some(warnings.join(
+                    "
+",
+                ))
             },
         }
     }
-    fn file_entry<'a>(&self, config: &'a Config, config_path: &Path) -> Option<&'a FileConfig> {
-        let input = self.input.as_ref()?;
-        config.files.get(input).or_else(|| {
+    fn file_entry<'a>(&self, config: &'a Config, path: &Path) -> Option<&'a Flags> {
+        config.files.get(&self.input).or_else(|| {
             config.files.iter().find_map(|(key, value)| {
-                let path = if key.is_absolute() {
+                let key = if key.is_absolute() {
                     key.clone()
                 } else {
-                    config_path.parent().unwrap().join(key)
+                    path.parent().unwrap().join(key)
                 };
-                (path.canonicalize().ok().as_ref() == Some(input)).then_some(value)
+                (key.canonicalize().ok().as_ref() == Some(&self.input)).then_some(value)
             })
         })
     }
+    pub fn effective(&self) -> Result<Effective> {
+        let mut value = Effective::default();
+        for (config, path) in [
+            (&self.global, &self.global_path),
+            (&self.project, &self.project_path),
+        ] {
+            let mut flags = config.flags.clone();
+            flags.resolve_paths(path.parent().unwrap());
+            flags.apply(&mut value);
+        }
+        for (config, path) in [
+            (&self.global, &self.global_path),
+            (&self.project, &self.project_path),
+        ] {
+            if let Some(flags) = self.file_entry(config, path) {
+                let mut flags = flags.clone();
+                flags.resolve_paths(path.parent().unwrap());
+                flags.apply(&mut value);
+            }
+        }
+        self.cli.apply(&mut value);
+        if let Some(flags) = &self.runtime {
+            flags.apply(&mut value);
+        }
+        validate_values(&value.options)?;
+        Ok(value)
+    }
     pub fn initial(&mut self, input: &Path) -> Effective {
-        match self.effective().and_then(|value| {
-            validate(input, &value.options)?;
-            Ok(value)
+        match self.effective().and_then(|v| {
+            validate(input, &v.options)?;
+            Ok(v)
         }) {
-            Ok(value) => value,
-            Err(error) => {
-                let previous = self.warning.take().unwrap_or_default();
-                self.warning = Some(format!("{previous}\nConfiguration not applied: {error:#}"));
+            Ok(v) => v,
+            Err(e) => {
+                self.warning = Some(format!(
+                    "{}
+Configuration not applied: {e:#}",
+                    self.warning.take().unwrap_or_default()
+                ));
                 Effective::default()
             }
         }
     }
-    pub fn names(&self) -> Vec<String> {
-        let mut names: std::collections::BTreeSet<String> =
-            ["default", "teacher", "student"].map(str::to_owned).into();
-        for config in [&self.global, &self.project, &self.runtime] {
-            names.extend(config.profiles.keys().cloned());
-        }
-        for (config, path) in [
-            (&self.global, &self.global_path),
-            (&self.project, &self.project_path),
-        ] {
-            if let Some(file) = self.file_entry(config, path) {
-                names.extend(file.profiles.keys().cloned());
-            }
-        }
-        names.insert(self.selected.clone());
-        names.into_iter().collect()
-    }
-    pub fn effective(&self) -> Result<Effective> {
-        anyhow::ensure!(
-            !self.selected.trim().is_empty() && self.selected.len() <= 128,
-            "invalid profile name"
-        );
-        let mut value = Effective::default();
-        for (config, base) in [
-            (&self.global, self.global_path.parent().unwrap()),
-            (&self.project, self.project_path.parent().unwrap()),
-        ] {
-            if let Some(profile) = config.profiles.get(&self.selected) {
-                let mut profile = profile.clone();
-                profile.resolve_paths(base);
-                profile.apply(&mut value);
-            }
-        }
-        for (config, path) in [
-            (&self.global, &self.global_path),
-            (&self.project, &self.project_path),
-        ] {
-            if let Some(profile) = self
-                .file_entry(config, path)
-                .and_then(|f| f.profiles.get(&self.selected))
-            {
-                let mut profile = profile.clone();
-                profile.resolve_paths(path.parent().unwrap());
-                profile.apply(&mut value);
-            }
-        }
-        self.cli.apply(&mut value);
-        if let Some(profile) = self.runtime.profiles.get(&self.selected) {
-            profile.apply(&mut value);
-        }
-        validate_values(&value.options)?;
-        anyhow::ensure!(
-            serde_json::to_vec(&value.options)?.len() <= 48 * 1024,
-            "compiler options exceed 48 KiB"
-        );
-        Ok(value)
-    }
-    pub fn save(&self, target: SaveTarget) -> Result<()> {
-        let (mut config, path) = match target {
-            SaveTarget::Global | SaveTarget::File => (self.global.clone(), &self.global_path),
-            SaveTarget::Project => (self.project.clone(), &self.project_path),
-        };
-        // Persist runtime snapshots only; other profiles and their relative paths stay intact.
-        // Resolve from disk again so an editor's unrelated changes are not lost.
-        if path.exists() {
-            config = Config::load(path)?;
-        }
-        if matches!(target, SaveTarget::File) {
-            let input = self.input.as_ref().context("no input file selected")?;
-            // Store only this document's runtime snapshots; preserve all other entries.
-            let file = config.files.entry(input.clone()).or_default();
-            file.profiles.extend(self.runtime.profiles.clone());
-            file.default_profile = Some(self.selected.clone());
-        } else {
-            config.profiles.extend(self.runtime.profiles.clone());
-            config.default_profile = self.selected.clone();
-        }
-        config.save(path)
+    pub fn save(&self) -> Result<()> {
+        // Always re-read to preserve settings for all other documents.
+        let mut config = Config::load(&self.global_path)?;
+        let flags = self.runtime.clone().context("no edited settings to save")?;
+        config.files.insert(self.input.clone(), flags);
+        config.save(&self.global_path)
     }
 }
 pub fn validate_values(o: &Options) -> Result<()> {
@@ -461,30 +366,10 @@ pub fn validate(input: &Path, o: &Options) -> Result<PathBuf> {
     Ok(root)
 }
 // The existing parser remains the single CLI grammar; explicit fields form the CLI layer.
-pub fn parse_cli(args: Vec<OsString>) -> Result<(PathBuf, Profile, Option<String>)> {
-    let mut filtered = Vec::new();
-    let mut selected = None;
-    let mut iter = args.into_iter();
-    let mut literal = false;
-    while let Some(arg) = iter.next() {
-        if arg == "--" {
-            literal = true;
-        }
-        if !literal && arg == "--profile" {
-            selected = Some(
-                iter.next()
-                    .context("--profile requires a name")?
-                    .into_string()
-                    .map_err(|_| anyhow::anyhow!("profile must be UTF-8"))?,
-            );
-        } else if !literal && arg.to_string_lossy().starts_with("--profile=") {
-            selected = Some(arg.to_string_lossy()[10..].to_owned());
-        } else {
-            filtered.push(arg);
-        }
-    }
+pub fn parse_cli(args: Vec<OsString>) -> Result<(PathBuf, Flags)> {
+    let filtered = args;
     let (path, options) = Options::parse(filtered.clone())?;
-    let all = serde_json::to_value(Profile::snapshot(&Effective {
+    let all = serde_json::to_value(Flags::snapshot(&Effective {
         options,
         ..Effective::default()
     })?)?;
@@ -558,169 +443,64 @@ pub fn parse_cli(args: Vec<OsString>) -> Result<(PathBuf, Profile, Option<String
             .contains(&text.as_ref())
             && !(text.starts_with("-j") && text.len() > 2 && !text.starts_with("--"));
     }
-    let mut profile: Profile = serde_json::from_value(patch.into())?;
-    profile.resolve_paths(&std::env::current_dir()?);
-    Ok((path, profile, selected))
+    let mut flags: Flags = serde_json::from_value(patch.into())?;
+    flags.resolve_paths(&std::env::current_dir()?);
+    Ok((path, flags))
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
-    fn layers_profiles_paths_and_atomic_save() {
-        let d = tempfile::tempdir().unwrap();
-        let global = d.path().join("global.json");
-        let project = d.path().join(".leafview.json");
-        std::fs::write(&global, r#"{"version":1,"default_profile":"teacher","profiles":{"teacher":{"jobs":1,"inputs":{"mode":"global","extra":"yes"}}}}"#).unwrap();
-        std::fs::write(&project, r#"{"version":1,"default_profile":"teacher","profiles":{"teacher":{"jobs":2,"root":".","inputs":{"mode":"project"}},"student":{"write_pdf":false}}}"#).unwrap();
-        let cli: Profile =
-            serde_json::from_value(serde_json::json!({"jobs":3,"inputs":{"mode":"cli"}})).unwrap();
-        let mut s = Session::from_paths(global, project.clone(), cli, None);
-        let mut v = s.effective().unwrap();
-        assert_eq!(v.options.jobs, Some(3));
-        assert_eq!(v.options.root, Some(d.path().join(".")));
-        assert!(v.options.inputs.contains(&("extra".into(), "yes".into())));
-        v.options.jobs = Some(4);
-        s.runtime
-            .profiles
-            .insert("teacher".into(), Profile::snapshot(&v).unwrap());
-        assert_eq!(s.effective().unwrap().options.jobs, Some(4));
-        s.save(SaveTarget::Project).unwrap();
-        assert_eq!(Config::load(&project).unwrap().default_profile, "teacher");
-        s.selected = "student".into();
-        assert!(s.effective().unwrap().options.no_pdf);
-        assert!(d.path().read_dir().unwrap().all(|p| !p
-            .unwrap()
-            .file_name()
-            .to_string_lossy()
-            .contains("tmp")));
-    }
-    #[test]
-    fn runtime_can_clear_nullable_fields_and_inputs() {
-        let d = tempfile::tempdir().unwrap();
-        let global = d.path().join("global.json");
-        let project = d.path().join(".leafview.json");
+    fn flat_file_flags_round_trip_and_preserve_other_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.typ");
+        let b = dir.path().join("b.typ");
+        std::fs::write(&a, "").unwrap();
+        std::fs::write(&b, "").unwrap();
+        let global = dir.path().join("config.json");
+        let project = dir.path().join(".leafview.json");
         std::fs::write(
-            &project,
-            r#"{"profiles":{"default":{"jobs":4,"pages":"1-2","inputs":{"x":"yes"}}}}"#,
+            &global,
+            serde_json::json!({"jobs":1,"files":{b.to_str().unwrap():{"jobs":4}}}).to_string(),
         )
         .unwrap();
-        let mut s = Session::from_paths(global, project, Profile::default(), None);
+        let mut s =
+            Session::from_paths(a.clone(), global.clone(), project.clone(), Flags::default());
+        assert_eq!(s.effective().unwrap().options.jobs, Some(1));
         let mut value = s.effective().unwrap();
-        value.options.jobs = None;
-        value.options.pages = None;
-        value.options.inputs.clear();
-        s.runtime
-            .profiles
-            .insert("default".into(), Profile::snapshot(&value).unwrap());
-        let v = s.effective().unwrap();
-        assert!(
-            v.options.jobs.is_none() && v.options.pages.is_none() && v.options.inputs.is_empty()
+        value.options.jobs = Some(2);
+        value.options.inputs = vec![("x".into(), "yes".into())];
+        s.runtime = Some(Flags::snapshot(&value).unwrap());
+        s.save().unwrap();
+        let json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&global).unwrap()).unwrap();
+        assert!(json.get("version").is_none() && json.get("profiles").is_none());
+        assert_eq!(json["files"][b.to_str().unwrap()]["jobs"], 4);
+        let loaded = Session::from_paths(a, global.clone(), project, Flags::default());
+        assert_eq!(loaded.effective().unwrap().options.jobs, Some(2));
+        assert_eq!(
+            loaded.effective().unwrap().options.inputs,
+            value.options.inputs
         );
-        s.save(SaveTarget::Project).unwrap();
-        let reloaded = Session::from_paths(
-            s.global_path.clone(),
-            s.project_path.clone(),
-            Profile::default(),
-            None,
-        );
-        assert!(reloaded.effective().unwrap().options.inputs.is_empty());
+        std::fs::write(&global, "{invalid").unwrap();
+        assert!(s.save().is_err());
+        assert_eq!(std::fs::read_to_string(global).unwrap(), "{invalid");
     }
     #[test]
-    fn invalid_json_does_not_overwrite_or_crash() {
-        let d = tempfile::tempdir().unwrap();
-        let p = d.path().join(".leafview.json");
-        std::fs::write(&p, "{bad").unwrap();
-        let s = Session::from_paths(
-            d.path().join("global.json"),
-            p.clone(),
-            Profile::default(),
-            None,
-        );
-        assert!(s.warning.is_some());
-        assert!(s.save(SaveTarget::Project).is_err());
-        assert_eq!(std::fs::read_to_string(p).unwrap(), "{bad");
-    }
-    #[test]
-    fn shared_file_entries_are_independent_and_round_trip() {
-        let d = tempfile::tempdir().unwrap();
-        let a = d.path().join("a.typ");
-        let b = d.path().join("b.typ");
-        std::fs::write(&a, "A").unwrap();
-        std::fs::write(&b, "B").unwrap();
-        let global = d.path().join("config.json");
-        let project = d.path().join(".leafview.json");
-        let mut session =
-            Session::from_paths(global.clone(), project.clone(), Profile::default(), None);
-        session.input = Some(a.clone());
-        session.selected = "teacher".into();
+    fn rejects_metadata_and_bad_values_and_clears_options() {
+        assert!(serde_json::from_str::<Config>(r#"{"profiles":{}}"#).is_err());
+        let flags: Flags = serde_json::from_str(r#"{"jobs":0}"#).unwrap();
         let mut value = Effective::default();
-        value.options.jobs = Some(3);
-        session
-            .runtime
-            .profiles
-            .insert("teacher".into(), Profile::snapshot(&value).unwrap());
-        session.save(SaveTarget::File).unwrap();
-        session.input = Some(b.clone());
-        session.selected = "student".into();
-        session.runtime.profiles.clear();
-        value.options.jobs = Some(1);
-        session
-            .runtime
-            .profiles
-            .insert("student".into(), Profile::snapshot(&value).unwrap());
-        session.save(SaveTarget::File).unwrap();
-        let config = Config::load(&global).unwrap();
-        assert_eq!(config.files.len(), 2);
-        assert!(config.profiles.is_empty());
-        assert_eq!(config.files[&a].default_profile.as_deref(), Some("teacher"));
-        let mut loaded =
-            Session::from_paths(global, project, Profile::default(), Some("teacher".into()));
-        loaded.input = Some(a);
-        assert_eq!(loaded.effective().unwrap().options.jobs, Some(3));
-        loaded.input = Some(b);
-        loaded.selected = "student".into();
-        assert_eq!(loaded.effective().unwrap().options.jobs, Some(1));
-    }
-    #[test]
-    fn malformed_values_and_cli() {
-        assert!(
-            serde_json::from_str::<Config>(r#"{"profiles":{"x":{"jobs":0}}}"#)
-                .unwrap()
-                .check()
-                .is_err()
-        );
-        assert!(serde_json::from_str::<Config>(r#"{"version":42}"#)
-            .unwrap()
-            .check()
-            .is_err());
-        assert!(serde_json::from_str::<Config>(r#"{"surprise":true}"#).is_err());
-        let (p, cli, name) = parse_cli(
-            [
-                "main.typ",
-                "--profile",
-                "teacher",
-                "-j2",
-                "--input",
-                "mode=cli",
-            ]
-            .map(Into::into)
-            .into(),
-        )
-        .unwrap();
-        assert_eq!(p, PathBuf::from("main.typ"));
-        assert_eq!(name.as_deref(), Some("teacher"));
-        assert_eq!(cli.options.jobs, Some(Some(2)));
-        assert!(cli.options.fonts.is_none());
-        let mut o = Options {
-            pages: Some("4-2".into()),
-            ..Options::default()
-        };
-        assert!(validate_values(&o).is_err());
-        let d = tempfile::tempdir().unwrap();
-        let input = d.path().join("main.typ");
-        std::fs::write(&input, "").unwrap();
-        o.pages = None;
-        o.root = Some("/does/not/exist".into());
-        assert!(validate(&input, &o).is_err());
+        flags.apply(&mut value);
+        assert!(validate_values(&value.options).is_err());
+        value.options.jobs = Some(4);
+        value.options.inputs = vec![("old".into(), "value".into())];
+        let flags: Flags = serde_json::from_str(r#"{"jobs":null,"inputs":{}}"#).unwrap();
+        flags.apply(&mut value);
+        assert!(value.options.jobs.is_none() && value.options.inputs.is_empty());
+        assert!(parse_cli(["a.typ", "--profile", "teacher"].map(Into::into).into()).is_err());
+        let (_, flags) = parse_cli(["a.typ", "-j2"].map(Into::into).into()).unwrap();
+        assert_eq!(flags.options.jobs, Some(Some(2)));
     }
 }
