@@ -38,7 +38,11 @@ PDF and Typst files and directories appear; folders expand lazily, sorted before
 Enter on `.typ` starts the same embedded Typst Preview with that project's config;
 Enter on `.pdf` returns to PDF mode. The previous PDF remains until the new build
 succeeds. Switching documents reaps the previous compiler and releases its watcher.
-The active PDF is cyan. Enter opens a selected file without leaving LeafView;
+PDF files/folders are warm amber, Typst files/folders are soft blue, folders
+containing both are lavender; empty folders are muted gray. Unknown/unscanned
+folders stay neutral. The active document and its parent folder are cyan;
+its parent also gets a ● marker and a tinted background. Recent uses the same
+file-type colors. Enter opens a selected file without leaving LeafView;
 failed opens retain the current document. Recent history contains up to 20 paths
 and is saved atomically to `$XDG_STATE_HOME/leafview/recent.json` (default:
 `~/.local/state/leafview/recent.json`). No document contents are stored.

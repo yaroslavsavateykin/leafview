@@ -16,9 +16,11 @@ import time
 root = Path(__file__).resolve().parents[1]
 with tempfile.TemporaryDirectory(prefix='leafview-settings-') as tmp:
     tmp = Path(tmp)
-    main = tmp / 'main.typ'
+    project = tmp / 'project'
+    project.mkdir()
+    main = project / 'main.typ'
     main.write_text('#sys.inputs.at("mode", default: "DEFAULT")\n')
-    shutil.copy(root / 'tests/fixtures/sample.pdf', tmp / 'a.pdf')
+    shutil.copy(root / 'tests/fixtures/sample.pdf', project / 'a.pdf')
     config = tmp / '.leafview.json'
     config.write_text(json.dumps({'inputs': {'mode': 'TEACHER'}, 'jobs': 1}))
     trace = tmp / 'trace.jsonl'
@@ -127,6 +129,18 @@ with tempfile.TemporaryDirectory(prefix='leafview-settings-') as tmp:
         main.write_text('Recovered\n')
         send(b'r')
         wait(lambda: revision() > old)
+        # Root/sandbox error must recover after applying a literal relative root.
+        (tmp / 'shared.typ').write_text('Shared content\n')
+        output.clear()
+        main.write_text('#include "../shared.typ"\n')
+        send(b'r')
+        wait(lambda: b'compilation error' in output)
+        old = revision()
+        edit(0, '..')
+        output.clear()
+        send(b'\x01')
+        wait(lambda: revision() > old)
+        assert b'compilation error' not in output, 'stale root diagnostic repainted'
         # Switch PDF/Typst; file flags load again from the shared config.
         send(b'\x1b')
         send(b'\x0brGkk\r')

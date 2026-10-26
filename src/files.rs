@@ -321,8 +321,10 @@ impl Files {
                 ListItem::new(crate::links::sanitize(&format!("◷ {name}"))).style(
                     Style::default().fg(if path == current {
                         Color::LightCyan
+                    } else if is_pdf(path) {
+                        Color::Rgb(224, 182, 112)
                     } else {
-                        Color::Rgb(214, 217, 224)
+                        Color::Rgb(128, 179, 237)
                     }),
                 )
             })
@@ -455,32 +457,56 @@ pub fn panel_block(title: &str, active: bool) -> Block<'static> {
 }
 // Bounded recursive check off the UI thread. Unknown is distinct from empty.
 fn contains_pdf(
-    path: &Path, depth: usize, budget: &mut usize,
+    path: &Path,
+    depth: usize,
+    budget: &mut usize,
     stop: &std::sync::atomic::AtomicBool,
 ) -> Option<u8> {
     use std::sync::atomic::Ordering;
-    if depth > 24 || *budget == 0 || stop.load(Ordering::Relaxed) { return None; }
+    if depth > 24 || *budget == 0 || stop.load(Ordering::Relaxed) {
+        return None;
+    }
     let entries = std::fs::read_dir(path).ok()?;
     let mut directories = Vec::new();
     let mut unknown = false;
     let mut types = 0u8;
     for item in entries {
-        if *budget == 0 || stop.load(Ordering::Relaxed) { return None; }
+        if *budget == 0 || stop.load(Ordering::Relaxed) {
+            return None;
+        }
         *budget -= 1;
-        let Ok(item) = item else { unknown = true; continue; };
-        let Ok(kind) = item.file_type() else { unknown = true; continue; };
-        if kind.is_file() && is_document(&item.path()) { types |= if is_pdf(&item.path()) { 1 } else { 2 }; }
-        if types == 3 { return Some(types); }
-        if kind.is_dir() { directories.push(item.path()); }
+        let Ok(item) = item else {
+            unknown = true;
+            continue;
+        };
+        let Ok(kind) = item.file_type() else {
+            unknown = true;
+            continue;
+        };
+        if kind.is_file() && is_document(&item.path()) {
+            types |= if is_pdf(&item.path()) { 1 } else { 2 };
+        }
+        if types == 3 {
+            return Some(types);
+        }
+        if kind.is_dir() {
+            directories.push(item.path());
+        }
     }
     for path in directories {
         match contains_pdf(&path, depth + 1, budget, stop) {
             Some(found) => types |= found,
             None => unknown = true,
         }
-        if types == 3 { return Some(types); }
+        if types == 3 {
+            return Some(types);
+        }
     }
-    if unknown { None } else { Some(types) }
+    if unknown {
+        None
+    } else {
+        Some(types)
+    }
 }
 fn is_document(path: &Path) -> bool {
     is_pdf(path)
@@ -584,6 +610,28 @@ mod tests {
         assert!(rendered.contains("Recent"));
         assert!(rendered.contains("Research notes.pdf"));
         assert!(!rendered.contains("Ctrl+"));
+    }
+    #[test]
+    fn document_palette_distinguishes_types_and_active_folder() {
+        let entry = Entry {
+            path: PathBuf::from("/library"),
+            depth: 0,
+            directory: true,
+            recent: false,
+        };
+        let current = Path::new("/elsewhere/a.pdf");
+        let colors: Vec<_> = [0, 1, 2, 3]
+            .into_iter()
+            .map(|kind| tree_entry_style(&entry, current, false, false, Some(kind)).fg)
+            .collect();
+        for i in 0..colors.len() {
+            for j in 0..i {
+                assert_ne!(colors[i], colors[j]);
+            }
+        }
+        let active = tree_entry_style(&entry, current, true, false, Some(3));
+        assert!(active.bg.is_some());
+        assert!(active.add_modifier.contains(Modifier::BOLD));
     }
     #[test]
     fn folder_pdf_scan_distinguishes_nested_empty_and_unknown() {
