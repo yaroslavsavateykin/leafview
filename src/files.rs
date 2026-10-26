@@ -35,8 +35,8 @@ pub struct Files {
     recent: Vec<PathBuf>,
     history_path: Option<PathBuf>,
     pub notice: Option<String>,
-    pdf_folders: BTreeMap<PathBuf, Option<bool>>,
-    folder_scanner: crate::workers::Worker<Vec<PathBuf>, Vec<(PathBuf, Option<bool>)>>,
+    pdf_folders: BTreeMap<PathBuf, Option<u8>>,
+    folder_scanner: crate::workers::Worker<Vec<PathBuf>, Vec<(PathBuf, Option<u8>)>>,
     scan_pending: bool,
     scan_due: bool,
 }
@@ -414,7 +414,7 @@ fn tree_entry_style(
     current: &Path,
     current_folder: bool,
     ancestor: bool,
-    contains: Option<bool>,
+    contains: Option<u8>,
 ) -> Style {
     if current_folder {
         Style::default()
@@ -430,12 +430,16 @@ fn tree_entry_style(
             Color::LightCyan
         } else if entry.directory {
             match contains {
-                Some(true) => Color::Rgb(125, 201, 160),
-                Some(false) => Color::Rgb(100, 108, 122),
+                Some(1) => Color::Rgb(224, 182, 112),
+                Some(2) => Color::Rgb(128, 179, 237),
+                Some(3) => Color::Rgb(187, 159, 230),
+                Some(_) => Color::Rgb(100, 108, 122),
                 None => Color::Rgb(180, 192, 211),
             }
+        } else if is_pdf(&entry.path) {
+            Color::Rgb(224, 182, 112)
         } else {
-            Color::Rgb(214, 217, 224)
+            Color::Rgb(128, 179, 237)
         })
     }
 }
@@ -451,50 +455,32 @@ pub fn panel_block(title: &str, active: bool) -> Block<'static> {
 }
 // Bounded recursive check off the UI thread. Unknown is distinct from empty.
 fn contains_pdf(
-    path: &Path,
-    depth: usize,
-    budget: &mut usize,
+    path: &Path, depth: usize, budget: &mut usize,
     stop: &std::sync::atomic::AtomicBool,
-) -> Option<bool> {
+) -> Option<u8> {
     use std::sync::atomic::Ordering;
-    if depth > 24 || *budget == 0 || stop.load(Ordering::Relaxed) {
-        return None;
-    }
+    if depth > 24 || *budget == 0 || stop.load(Ordering::Relaxed) { return None; }
     let entries = std::fs::read_dir(path).ok()?;
     let mut directories = Vec::new();
     let mut unknown = false;
+    let mut types = 0u8;
     for item in entries {
-        if *budget == 0 || stop.load(Ordering::Relaxed) {
-            return None;
-        }
+        if *budget == 0 || stop.load(Ordering::Relaxed) { return None; }
         *budget -= 1;
-        let Ok(item) = item else {
-            unknown = true;
-            continue;
-        };
-        let Ok(kind) = item.file_type() else {
-            unknown = true;
-            continue;
-        };
-        if kind.is_file() && is_pdf(&item.path()) {
-            return Some(true);
-        }
-        if kind.is_dir() {
-            directories.push(item.path());
-        }
+        let Ok(item) = item else { unknown = true; continue; };
+        let Ok(kind) = item.file_type() else { unknown = true; continue; };
+        if kind.is_file() && is_document(&item.path()) { types |= if is_pdf(&item.path()) { 1 } else { 2 }; }
+        if types == 3 { return Some(types); }
+        if kind.is_dir() { directories.push(item.path()); }
     }
     for path in directories {
         match contains_pdf(&path, depth + 1, budget, stop) {
-            Some(true) => return Some(true),
+            Some(found) => types |= found,
             None => unknown = true,
-            _ => {}
         }
+        if types == 3 { return Some(types); }
     }
-    if unknown {
-        None
-    } else {
-        Some(false)
-    }
+    if unknown { None } else { Some(types) }
 }
 fn is_document(path: &Path) -> bool {
     is_pdf(path)
@@ -604,9 +590,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let stop = std::sync::atomic::AtomicBool::new(false);
         std::fs::create_dir(dir.path().join("nested")).unwrap();
-        assert_eq!(contains_pdf(dir.path(), 0, &mut 100, &stop), Some(false));
+        assert_eq!(contains_pdf(dir.path(), 0, &mut 100, &stop), Some(0));
         std::fs::write(dir.path().join("nested/paper.PDF"), "pdf").unwrap();
-        assert_eq!(contains_pdf(dir.path(), 0, &mut 100, &stop), Some(true));
+        assert_eq!(contains_pdf(dir.path(), 0, &mut 100, &stop), Some(1));
+        std::fs::write(dir.path().join("source.typ"), "").unwrap();
+        assert_eq!(contains_pdf(dir.path(), 0, &mut 100, &stop), Some(3));
         assert_eq!(contains_pdf(dir.path(), 0, &mut 0, &stop), None);
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         assert_eq!(contains_pdf(dir.path(), 0, &mut 100, &stop), None);

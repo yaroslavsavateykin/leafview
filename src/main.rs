@@ -231,6 +231,11 @@ impl App {
                         }
                         let live = self.live.as_mut().context("no live compiler")?;
                         live.configure(&value)?;
+                        live.refresh();
+                        // A diagnostic belongs to the previous configuration.
+                        // Keep the last-good PDF visible while rebuilding.
+                        self.compile_error = None;
+                        self.error = None;
                         let mut session = *session;
                         session.warning = None;
                         self.settings_notice = Some(if save {
