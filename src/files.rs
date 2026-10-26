@@ -319,13 +319,17 @@ impl Files {
                     .unwrap_or(path.as_os_str())
                     .to_string_lossy();
                 ListItem::new(crate::links::sanitize(&format!("◷ {name}"))).style(
-                    Style::default().fg(if path == current {
-                        Color::LightCyan
-                    } else if is_pdf(path) {
-                        Color::Rgb(224, 182, 112)
-                    } else {
-                        Color::Rgb(128, 179, 237)
-                    }),
+                    Style::default()
+                        .fg(if is_pdf(path) {
+                            Color::Rgb(224, 182, 112)
+                        } else {
+                            Color::Rgb(128, 179, 237)
+                        })
+                        .bg(if path == current {
+                            Color::Rgb(24, 61, 65)
+                        } else {
+                            Color::Rgb(25, 29, 36)
+                        }),
                 )
             })
             .collect();
@@ -347,7 +351,7 @@ impl Files {
                     })
                     .add_modifier(Modifier::BOLD),
             )
-            .highlight_symbol(if recent_active { "› " } else { "  " });
+            .highlight_symbol("  ");
         f.render_stateful_widget(recent_list, recent_area, &mut self.recent_state);
         let current_is_pdf = is_document(current);
         let items: Vec<_> = self
@@ -375,7 +379,6 @@ impl Files {
                     && current.parent() == Some(entry.path.as_path());
                 let ancestor =
                     entry.directory && current_is_pdf && current.starts_with(&entry.path);
-                let marker = if current_folder { "●" } else { marker };
                 let label = if entry.recent {
                     format!(
                         "{marker} {name} — {}",
@@ -407,7 +410,7 @@ impl Files {
                     })
                     .add_modifier(Modifier::BOLD),
             )
-            .highlight_symbol(if active { "› " } else { "  " });
+            .highlight_symbol("  ");
         f.render_stateful_widget(list, tree_area, &mut self.state);
     }
 }
@@ -418,31 +421,24 @@ fn tree_entry_style(
     ancestor: bool,
     contains: Option<u8>,
 ) -> Style {
-    if current_folder {
-        Style::default()
-            .fg(Color::Rgb(110, 240, 225))
-            .bg(Color::Rgb(24, 61, 65))
-            .add_modifier(Modifier::BOLD)
-    } else if ancestor {
-        Style::default()
-            .fg(Color::Rgb(100, 196, 202))
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(if entry.path == current {
-            Color::LightCyan
-        } else if entry.directory {
-            match contains {
-                Some(1) => Color::Rgb(224, 182, 112),
-                Some(2) => Color::Rgb(128, 179, 237),
-                Some(3) => Color::Rgb(187, 159, 230),
-                Some(_) => Color::Rgb(100, 108, 122),
-                None => Color::Rgb(180, 192, 211),
-            }
-        } else if is_pdf(&entry.path) {
-            Color::Rgb(224, 182, 112)
+    let color = if entry.directory {
+        if current_folder || ancestor || contains.is_some_and(|types| types != 0) {
+            Color::Rgb(110, 205, 192)
+        } else if contains == Some(0) {
+            Color::Rgb(100, 108, 122)
         } else {
-            Color::Rgb(128, 179, 237)
-        })
+            Color::Rgb(180, 192, 211)
+        }
+    } else if is_pdf(&entry.path) {
+        Color::Rgb(224, 182, 112)
+    } else {
+        Color::Rgb(128, 179, 237)
+    };
+    let style = Style::default().fg(color);
+    if current_folder || entry.path == current {
+        style.bg(Color::Rgb(24, 61, 65))
+    } else {
+        style
     }
 }
 pub fn panel_block(title: &str, active: bool) -> Block<'static> {
@@ -624,14 +620,12 @@ mod tests {
             .into_iter()
             .map(|kind| tree_entry_style(&entry, current, false, false, Some(kind)).fg)
             .collect();
-        for i in 0..colors.len() {
-            for j in 0..i {
-                assert_ne!(colors[i], colors[j]);
-            }
-        }
+        assert_ne!(colors[0], colors[1]);
+        assert_eq!(colors[1], colors[2]);
+        assert_eq!(colors[2], colors[3]);
         let active = tree_entry_style(&entry, current, true, false, Some(3));
         assert!(active.bg.is_some());
-        assert!(active.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(active.fg, colors[1]);
     }
     #[test]
     fn folder_pdf_scan_distinguishes_nested_empty_and_unknown() {
