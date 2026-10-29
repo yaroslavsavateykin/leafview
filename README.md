@@ -346,7 +346,7 @@ Override the automatic selection when needed:
 ```sh
 LEAFVIEW_GRAPHICS=safe leafview document.pdf    # explicitly request low-resolution halfblocks
 LEAFVIEW_GRAPHICS=native leafview document.pdf  # negotiate native graphics (same as auto)
-LEAFVIEW_DEBUG=1 leafview document.pdf         # inspect selected backend
+LEAFVIEW_DEBUG=1 LEAFVIEW_LOG=/tmp/leafview.log leafview document.pdf # log selected backend
 ```
 
 `LEAFVIEW_GRAPHICS=auto` (default) queries terminal capabilities without a
@@ -356,6 +356,12 @@ one every 75 ms during key repeats; the final viewport is always scheduled.
 Ctrl-C is handled as an ordinary clean exit. A system-level
 SIGKILL, OOM kill, or a crash inside Ghostty itself cannot be handled by an
 application's cleanup code.
+
+Loading, compilation, link-hover hints and short notifications appear in the
+bottom footer, never appended to the document title. Borderless mode reserves a
+footer row outside the PDF image. Compile diagnostics appear once in the error
+panel. Optional `LEAFVIEW_DEBUG`/`LEAFVIEW_PERF` diagnostics are written only to
+`LEAFVIEW_LOG` when that path is set, never over the terminal UI.
 
 ## SSH and Kitty graphics
 

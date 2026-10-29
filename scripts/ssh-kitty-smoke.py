@@ -25,7 +25,7 @@ for wrapped in (False, True):
     with tempfile.TemporaryDirectory(prefix='leafview-ssh-test-') as tmp:
         env = {**os.environ, 'SSH_CONNECTION': '192.0.2.1 50000 192.0.2.2 22',
                'TERM': 'tmux-256color' if wrapped else 'xterm-kitty',
-               'LEAFVIEW_GRAPHICS': 'auto', 'LEAFVIEW_DEBUG': '1',
+               'LEAFVIEW_GRAPHICS': 'auto', 'LEAFVIEW_DEBUG': '1', 'LEAFVIEW_LOG': str(Path(tmp) / 'debug.log'),
                'XDG_STATE_HOME': tmp}
         # TERM identifies the virtual tmux protocol without invoking a real
         # tmux server or changing a user's passthrough configuration.
@@ -53,7 +53,8 @@ for wrapped in (False, True):
             pump(1.2)
             os.write(master, b'\x1b_Gi=31;OK\x1b\\\x1b[6;20;10t\x1b[0n')
             pump(1.5)
-            assert b'protocol=Kitty' in output, output[-3000:]
+            assert 'protocol=Kitty' in (Path(tmp) / 'debug.log').read_text(), output[-3000:]
+            assert b'leafview: protocol=' not in output, 'debug diagnostics leaked into UI'
             assert b'f=100,t=d' in output, 'missing inline SSH-safe PNG'
             assert b't=f' not in output and b't=s' not in output, 'remote file transport used'
             if wrapped:

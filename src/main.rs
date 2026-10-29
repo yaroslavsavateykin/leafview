@@ -3,6 +3,7 @@
 mod compile_config;
 #[cfg(feature = "typst")]
 mod compile_settings;
+mod diagnostics;
 mod document;
 mod files;
 mod kitty;
@@ -101,8 +102,6 @@ struct App {
     compile_error: Option<String>,
     dirty: bool,
     loading: bool,
-    backend: ratatui_image::picker::ProtocolType,
-    graphics_safe: bool,
     last_render_at: Option<Instant>,
     render_due: Option<Instant>,
 }
@@ -215,7 +214,7 @@ impl App {
             )
             .saturating_mul(self.font_width)
             .clamp(1, 3400),
-            height: u32::from(screen.height.saturating_sub(if framed { 2 } else { 1 }))
+            height: u32::from(screen.height.saturating_sub(2))
                 .saturating_mul(self.font_height)
                 .clamp(1, 2400),
         };
@@ -966,90 +965,34 @@ impl App {
             }
         }
     }
-    fn status(&self) -> String {
-        if let Some(action) = self.hovered.and_then(|i| {
-            self.displayed
-                .as_ref()?
-                .links
-                .as_ref()?
-                .links
-                .get(i)
-                .map(|l| &l.action)
-        }) {
-            return match action {
-                LinkAction::External(url) => {
-                    format!(" ↗ {}  [click to open]", links::sanitize(url))
-                }
-                LinkAction::Internal(d) => {
-                    format!(" → Page {}  [click to follow · b back]", d.page + 1)
-                }
-                LinkAction::Unsupported(reason) => {
-                    format!(" Unsupported link: {}", links::sanitize(reason))
-                }
-            };
+    fn footer_notice(&self) -> String {
+        if let Some(notice) = &self.files.notice {
+            return links::sanitize(notice);
         }
-        let name = self
-            .source
-            .file_name()
-            .map(|n| n.to_string_lossy())
-            .unwrap_or_else(|| "document.pdf".into());
-        if !self.jump.is_empty() {
-            return format!(" :{}  Enter: go to page  |  Esc: cancel", self.jump);
-        }
-        if let Some(err) = &self.error {
-            return format!(
-                " {}  {}/{}  ERROR: {}",
-                name,
-                self.view.page + 1,
-                self.view.pages,
-                abbreviate(err, 110)
-            );
-        }
-        #[cfg(not(feature = "typst"))]
-        let live_state = "";
         #[cfg(feature = "typst")]
-        let live_state = self
-            .live
+        {
+            if self.live.as_ref().is_some_and(|live| live.compiling) {
+                return "Compiling…".into();
+            }
+            if let Some(notice) = &self.settings_notice {
+                return links::sanitize(notice);
+            }
+            // Full diagnostics already appear in the error panel.
+            if self.compile_error.is_some() {
+                return String::new();
+            }
+        }
+        if self.loading {
+            return "Loading page…".into();
+        }
+        if !self.jump.is_empty() {
+            return format!(":{} · Enter: go to page", self.jump);
+        }
+        self.error
             .as_ref()
-            .map(|live| {
-                format!(
-                    "{} · sync {} · {}ms · ",
-                    if live.compiling || self.loading {
-                        "⏳"
-                    } else {
-                        "✓"
-                    },
-                    if live.auto_sync { "on" } else { "off" },
-                    self.compile_millis
-                )
-            })
-            .unwrap_or_default();
-        let state = if self.graphics_safe {
-            "Halfblocks (explicit compatibility mode) · "
-        } else if self.backend == ratatui_image::picker::ProtocolType::Halfblocks {
-            "Halfblocks (low resolution) · "
-        } else {
-            ""
-        };
-        format!(
-            " {}  {}/{}   {:.0}%   {}{}",
-            name,
-            self.view.page + 1,
-            self.view.pages,
-            self.view.zoom * 100.0,
-            live_state,
-            state
-        )
+            .map(|error| links::sanitize(error))
+            .unwrap_or_default()
     }
-}
-
-fn abbreviate(text: &str, max_chars: usize) -> String {
-    let mut text = text.chars();
-    let mut out: String = text.by_ref().take(max_chars).collect();
-    if text.next().is_some() {
-        out.push('…');
-    }
-    out
 }
 
 fn ui(f: &mut Frame<'_>, app: &mut App) {
@@ -1076,36 +1019,15 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
         app.view.pages,
         app.view.zoom * 100.0
     );
-    #[cfg(feature = "typst")]
-    let title = if app.live.as_ref().is_some_and(|live| live.compiling) {
-        format!("{title} · Compiling…")
-    } else {
-        title
-    };
-    #[cfg(feature = "typst")]
-    let title = if let Some(notice) = &app.settings_notice {
-        format!("{title} · {}", links::sanitize(notice))
-    } else {
-        title
-    };
-    let notice = if app.files.focused {
-        app.files.notice.clone().unwrap_or_default()
-    } else if app.error.is_some() || !app.jump.is_empty() {
-        app.status()
-    } else {
-        String::new()
-    };
-    let title = if notice.is_empty() {
-        title
-    } else {
-        format!("{title} · {}", links::sanitize(&notice))
-    };
     let pdf_block = document_block(
         &title,
         panel_width > 0,
         !app.files.focused || panel_width == 0,
     );
-    let screen = pdf_block.inner(columns[1]);
+    let mut screen = pdf_block.inner(columns[1]);
+    if panel_width == 0 {
+        screen.height = screen.height.saturating_sub(1);
+    }
     f.render_widget(pdf_block, columns[1]);
     f.render_widget(
         Block::new().style(Style::default().bg(Color::Rgb(20, 22, 26))),
@@ -1143,22 +1065,10 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
             .get(id)
             .map(|link| &link.action)
     }) {
-        if panel_width > 0 {
-            render_link_hint(f, columns[1], action);
-        } else {
-            // Kitty placements occupy the entire image row. Never draw text
-            // over them: put the hint in the reserved header instead.
-            let area = ratatui::layout::Rect::new(columns[1].x, columns[1].y, columns[1].width, 1);
-            let hint = format!(" {} · {}", title, app.status().trim());
-            f.render_widget(
-                Paragraph::new(hint).style(
-                    Style::default()
-                        .fg(Color::Rgb(110, 205, 192))
-                        .bg(Color::Rgb(25, 29, 36)),
-                ),
-                area,
-            );
-        }
+        render_link_hint(f, columns[1], action);
+    } else {
+        let notice = app.footer_notice();
+        render_footer_notice(f, columns[1], &notice);
     }
     #[cfg(feature = "typst")]
     if let Some(error) = &app.compile_error {
@@ -1185,7 +1095,22 @@ fn document_block(title: &str, framed: bool, active: bool) -> Block<'static> {
     }
 }
 
-// Use the existing bottom border: hovering never changes raster geometry.
+fn render_footer_notice(f: &mut Frame<'_>, panel: ratatui::layout::Rect, notice: &str) {
+    if notice.is_empty() || panel.height < 2 || panel.width < 4 {
+        return;
+    }
+    let area = ratatui::layout::Rect::new(panel.x + 1, panel.bottom() - 1, panel.width - 2, 1);
+    f.render_widget(
+        Paragraph::new(format!(" {} ", links::sanitize(notice))).style(
+            Style::default()
+                .fg(Color::Rgb(180, 192, 211))
+                .bg(Color::Rgb(20, 22, 26)),
+        ),
+        area,
+    );
+}
+
+// The footer is outside Kitty placements, including the borderless layout.
 fn render_link_hint(f: &mut Frame<'_>, panel: ratatui::layout::Rect, action: &LinkAction) {
     if panel.width < 8 || panel.height < 2 {
         return;
@@ -1317,14 +1242,14 @@ fn viewer_loop(
     // In safe mode skip the graphics query entirely.
     let picker = terminal::picker()?;
     if env::var("LEAFVIEW_DEBUG").is_ok() {
-        eprintln!(
+        diagnostics::log(format_args!(
             "leafview: protocol={:?} font={:?} tmux_env={:?} term={:?} term_program={:?} graphics_safe={graphics_safe}",
             picker.protocol_type(),
             picker.font_size(),
             env::var("TMUX").is_ok(),
             env::var("TERM").ok(),
             env::var("TERM_PROGRAM").ok(),
-        );
+        ));
     }
     // Do not feed unsolicited mouse/focus reports into the capability parser.
     // Enable reporting only after its terminal query has finished.
@@ -1333,7 +1258,6 @@ fn viewer_loop(
         event::EnableFocusChange,
         event::EnableMouseCapture
     )?;
-    let backend = picker.protocol_type();
     let font = picker.font_size();
     let (tx_completed, completed) = mpsc::sync_channel(1);
     let renderer = Renderer::new(tx_completed)?;
@@ -1430,11 +1354,11 @@ fn viewer_loop(
             }
         }
         if env::var_os("LEAFVIEW_PERF").is_some() {
-            eprintln!(
+            diagnostics::log(format_args!(
                 "leafview encode page={} elapsed_ms={:.2}",
                 geometry.page + 1,
                 started.elapsed().as_secs_f64() * 1000.
-            );
+            ));
         }
         (geometry, result)
     });
@@ -1516,8 +1440,6 @@ fn viewer_loop(
         compile_error: None,
         dirty: true,
         loading: false,
-        backend,
-        graphics_safe,
         last_render_at: None,
         render_due: None,
     };
@@ -1902,6 +1824,29 @@ mod graphics_safety_tests {
         assert!(!snapshot.contains(['│', '─', '┌', '┘']));
         if let Ok(path) = std::env::var("LEAFVIEW_HEADER_SNAPSHOT") {
             std::fs::write(path, snapshot).unwrap();
+        }
+    }
+
+    #[test]
+    fn footer_notice_stays_below_document() {
+        use super::*;
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 8)).unwrap();
+        terminal
+            .draw(|f| {
+                f.render_widget(document_block("PDF · document.pdf", false, true), f.area());
+                render_footer_notice(f, f.area(), "Compiling…");
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let rows = (0..8)
+            .map(|y| (0..60).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>();
+        assert!(rows[0].contains("document.pdf"));
+        assert!(!rows[0].contains("Compiling"));
+        assert!(rows[7].contains("Compiling"));
+        if let Ok(path) = std::env::var("LEAFVIEW_FOOTER_SNAPSHOT") {
+            std::fs::write(path, rows.join("\n")).unwrap();
         }
     }
 

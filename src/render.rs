@@ -439,12 +439,12 @@ fn cached(
     let started = std::time::Instant::now();
     let image = Arc::new(rasterize(path, key.page, key.width, cancelled)?);
     if std::env::var_os("LEAFVIEW_PERF").is_some() {
-        eprintln!(
+        crate::diagnostics::log(format_args!(
             "leafview raster page={} width={} elapsed_ms={:.2}",
             key.page + 1,
             key.width,
             started.elapsed().as_secs_f64() * 1000.
-        );
+        ));
     }
     if !cancelled() {
         cache.lock().unwrap().insert(key, image.clone());
