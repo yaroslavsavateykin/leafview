@@ -5,6 +5,8 @@ mod compile_config;
 mod compile_settings;
 mod diagnostics;
 mod document;
+#[cfg(feature = "editor")]
+mod editor;
 mod files;
 mod kitty;
 #[cfg(test)]
@@ -56,6 +58,8 @@ use workers::Worker;
 mod welcome;
 
 struct App {
+    #[cfg(feature = "editor")]
+    editor: editor::Editor,
     workspace_history: Vec<(PathBuf, PathBuf)>,
     files: files::Files,
     terminal_size: Size,
@@ -204,17 +208,30 @@ impl App {
     }
     fn geometry(&mut self, screen: ratatui::layout::Size) {
         self.terminal_size = screen;
-        let framed = self.files.width(screen.width) > 0;
-        let area = Viewport {
-            width: u32::from(
-                screen
-                    .width
-                    .saturating_sub(self.files.width(screen.width))
-                    .saturating_sub(if framed { 2 } else { 0 }),
+        let panel_width = self.files.width(screen.width);
+        let content = ratatui::layout::Rect::new(
+            panel_width,
+            0,
+            screen.width.saturating_sub(panel_width),
+            screen.height,
+        );
+        #[cfg(feature = "editor")]
+        let content = {
+            let area = editor_regions(
+                content,
+                self.editor.visible,
+                self.editor.horizontal,
+                self.editor.ratio,
             )
-            .saturating_mul(self.font_width)
-            .clamp(1, 3400),
-            height: u32::from(screen.height.saturating_sub(2))
+            .1;
+            area
+        };
+        let framed = panel_width > 0;
+        let area = Viewport {
+            width: u32::from(content.width.saturating_sub(if framed { 2 } else { 0 }))
+                .saturating_mul(self.font_width)
+                .clamp(1, 3400),
+            height: u32::from(content.height.saturating_sub(2))
                 .saturating_mul(self.font_height)
                 .clamp(1, 2400),
         };
@@ -224,7 +241,117 @@ impl App {
             self.dirty = true;
         }
     }
+    #[cfg(feature = "editor")]
+    fn focus_pane(&mut self, direction: char) {
+        let area =
+            ratatui::layout::Rect::new(0, 0, self.terminal_size.width, self.terminal_size.height);
+        let width = self.files.width(area.width);
+        let side = ratatui::layout::Rect::new(0, 0, width, area.height);
+        let [tree, recent] = self.files.panels(side);
+        let (source, pdf) = editor_regions(
+            ratatui::layout::Rect::new(width, 0, area.width.saturating_sub(width), area.height),
+            self.editor.visible,
+            self.editor.horizontal,
+            self.editor.ratio,
+        );
+        let panes = [tree, recent, source, pdf];
+        let current = if self.editor.visible && self.editor.focused {
+            2
+        } else if self.files.focused && width > 0 {
+            usize::from(self.files.recent_focused)
+        } else {
+            3
+        };
+        let next = editor::focus::neighbor(&panes, current, direction);
+        self.editor.focused = next == 2;
+        self.files.focused = next < 2;
+        if next < 2 {
+            self.files.recent_focused = next == 1;
+        }
+        self.files.clear_hover();
+        self.pointer = None;
+        self.hovered = None;
+        self.hover_deadline = None;
+        self.dirty = true;
+    }
     fn on_key(&mut self, key: KeyEvent) -> bool {
+        if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+            return false;
+        }
+        #[cfg(feature = "editor")]
+        if key.code == KeyCode::F(2) {
+            self.files.visible = !self.files.visible;
+            if !self.files.visible {
+                self.files.focused = false;
+            }
+            self.files.clear_hover();
+            self.geometry(self.terminal_size);
+            self.dirty = true;
+            return false;
+        }
+        #[cfg(feature = "editor")]
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            || (key.code == KeyCode::Backspace
+                && (!self.editor.focused || self.editor.vim.mode == editor::vim::Mode::Normal))
+        {
+            let direction = match key.code {
+                KeyCode::Backspace => Some('h'),
+                KeyCode::Char('h') | KeyCode::Left => Some('h'),
+                KeyCode::Char('j') | KeyCode::Down => Some('j'),
+                KeyCode::Char('k') | KeyCode::Up => Some('k'),
+                KeyCode::Char('l') | KeyCode::Right => Some('l'),
+                _ => None,
+            };
+            #[cfg(feature = "typst")]
+            let modal = self.settings.is_some();
+            #[cfg(not(feature = "typst"))]
+            let modal = false;
+            if let Some(direction) = direction.filter(|_| !modal) {
+                self.focus_pane(direction);
+                return false;
+            }
+        }
+        #[cfg(feature = "editor")]
+        {
+            if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                if !self.editor.dirty() || self.editor.exit_confirmation {
+                    return true;
+                }
+                self.editor.exit_confirmation = true;
+                self.editor.message =
+                    "Unsaved changes · Ctrl+C again: discard and exit · :w: save".into();
+                self.editor.visible = true;
+                self.editor.focused = true;
+                self.geometry(self.terminal_size);
+                self.dirty = true;
+                return false;
+            }
+            self.editor.exit_confirmation = false;
+            if key.code == KeyCode::F(4) {
+                if self.editor.visible {
+                    self.editor.visible = false;
+                    self.editor.focused = false;
+                } else {
+                    self.files.visible = true;
+                    self.files.focused = false;
+                    self.editor.open(&self.source);
+                }
+                self.geometry(self.terminal_size);
+                self.dirty = true;
+                return false;
+            }
+            if self.editor.visible && key.code == KeyCode::F(6) {
+                self.editor.focused = !self.editor.focused;
+                self.dirty = true;
+                return false;
+            }
+            if self.editor.visible && self.editor.focused {
+                self.editor.key(key);
+                self.geometry(self.terminal_size);
+                self.dirty = true;
+                return false;
+            }
+        }
         if self.source.is_dir() && key.modifiers.is_empty() {
             if let KeyCode::Char(c @ '1'..='9') = key.code {
                 if let Some((root, path)) = self
@@ -725,6 +852,41 @@ impl App {
         if self.settings.is_some() {
             return;
         }
+        #[cfg(feature = "editor")]
+        if self.editor.visible {
+            let sidebar = self.files.width(self.terminal_size.width);
+            let (source, _) = editor_regions(
+                ratatui::layout::Rect::new(
+                    sidebar,
+                    0,
+                    self.terminal_size.width.saturating_sub(sidebar),
+                    self.terminal_size.height,
+                ),
+                true,
+                self.editor.horizontal,
+                self.editor.ratio,
+            );
+            if source.contains((event.column, event.row).into()) {
+                if event.kind == MouseEventKind::Down(MouseButton::Left) {
+                    self.editor.focused = true;
+                    self.files.focused = false;
+                    self.dirty = true;
+                }
+                self.editor.mouse(event, source);
+                self.pointer = None;
+                self.hovered = None;
+                self.dirty = true;
+                return;
+            }
+            if event.kind == MouseEventKind::Down(MouseButton::Left) {
+                self.editor.focused = false;
+                self.dirty = true;
+            }
+        }
+        #[cfg(feature = "typst")]
+        if self.settings.is_some() {
+            return;
+        }
         let panel_width = self.files.width(self.terminal_size.width);
         if matches!(event.kind, MouseEventKind::Moved)
             && self.files.hover_recent(
@@ -995,10 +1157,52 @@ impl App {
     }
 }
 
+#[cfg(feature = "editor")]
+fn editor_regions(
+    area: ratatui::layout::Rect,
+    visible: bool,
+    horizontal: bool,
+    ratio: u16,
+) -> (ratatui::layout::Rect, ratatui::layout::Rect) {
+    if !visible {
+        return (ratatui::layout::Rect::default(), area);
+    }
+    let layout = if horizontal {
+        Layout::vertical([
+            Constraint::Percentage(ratio.clamp(20, 80)),
+            Constraint::Min(0),
+        ])
+    } else {
+        Layout::horizontal([
+            Constraint::Percentage(ratio.clamp(20, 80)),
+            Constraint::Min(0),
+        ])
+    };
+    let parts = layout.split(area);
+    (parts[0], parts[1])
+}
+
 fn ui(f: &mut Frame<'_>, app: &mut App) {
-    let panel_width = app.files.width(f.area().width);
-    let columns =
-        Layout::horizontal([Constraint::Length(panel_width), Constraint::Min(1)]).split(f.area());
+    let area = f.area();
+    let panel_width = app.files.width(area.width);
+    let parts =
+        Layout::horizontal([Constraint::Length(panel_width), Constraint::Min(1)]).split(area);
+    #[cfg(feature = "editor")]
+    let preview = {
+        let (source, preview) = editor_regions(
+            parts[1],
+            app.editor.visible,
+            app.editor.horizontal,
+            app.editor.ratio,
+        );
+        if app.editor.visible {
+            app.editor.render(f, source);
+        }
+        preview
+    };
+    #[cfg(not(feature = "editor"))]
+    let preview = parts[1];
+    let columns = [parts[0], preview];
     if panel_width > 0 {
         app.files.render(f, columns[0], &app.source);
     }
@@ -1022,7 +1226,16 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
     let pdf_block = document_block(
         &title,
         panel_width > 0,
-        !app.files.focused || panel_width == 0,
+        (!app.files.focused || panel_width == 0) && {
+            #[cfg(feature = "editor")]
+            {
+                !app.editor.focused
+            }
+            #[cfg(not(feature = "editor"))]
+            {
+                true
+            }
+        },
     );
     let mut screen = pdf_block.inner(columns[1]);
     if panel_width == 0 {
@@ -1302,8 +1515,8 @@ fn viewer_loop(
             let mut padded = image::RgbaImage::new(padded_width, padded_height);
             let stride = padded_width as usize * 4;
             let source_stride = source.width() as usize * 4;
-            for (destination, source) in padded
-                .as_mut()
+            let pixels: &mut [u8] = padded.as_mut();
+            for (destination, source) in pixels
                 .chunks_mut(stride)
                 .zip(source.as_raw().chunks(source_stride))
             {
@@ -1386,6 +1599,8 @@ fn viewer_loop(
         files.record(&path);
     }
     let mut app = App {
+        #[cfg(feature = "editor")]
+        editor: editor::Editor::new(),
         workspace_history: files.workspace_history(),
         files,
         terminal_size: Size::default(),
@@ -1469,6 +1684,10 @@ fn viewer_loop(
         }
         #[cfg(feature = "typst")]
         app.consume_live();
+        #[cfg(feature = "editor")]
+        if app.editor.poll() {
+            app.dirty = true;
+        }
         if app.files.poll() {
             app.dirty = true;
         }
@@ -1847,6 +2066,23 @@ mod graphics_safety_tests {
         assert!(rows[7].contains("Compiling"));
         if let Ok(path) = std::env::var("LEAFVIEW_FOOTER_SNAPSHOT") {
             std::fs::write(path, rows.join("\n")).unwrap();
+        }
+    }
+
+    #[cfg(feature = "editor")]
+    #[test]
+    fn source_is_between_tree_and_pdf() {
+        for width in [0, 1, 48, 80, 120, 201] {
+            let sidebar = if width >= 48 {
+                (width / 3).clamp(22, 38)
+            } else {
+                0
+            };
+            let content = ratatui::layout::Rect::new(sidebar, 0, width - sidebar, 30);
+            let (source, pdf) = super::editor_regions(content, true, false, 50);
+            assert_eq!(source.x, sidebar);
+            assert_eq!(source.right(), pdf.x);
+            assert_eq!(pdf.right(), width);
         }
     }
 

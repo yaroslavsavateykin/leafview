@@ -363,6 +363,15 @@ footer row outside the PDF image. Compile diagnostics appear once in the error
 panel. Optional `LEAFVIEW_DEBUG`/`LEAFVIEW_PERF` diagnostics are written only to
 `LEAFVIEW_LOG` when that path is set, never over the terminal UI.
 
+## Experimental native source editor (Helix Core)
+
+Build with `cargo build --release --features typst,editor`. While viewing a Typst
+file, F4 opens/hides the source pane; F6 switches source/PDF focus. `:w` saves
+asynchronously and the existing Typst watcher recompiles the saved source.
+The editor is opt-in and is **not yet a complete Vim/LSP IDE**. Implemented
+commands, architecture, measured 1/10/100 MiB performance and explicit remaining
+limitations are documented in [EDITOR-HELIX-STATUS.md](EDITOR-HELIX-STATUS.md).
+
 ## SSH and Kitty graphics
 
 Run Leafview **on the server**, from a local terminal supporting Kitty graphics
