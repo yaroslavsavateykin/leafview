@@ -14,7 +14,7 @@ pub struct Worker<I, O> {
     thread: Option<JoinHandle<()>>,
 }
 impl<I: Send + 'static, O: Send + 'static> Worker<I, O> {
-    pub fn new(f: impl Fn(I, &AtomicBool) -> O + Send + 'static) -> Self {
+    pub fn new(mut f: impl FnMut(I, &AtomicBool) -> O + Send + 'static) -> Self {
         let (tx, rx) = mpsc::sync_channel(1);
         let (done, output) = mpsc::sync_channel(1);
         let stop = Arc::new(AtomicBool::new(false));

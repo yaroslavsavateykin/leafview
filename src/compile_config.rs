@@ -411,7 +411,8 @@ pub fn parse_cli(args: Vec<OsString>) -> Result<(PathBuf, Flags)> {
         ("--features", "features"),
         ("--pretty", "pretty"),
         ("--no-pdf-tags", "no_tags"),
-        ("--no-pdf", "no_pdf"),
+        ("--output", "output"),
+        ("--write-pdf", "no_pdf"),
         ("--pdf-standard", "standards"),
         ("--pages", "pages"),
     ];
@@ -460,7 +461,7 @@ pub fn parse_cli(args: Vec<OsString>) -> Result<(PathBuf, Flags)> {
                 "--ignore-embedded-fonts",
                 "--pretty",
                 "--no-pdf-tags",
-                "--no-pdf",
+                "--write-pdf",
             ]
             .contains(&text.as_ref())
             && !(text.starts_with("-j") && text.len() > 2 && !text.starts_with("--"));
@@ -507,6 +508,32 @@ mod tests {
         std::fs::write(&global, "{invalid").unwrap();
         assert!(s.save().is_err());
         assert_eq!(std::fs::read_to_string(global).unwrap(), "{invalid");
+    }
+    #[test]
+    fn pdf_export_default_and_cli_override() {
+        let (_, flags) = parse_cli(vec!["main.typ".into()]).unwrap();
+        let mut value = Effective::default();
+        flags.apply(&mut value);
+        assert!(value.options.no_pdf);
+        let (_, flags) = parse_cli(vec!["main.typ".into(), "--write-pdf".into()]).unwrap();
+        flags.apply(&mut value);
+        assert!(!value.options.no_pdf);
+        let flags = Flags {
+            write_pdf: Some(false),
+            ..Default::default()
+        };
+        flags.apply(&mut value);
+        assert!(value.options.no_pdf);
+        let (_, flags) = parse_cli(vec![
+            "main.typ".into(),
+            "--write-pdf".into(),
+            "--output".into(),
+            "result.pdf".into(),
+        ])
+        .unwrap();
+        flags.apply(&mut value);
+        assert!(!value.options.no_pdf);
+        assert_eq!(value.options.output, Some("result.pdf".into()));
     }
     #[test]
     fn paths_remain_literal_in_editor_and_saved_file() {

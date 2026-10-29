@@ -109,6 +109,7 @@ previous: do not mistake it for the requested page.
 
 ```sh
 leafview main.typ
+# Or: leafview *.typ (when exactly one .typ file matches)
 leafview main.typ --input mode=teacher
 leafview typst main.typ  # legacy syntax remains supported
 leafview typst "./notes with spaces/lecture.typ"
@@ -137,12 +138,15 @@ build dependencies and a roughly 47 MiB release executable.
 After a save, dependency events are debounced for 200 ms. One compiler is reused
 for incremental compilation; at most one job is running and one latest request
 is pending. Newer edits invalidate older results. PDF and source coordinates
-always come from the same compiled layout. By default successful current builds
-**atomically replace `main.pdf` beside `main.typ`**, including an existing PDF.
-Compilation and preview still use a private snapshot; publishing only adds a file
-copy, not another compile/render. Use `leafview typst main.typ --no-pdf` to keep
-output private and leave any existing `main.pdf` untouched. Failed or superseded
-builds do not replace the exported file; own PDF writes do not trigger a rebuild.
+always come from the same compiled layout. By default builds use a **private
+preview snapshot**: opening or selecting a `.typ` does not create or overwrite
+`main.pdf` beside the source. Run `leafview main.typ` (or `leafview *.typ` when
+there is exactly one matching file). Use `leafview main.typ --write-pdf` to opt
+into atomic PDF export, or enable Write PDF in compilation settings. A previously
+saved Export PDF setting is still respected. Disable Export PDF in settings to
+return to private preview. `--no-pdf` has been removed.
+Failed or superseded builds do not replace exported files; own PDF writes do not
+trigger a rebuild.
 Compilation errors
 keep the previous PDF visible; fix and save again, or press `r` to retry. An
 initial error shows a blank placeholder until compilation succeeds.
@@ -172,7 +176,9 @@ Not all CLI side effects fit a live PDF viewer: `--deps`, `--deps-format`,
 non-PDF output formats and a positional output path are **explicitly rejected**,
 not forwarded or silently ignored. Use `typst compile/watch` for these exports
 or server features. LeafView does not claim full Typst CLI flag compatibility.
-`--no-pdf` is a LeafView-specific option, not a Typst compiler flag.
+`--write-pdf` and `--output PATH` are LeafView-specific options. Output paths
+are relative to the source directory unless absolute. In compilation settings
+(`o`), use **Export PDF** and **Output PDF path** to control publication and filename.
 
 | Key in Typst mode | Action |
 | --- | --- |
@@ -351,6 +357,47 @@ Ctrl-C is handled as an ordinary clean exit. A system-level
 SIGKILL, OOM kill, or a crash inside Ghostty itself cannot be handled by an
 application's cleanup code.
 
+## SSH and Kitty graphics
+
+Run Leafview **on the server**, from a local terminal supporting Kitty graphics
+with Unicode placeholders (for example Kitty). Both queries and lossless PNG
+images travel inline through the SSH terminal stream (`t=d`); no shared filesystem,
+X forwarding, remote control socket or copying PDFs to the client is required.
+The server still needs Leafview, Poppler and util-linux installed.
+
+```sh
+ssh -t server 'leafview /path/to/document.pdf'
+# If capability negotiation is blocked but the client is known to support Kitty:
+ssh -t server 'LEAFVIEW_GRAPHICS=kitty leafview /path/to/document.pdf'
+# A slow connection can use a longer capability-query timeout (100..15000 ms):
+ssh -t server 'LEAFVIEW_QUERY_TIMEOUT_MS=5000 leafview /path/to/document.pdf'
+```
+
+SSH sessions detected via `SSH_CONNECTION` or `SSH_TTY` use a 3-second query
+budget; local sessions use 1 second. `kitty` explicitly forces the graphics
+backend, but still queries cell size; prefer automatic negotiation. A PTY is
+required (`ssh -t`), and the SSH session must preserve escape sequences and UTF-8.
+A terminal implementing only part of the Kitty protocol may not support the
+Unicode placements used here. Do not force Kitty on unsupported clients.
+
+With tmux on the server, use a recent tmux and configure:
+
+```tmux
+set -g allow-passthrough on
+set -g focus-events on
+```
+
+The first display transmits PNG data; revisiting cached views uses terminal-side
+images without retransmitting them. Network throughput still bounds cold-page
+latency. Reattaching from another client invalidates upload state on focus;
+press `r` if focus forwarding is unavailable. Cleanup deletes only Leafview's
+32 image slots. The protocol uses no server-local image filenames.
+
+Verification: `python3 scripts/ssh-kitty-smoke.py` emulates a Kitty client over a
+PTY with 1.2-second query latency, direct/tmux framing, inline PNG transport and
+focus-triggered re-upload. This is **not** a real SSH/network or visual terminal
+test; those remain to be checked on the target client/server.
+
 ## Terminals and tmux
 
 Ghostty 1.3 development build with tmux 3.6 has been visually tested, including
@@ -360,8 +407,8 @@ Kitty itself, Sixel and iTerm2 have **NOT TESTED** status; see VERIFICATION.md.
 Capability negotiation is delegated to ratatui-image 11.0.8. `TMUX` alone is not
 proof of graphics support. The library may enable `allow-passthrough` on the
 current pane during detection. Kitty Unicode placeholders constrain images to
-the pane. Leafview reuses its own process-specific image ID and deletes only that
-image on normal exit; it does not delete other panes' graphics.
+the pane. Leafview uses 32 process-owned image slots and deletes only those slots on
+normal exit; it does not delete other panes' graphics.
 
 For automatic repaint after attaching a **new outer terminal**, enable focus
 forwarding in your tmux configuration:
@@ -438,6 +485,15 @@ repeatable real-terminal checklist. `scripts/publish-private.sh` is an optional
 maintainer helper, never required for installation or daily use; it only creates
 private repositories and refuses to modify an existing remote repository.
 The Leafview repository itself is now public by the author's choice.
+
+## Start screen and recent workspaces
+
+Launching `leafview` without a document (or with a directory) shows “Ничего не
+выбрано”, not a blank PDF page. Select a file in the tree/Recent and press Enter,
+or press 1–9 on the welcome screen to reopen a recent workspace. Workspace history
+stores the browser folder and document in `leafview/workspaces.json` alongside
+`recent.json` under the XDG state directory. Old Recent entries remain usable.
+No document is automatically opened or exported on this screen.
 
 ## Troubleshooting
 

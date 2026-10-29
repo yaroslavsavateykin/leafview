@@ -31,8 +31,7 @@ impl View {
             return false;
         }
         self.page = next;
-        self.x = 0;
-        self.y = 0;
+        // Page turns preserve zoom and pan; the renderer clamps to page bounds.
         true
     }
     pub fn go_to(&mut self, page_1_based: u32) -> bool {
@@ -41,8 +40,6 @@ impl View {
             return false;
         }
         self.page = next;
-        self.x = 0;
-        self.y = 0;
         true
     }
     pub fn adjust_zoom(&mut self, delta: f32) -> bool {
@@ -130,6 +127,33 @@ mod tests {
         assert!(!v.step_page(1));
         assert!(v.go_to(1));
         assert_eq!(v.page, 0);
+    }
+    #[test]
+    fn page_navigation_preserves_zoom_and_pan() {
+        let mut view = View::new(5);
+        view.adjust_zoom(1.0);
+        view.scroll(320, 640);
+        for delta in [1, 1, -1, -1, -1, 4, 1] {
+            view.step_page(delta);
+            assert_eq!((view.zoom, view.x, view.y), (2.0, 320, 640));
+        }
+        for page in [1, 3, 5, 999, 0] {
+            view.go_to(page);
+            assert_eq!((view.zoom, view.x, view.y), (2.0, 320, 640));
+        }
+        assert_eq!(
+            crop_bounds(
+                400,
+                500,
+                Viewport {
+                    width: 300,
+                    height: 400
+                },
+                view.x,
+                view.y
+            ),
+            (100, 100, 300, 400)
+        );
     }
     #[test]
     fn scroll_never_underflows() {

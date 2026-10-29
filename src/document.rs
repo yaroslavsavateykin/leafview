@@ -1,6 +1,7 @@
 //! Immutable snapshots; failed reloads never replace the current document.
 use anyhow::{bail, Context, Result};
 use std::{
+    hash::{Hash, Hasher},
     io::{Read, Seek, SeekFrom, Write},
     path::Path,
     process::Command,
@@ -26,6 +27,7 @@ impl Document {
         let mut snapshot = NamedTempFile::new()?;
         let mut buffer = vec![0; 64 * 1024];
         let mut copied = 0;
+        let mut fingerprint = std::collections::hash_map::DefaultHasher::new();
         loop {
             if cancelled() {
                 bail!("cancelled");
@@ -38,6 +40,7 @@ impl Document {
             if copied > 512 * 1024 * 1024 {
                 bail!("PDF exceeds snapshot limit");
             }
+            fingerprint.write(&buffer[..count]);
             snapshot.write_all(&buffer[..count])?;
         }
         let after = input.metadata()?;
@@ -60,7 +63,26 @@ impl Document {
             })
             .filter(|&n| n > 0)
             .context("pdfinfo did not report a valid page count")?;
-        let links = crate::links::LinkIndex::load(snapshot.path(), cancelled);
+        copied.hash(&mut fingerprint);
+        // Cache by immutable PDF contents, not path/mtime: Typst writes a new
+        // temporary path for every compilation, and atomic saves reuse names.
+        static CACHE: std::sync::OnceLock<
+            std::sync::Mutex<lru::LruCache<u64, crate::links::LinkIndex>>,
+        > = std::sync::OnceLock::new();
+        let cache = CACHE.get_or_init(|| {
+            std::sync::Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(8).unwrap()))
+        });
+        let key = fingerprint.finish();
+        let cached = cache.lock().unwrap().get(&key).cloned();
+        let links = if let Some(links) = cached {
+            links
+        } else {
+            let links = crate::links::LinkIndex::load(snapshot.path(), &cancelled);
+            if links.error.is_none() && !cancelled() {
+                cache.lock().unwrap().put(key, links.clone());
+            }
+            links
+        };
         Ok(Self {
             links,
             snapshot,

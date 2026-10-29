@@ -33,7 +33,7 @@ struct Cache {
 impl Cache {
     fn new(limit: usize) -> Self {
         Self {
-            images: LruCache::new(NonZeroUsize::new(8).unwrap()),
+            images: LruCache::new(NonZeroUsize::new(64).unwrap()),
             bytes: 0,
             limit,
         }
@@ -41,7 +41,7 @@ impl Cache {
     // Speculation must never evict a useful raster, especially the visible page.
     fn insert_prefetched(&mut self, key: Key, image: Arc<DynamicImage>) {
         if !self.images.contains(&key)
-            && self.images.len() < 8
+            && self.images.len() < 64
             && self.bytes.saturating_add(image.as_bytes().len()) <= self.limit
         {
             self.insert(key, image);
@@ -55,7 +55,7 @@ impl Cache {
         if size > self.limit {
             return;
         }
-        while self.bytes + size > self.limit || self.images.len() == 8 {
+        while self.bytes + size > self.limit || self.images.len() == 64 {
             if let Some((_, old)) = self.images.pop_lru() {
                 self.bytes -= old.as_bytes().len();
             } else {
@@ -110,7 +110,7 @@ impl Renderer {
         let desired_raster = raster_key.clone();
         let hint_pending = Arc::new(AtomicUsize::new(0));
         let prefetch_busy = Arc::new(AtomicBool::new(false));
-        let cache: Arc<Mutex<Cache>> = Arc::new(Mutex::new(Cache::new(96 * 1024 * 1024)));
+        let cache: Arc<Mutex<Cache>> = Arc::new(Mutex::new(Cache::new(256 * 1024 * 1024)));
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(2)
             .thread_name(|i| format!("leafview-raster-{i}"))
@@ -255,13 +255,7 @@ impl Renderer {
                         .images
                         .iter()
                         .map(|(&k, _)| k)
-                        .filter(|k| {
-                            k.revision != key.revision
-                                || (k.width != key.width
-                                    && (k.page != key.page
-                                        || k.width.abs_diff(key.width) > req.viewport.width / 5))
-                                || k.page.abs_diff(key.page) > 3
-                        })
+                        .filter(|k| k.revision != key.revision)
                         .collect();
                     for old in obsolete {
                         if let Some(image) = cache.images.pop(&old) {
@@ -273,12 +267,18 @@ impl Renderer {
                 // background workers can run Poppler alongside the visible render.
                 // A new request cancels obsolete work; only one batch is queued.
                 if !prefetch_busy.swap(true, Ordering::SeqCst) {
-                    let (cache, stopped, generation, busy) =
-                        (wc.clone(), ws.clone(), wg.clone(), prefetch_busy.clone());
+                    let (cache, stopped, desired, busy) = (
+                        wc.clone(),
+                        ws.clone(),
+                        desired_raster.clone(),
+                        prefetch_busy.clone(),
+                    );
                     pool.spawn(move || {
                         let cancelled = || {
                             stopped.load(Ordering::SeqCst)
-                                || generation.load(Ordering::SeqCst) != req.generation
+                                || desired.lock().unwrap().is_none_or(|current| {
+                                    current.revision != key.revision || current.width != key.width
+                                })
                         };
                         let targets = speculative_keys(key, req.doc.pages, req.viewport.width);
                         for pair in targets.chunks(2) {
@@ -387,7 +387,7 @@ fn speculative_keys(key: Key, pages: u32, viewport_width: u32) -> Vec<Key> {
             targets.push(Key { width, ..key });
         }
     }
-    for distance in 2..=3 {
+    for distance in 2..=6 {
         for page in neighbors(key.page, pages, distance).into_iter().flatten() {
             targets.push(Key { page, ..key });
         }
@@ -416,7 +416,7 @@ fn prefetch(
             let ratio = key.width as f64 / current.width.max(1) as f64;
             (img.as_bytes().len() as f64 * ratio * ratio).ceil() as usize
         });
-        if cache.images.len() == 8 || cache.bytes.saturating_add(estimate) > cache.limit {
+        if cache.images.len() == 64 || cache.bytes.saturating_add(estimate) > cache.limit {
             return Ok(());
         }
     }
@@ -436,7 +436,16 @@ fn cached(
     if let Some(image) = cache.lock().unwrap().images.get(&key).cloned() {
         return Ok(image);
     }
+    let started = std::time::Instant::now();
     let image = Arc::new(rasterize(path, key.page, key.width, cancelled)?);
+    if std::env::var_os("LEAFVIEW_PERF").is_some() {
+        eprintln!(
+            "leafview raster page={} width={} elapsed_ms={:.2}",
+            key.page + 1,
+            key.width,
+            started.elapsed().as_secs_f64() * 1000.
+        );
+    }
     if !cancelled() {
         cache.lock().unwrap().insert(key, image.clone());
     }
@@ -461,7 +470,6 @@ fn rasterize(
             &width.clamp(100, 3400).to_string(),
             "-scale-to-y",
             "-1",
-            "-png",
         ])
         .arg(path);
     let mut output = crate::process::run(&mut command, 80 * 1024 * 1024, &cancelled)?;
@@ -472,7 +480,7 @@ fn rasterize(
     limits.max_image_height = Some(12000);
     limits.max_alloc = Some(96 * 1024 * 1024);
     reader.limits(limits);
-    reader.decode().context("decode bounded Poppler PNG")
+    reader.decode().context("decode bounded Poppler PPM")
 }
 #[cfg(test)]
 mod tests {
@@ -501,6 +509,47 @@ mod tests {
         assert!(cache.images.contains(&Key { page: 1, ..key }));
         assert!(!cache.images.contains(&Key { page: 7, ..key }));
     }
+    #[test]
+    #[ignore = "set LEAFVIEW_BENCH_PDF to a local PDF; measures real rendering and transport"]
+    fn profile_real_pdf() {
+        use std::time::Instant;
+        let path = std::path::PathBuf::from(
+            std::env::var_os("LEAFVIEW_BENCH_PDF").expect("LEAFVIEW_BENCH_PDF"),
+        );
+        let started = Instant::now();
+        let doc = Document::open(&path, 987).unwrap();
+        println!("open: {:?}", started.elapsed());
+        let cache = Mutex::new(Cache::new(256 * 1024 * 1024));
+        for page in [0, 14.min(doc.pages - 1), 28.min(doc.pages - 1)] {
+            let key = Key {
+                revision: 987,
+                page,
+                width: 1800,
+            };
+            let started = Instant::now();
+            let raster = cached(&cache, key, doc.snapshot_path(), &|| false).unwrap();
+            let cold = started.elapsed();
+            let started = Instant::now();
+            let _ = cached(&cache, key, doc.snapshot_path(), &|| false).unwrap();
+            let warm = started.elapsed();
+            let started = Instant::now();
+            let crop = raster.crop_imm(0, 0, raster.width(), raster.height().min(900));
+            let crop_time = started.elapsed();
+            let started = Instant::now();
+            let encoded = crate::kitty::KittyImage::new(
+                crop,
+                ratatui::layout::Size::new(100, 30),
+                123,
+                false,
+            )
+            .unwrap();
+            let encode_time = started.elapsed();
+            let started = Instant::now();
+            let _ = encoded.replay();
+            println!("page={} raster={cold:?} cached={warm:?} crop={crop_time:?} encode={encode_time:?} encoded_bytes={} replay={:?}", page + 1, encoded.encoded_len(), started.elapsed());
+        }
+    }
+
     fn fixture() -> std::path::PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sample.pdf")
     }

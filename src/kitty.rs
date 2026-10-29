@@ -2,7 +2,10 @@
 //! Unicode placements. IDs remain process-owned so cleanup cannot erase a pane.
 use anyhow::Result;
 use base64::{engine::general_purpose::STANDARD, Engine};
-use image::DynamicImage;
+use image::{
+    codecs::png::{CompressionType, FilterType, PngEncoder},
+    DynamicImage, ImageEncoder,
+};
 use ratatui::{
     buffer::{Buffer, CellDiffOption},
     layout::{Rect, Size},
@@ -11,25 +14,55 @@ use ratatui::{
 use std::{
     fmt::Write,
     num::NonZeroU16,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicU64, Ordering},
 };
+
+static TERMINAL_EPOCH: AtomicU64 = AtomicU64::new(1);
+
+/// A new SSH/tmux client has no copies of the old client's image cache.
+pub fn invalidate_terminal_cache() {
+    TERMINAL_EPOCH.fetch_add(1, Ordering::SeqCst);
+}
 
 pub struct KittyImage {
     pub size: Size,
     id: u32,
-    transfer: String,
-    sent: AtomicBool,
+    transfer: std::sync::Arc<str>,
+    sent: std::sync::Arc<AtomicU64>,
 }
 impl KittyImage {
+    pub fn encoded_len(&self) -> usize {
+        self.transfer.len()
+    }
+    pub fn id(&self) -> u32 {
+        self.id
+    }
+    // Reuse the terminal-resident image, not just its encoded PNG. All clones
+    // share upload state; a never-displayed queued image still uploads once.
+    pub fn replay(&self) -> Self {
+        Self {
+            size: self.size,
+            id: self.id,
+            transfer: self.transfer.clone(),
+            sent: self.sent.clone(),
+        }
+    }
     pub fn new(image: DynamicImage, size: Size, id: u32, tmux: bool) -> Result<Self> {
-        let mut png = std::io::Cursor::new(Vec::new());
-        image.write_to(&mut png, image::ImageFormat::Png)?;
-        let transfer = transfer(png.get_ref(), id, tmux);
+        let rgb = image.into_rgba8();
+        let mut png = Vec::new();
+        PngEncoder::new_with_quality(&mut png, CompressionType::Fast, FilterType::Sub)
+            .write_image(
+                rgb.as_raw(),
+                rgb.width(),
+                rgb.height(),
+                image::ExtendedColorType::Rgba8,
+            )?;
+        let transfer = transfer(&png, id, tmux);
         Ok(Self {
             size,
             id,
-            transfer,
-            sent: AtomicBool::new(false),
+            transfer: transfer.into(),
+            sent: std::sync::Arc::new(AtomicU64::new(0)),
         })
     }
 }
@@ -67,7 +100,8 @@ impl Widget for &KittyImage {
         let [extra, r, g, b] = self.id.to_be_bytes();
         for y in 0..height {
             let mut row = String::new();
-            if y == 0 && !self.sent.swap(true, Ordering::SeqCst) {
+            let epoch = TERMINAL_EPOCH.load(Ordering::SeqCst);
+            if y == 0 && self.sent.swap(epoch, Ordering::SeqCst) != epoch {
                 row.push_str(&self.transfer);
             }
             // Save/restore the cursor and foreground, not just its position.
@@ -424,6 +458,9 @@ mod tests {
         assert_eq!(payload, decoded);
         assert_eq!(commands.matches("m=0;").count(), 1);
         assert_eq!(commands.matches("a=T").count(), 1);
+        let replay = kitty.replay();
+        assert!(std::sync::Arc::ptr_eq(&kitty.transfer, &replay.transfer));
+        assert_eq!(replay.encoded_len(), kitty.encoded_len());
         let wrapped = transfer(&bytes, 123, true);
         assert!(wrapped.starts_with("\x1bPtmux;\x1b\x1b_G"));
         let mut buf = Buffer::empty(Rect::new(0, 0, 40, 15));
@@ -431,5 +468,19 @@ mod tests {
         assert!(buf[(0, 0)].symbol().contains("f=100"));
         (&kitty).render(buf.area, &mut buf);
         assert!(!buf[(0, 0)].symbol().contains("f=100"));
+        let mut revisited = Buffer::empty(Rect::new(0, 0, 40, 15));
+        (&replay).render(revisited.area, &mut revisited);
+        assert!(
+            !revisited[(0, 0)].symbol().contains("f=100"),
+            "cached viewport uploaded PNG again"
+        );
+        let fresh = KittyImage::new(image, Size::new(40, 15), 124, false).unwrap();
+        let queued_clone = fresh.replay();
+        let mut pending = Buffer::empty(Rect::new(0, 0, 40, 15));
+        (&queued_clone).render(pending.area, &mut pending);
+        assert!(
+            pending[(0, 0)].symbol().contains("f=100"),
+            "undisplayed cached image skipped its first upload"
+        );
     }
 }

@@ -11,6 +11,7 @@ mod link_tests;
 mod links;
 mod process;
 mod render;
+mod terminal;
 #[cfg(feature = "typst")]
 mod typst_compiler;
 #[cfg(feature = "typst")]
@@ -29,14 +30,15 @@ use document::Document;
 use links::{Destination, LinkAction, RenderGeometry};
 use notify::Watcher;
 #[cfg(feature = "typst")]
-use ratatui::widgets::{Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Borders, Clear, Wrap};
 use ratatui::{
     layout::{Constraint, Layout, Size},
     style::{Color, Style},
-    widgets::Block,
+    text::{Line, Span},
+    widgets::{Block, Paragraph},
     DefaultTerminal, Frame,
 };
-use ratatui_image::{picker::Picker, protocol::Protocol, Image, Resize};
+use ratatui_image::{protocol::Protocol, Image, Resize};
 use render::{Completed, Renderer, Request};
 use std::{
     env,
@@ -50,7 +52,10 @@ use std::{
 use view::{raster_width, View, Viewport};
 use workers::Worker;
 
+mod welcome;
+
 struct App {
+    workspace_history: Vec<(PathBuf, PathBuf)>,
     files: files::Files,
     terminal_size: Size,
     opener: Worker<(PathBuf, u64), (PathBuf, Result<Document>)>,
@@ -123,7 +128,14 @@ impl Drop for GraphicsCleanup {
         if !self.enabled {
             return;
         }
-        let seq = format!("\x1b_Ga=d,d=I,i={},q=2;\x1b\\", self.id);
+        let seq = (0..32)
+            .map(|slot| {
+                format!(
+                    "\x1b_Ga=d,d=I,i={},q=2;\x1b\\",
+                    self.id.wrapping_mul(64).wrapping_add(slot)
+                )
+            })
+            .collect::<String>();
         let seq = if self.tmux {
             format!("\x1bPtmux;{}\x1b\\", seq.replace('\x1b', "\x1b\x1b"))
         } else {
@@ -156,7 +168,7 @@ impl App {
     // still use latest-wins semantics, but we don't restart Poppler on every
     // auto-repeat and overwhelm Kitty/tmux with obsolete images.
     fn schedule(&mut self) {
-        if self.viewport.width == 0 || self.viewport.height == 0 {
+        if self.source.is_dir() || self.viewport.width == 0 || self.viewport.height == 0 {
             return;
         }
         self.loading = true;
@@ -193,16 +205,17 @@ impl App {
     }
     fn geometry(&mut self, screen: ratatui::layout::Size) {
         self.terminal_size = screen;
+        let framed = self.files.width(screen.width) > 0;
         let area = Viewport {
             width: u32::from(
                 screen
                     .width
                     .saturating_sub(self.files.width(screen.width))
-                    .saturating_sub(2),
+                    .saturating_sub(if framed { 2 } else { 0 }),
             )
             .saturating_mul(self.font_width)
             .clamp(1, 3400),
-            height: u32::from(screen.height.saturating_sub(2))
+            height: u32::from(screen.height.saturating_sub(if framed { 2 } else { 1 }))
                 .saturating_mul(self.font_height)
                 .clamp(1, 2400),
         };
@@ -213,6 +226,46 @@ impl App {
         }
     }
     fn on_key(&mut self, key: KeyEvent) -> bool {
+        if self.source.is_dir() && key.modifiers.is_empty() {
+            if let KeyCode::Char(c @ '1'..='9') = key.code {
+                if let Some((root, path)) = self
+                    .workspace_history
+                    .get(c as usize - '1' as usize)
+                    .cloned()
+                {
+                    if !self.opening {
+                        let result = if is_typst(&path) {
+                            #[cfg(feature = "typst")]
+                            {
+                                self.open_typst(&path)
+                            }
+                            #[cfg(not(feature = "typst"))]
+                            {
+                                Err(anyhow::anyhow!(
+                                    "Build with --features typst to open Typst files"
+                                ))
+                            }
+                        } else {
+                            self.opener
+                                .input
+                                .as_ref()
+                                .unwrap()
+                                .try_send((path, self.doc.revision + 1))
+                                .map_err(anyhow::Error::from)
+                                .map(|_| {
+                                    self.opening = true;
+                                })
+                        };
+                        match result {
+                            Ok(()) => self.files.restore_folder(&root),
+                            Err(error) => self.files.notice = Some(format!("{error:#}")),
+                        }
+                        self.dirty = true;
+                    }
+                }
+                return false;
+            }
+        }
         if key.kind != KeyEventKind::Press && key.kind != KeyEventKind::Repeat {
             return false;
         }
@@ -308,6 +361,7 @@ impl App {
             return false;
         }
         if matches!(key.code, KeyCode::Esc | KeyCode::F(2)) {
+            self.files.clear_hover();
             self.files.visible = !self.files.visible;
             self.files.focused = self.files.visible;
             self.image = None;
@@ -437,6 +491,7 @@ impl App {
                 }
             }
             KeyCode::Char('r') => {
+                kitty::invalidate_terminal_cache();
                 #[cfg(feature = "typst")]
                 if let Some(live) = &mut self.live {
                     live.refresh();
@@ -469,6 +524,13 @@ impl App {
         self.session = Some(session);
         self.source = path;
         self.compile_error = None;
+        self.compile_millis = 0;
+        self.image = None;
+        self.displayed = None;
+        self.image_area = ratatui::layout::Rect::default();
+        self.pointer = None;
+        self.hovered = None;
+        self.hover_deadline = None;
         self.settings = None;
         self.files.record(&self.source);
         self.files.notice = None;
@@ -531,6 +593,12 @@ impl App {
         let was_compiling = live.compiling;
         let update = live.poll();
         if was_compiling != live.compiling {
+            self.dirty = true;
+        }
+        // Diagnostics describe the last completed attempt, not the source now
+        // being compiled. Hide them during retries, including the debounce.
+        if live.compiling && self.compile_error.take().is_some() {
+            self.error = self.session.as_ref().and_then(|s| s.warning.clone());
             self.dirty = true;
         }
         let auto_sync = live.auto_sync;
@@ -659,6 +727,15 @@ impl App {
             return;
         }
         let panel_width = self.files.width(self.terminal_size.width);
+        if matches!(event.kind, MouseEventKind::Moved)
+            && self.files.hover_recent(
+                ratatui::layout::Rect::new(0, 0, panel_width, self.terminal_size.height),
+                event.column,
+                event.row,
+            )
+        {
+            self.dirty = true;
+        }
         if event.row >= self.terminal_size.height {
             return;
         }
@@ -680,7 +757,7 @@ impl App {
             }
             return;
         }
-        if self.files.focused {
+        if self.files.focused && !matches!(event.kind, MouseEventKind::Moved) {
             if !click {
                 return;
             }
@@ -951,10 +1028,6 @@ impl App {
             "Halfblocks (explicit compatibility mode) · "
         } else if self.backend == ratatui_image::picker::ProtocolType::Halfblocks {
             "Halfblocks (low resolution) · "
-        } else if self.loading {
-            "Loading (previous image)…  "
-        } else if self.reload_pending {
-            "Reloading…  "
         } else {
             ""
         };
@@ -986,6 +1059,11 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
     if panel_width > 0 {
         app.files.render(f, columns[0], &app.source);
     }
+    if app.source.is_dir() {
+        welcome::render(f, columns[1], app.files.folder(), &app.workspace_history);
+        app.files.render_recent_info(f, columns[1]);
+        return;
+    }
     let name = links::sanitize(
         &app.source
             .file_name()
@@ -999,6 +1077,12 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
         app.view.zoom * 100.0
     );
     #[cfg(feature = "typst")]
+    let title = if app.live.as_ref().is_some_and(|live| live.compiling) {
+        format!("{title} · Compiling…")
+    } else {
+        title
+    };
+    #[cfg(feature = "typst")]
     let title = if let Some(notice) = &app.settings_notice {
         format!("{title} · {}", links::sanitize(notice))
     } else {
@@ -1006,7 +1090,7 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
     };
     let notice = if app.files.focused {
         app.files.notice.clone().unwrap_or_default()
-    } else if app.error.is_some() || app.hovered.is_some() || !app.jump.is_empty() || app.loading {
+    } else if app.error.is_some() || !app.jump.is_empty() {
         app.status()
     } else {
         String::new()
@@ -1016,7 +1100,11 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
     } else {
         format!("{title} · {}", links::sanitize(&notice))
     };
-    let pdf_block = files::panel_block(&title, !app.files.focused || panel_width == 0);
+    let pdf_block = document_block(
+        &title,
+        panel_width > 0,
+        !app.files.focused || panel_width == 0,
+    );
     let screen = pdf_block.inner(columns[1]);
     f.render_widget(pdf_block, columns[1]);
     f.render_widget(
@@ -1046,14 +1134,92 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
     } else if let Some((x, y)) = app.pointer {
         app.hover_at(x, y);
     }
+    if let Some(action) = app.hovered.and_then(|id| {
+        app.displayed
+            .as_ref()?
+            .links
+            .as_ref()?
+            .links
+            .get(id)
+            .map(|link| &link.action)
+    }) {
+        if panel_width > 0 {
+            render_link_hint(f, columns[1], action);
+        } else {
+            // Kitty placements occupy the entire image row. Never draw text
+            // over them: put the hint in the reserved header instead.
+            let area = ratatui::layout::Rect::new(columns[1].x, columns[1].y, columns[1].width, 1);
+            let hint = format!(" {} · {}", title, app.status().trim());
+            f.render_widget(
+                Paragraph::new(hint).style(
+                    Style::default()
+                        .fg(Color::Rgb(110, 205, 192))
+                        .bg(Color::Rgb(25, 29, 36)),
+                ),
+                area,
+            );
+        }
+    }
     #[cfg(feature = "typst")]
     if let Some(error) = &app.compile_error {
         render_compile_error(f, screen, error);
     }
+    app.files.render_recent_info(f, columns[1]);
     #[cfg(feature = "typst")]
     if let Some(settings) = &app.settings {
         settings.render(f);
     }
+}
+
+fn document_block(title: &str, framed: bool, active: bool) -> Block<'static> {
+    if framed {
+        files::panel_block(title, active)
+    } else {
+        Block::default().title(
+            Line::from(format!(" {title} ")).style(
+                Style::default()
+                    .fg(Color::Rgb(180, 192, 211))
+                    .bg(Color::Rgb(25, 29, 36)),
+            ),
+        )
+    }
+}
+
+// Use the existing bottom border: hovering never changes raster geometry.
+fn render_link_hint(f: &mut Frame<'_>, panel: ratatui::layout::Rect, action: &LinkAction) {
+    if panel.width < 8 || panel.height < 2 {
+        return;
+    }
+    let (label, detail, color) = match action {
+        LinkAction::External(url) => (
+            "↗ Click to open",
+            links::sanitize(url),
+            Color::Rgb(110, 205, 192),
+        ),
+        LinkAction::Internal(destination) => (
+            "→ Click to follow",
+            format!("Page {} · b: back", destination.page + 1),
+            Color::Rgb(110, 205, 192),
+        ),
+        LinkAction::Unsupported(reason) => (
+            "Link unavailable",
+            links::sanitize(reason),
+            Color::Rgb(224, 182, 112),
+        ),
+    };
+    let hint = Line::from(vec![
+        Span::styled(format!(" {label} "), Style::default().fg(color)),
+        Span::styled(
+            format!("· {detail} "),
+            Style::default().fg(Color::Rgb(180, 192, 211)),
+        ),
+    ]);
+    let width = (hint.width().min(u16::MAX as usize) as u16).min(panel.width.saturating_sub(4));
+    let area = ratatui::layout::Rect::new(panel.x + 2, panel.bottom() - 1, width, 1);
+    f.render_widget(
+        Paragraph::new(hint).style(Style::default().bg(Color::Rgb(20, 22, 26))),
+        area,
+    );
 }
 
 #[cfg(feature = "typst")]
@@ -1149,11 +1315,7 @@ fn viewer_loop(
     );
     // Picker queries must occur after alternate-screen entry, before event polling.
     // In safe mode skip the graphics query entirely.
-    let picker = if graphics_safe {
-        Picker::halfblocks()
-    } else {
-        Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks())
-    };
+    let picker = terminal::picker()?;
     if env::var("LEAFVIEW_DEBUG").is_ok() {
         eprintln!(
             "leafview: protocol={:?} font={:?} tmux_env={:?} term={:?} term_program={:?} graphics_safe={graphics_safe}",
@@ -1179,22 +1341,61 @@ fn viewer_loop(
         picker.protocol_type() == ratatui_image::picker::ProtocolType::Kitty,
         tmux,
     );
-    let image_id = graphics.id;
+    // Fixed process-owned slots bound terminal memory and permit upload-free
+    // revisits. Reusing an evicted slot replaces its terminal image atomically.
+    let mut free_image_ids: Vec<u32> = (0..32)
+        .rev()
+        .map(|slot| graphics.id.wrapping_mul(64).wrapping_add(slot))
+        .collect();
+    let mut encoded_cache = lru::LruCache::new(std::num::NonZeroUsize::new(32).unwrap());
+    let mut encoded_bytes: usize = 0;
     let encoder = Worker::new(move |(geometry, image, _size): EncodeInput, _| {
+        let started = Instant::now();
+        let key = (
+            geometry.revision,
+            geometry.page,
+            geometry.raster,
+            geometry.crop,
+        );
+        if let Some(cached) = encoded_cache.get(&key) {
+            let cached: &kitty::KittyImage = cached;
+            return (geometry, Ok(DisplayImage::Kitty(cached.replay())));
+        }
         // Pad the last terminal cell instead of stretching the PDF pixels into
         // ceil-sized Kitty placements. All backends now have identical pixel scale.
         let cells = Size::new(
             image.width().div_ceil(u32::from(font.width.max(1))) as u16,
             image.height().div_ceil(u32::from(font.height.max(1))) as u16,
         );
-        let mut padded = image::DynamicImage::new_rgba8(
-            u32::from(cells.width) * u32::from(font.width.max(1)),
-            u32::from(cells.height) * u32::from(font.height.max(1)),
-        );
-        image::imageops::overlay(&mut padded, &image, 0, 0);
-        let image = padded;
+        let padded_width = u32::from(cells.width) * u32::from(font.width.max(1));
+        let padded_height = u32::from(cells.height) * u32::from(font.height.max(1));
+        let image = if image.width() == padded_width && image.height() == padded_height {
+            image
+        } else {
+            // Raster pixels are opaque. Row copies avoid per-pixel alpha blending
+            // across the entire viewport merely to pad its final terminal cell.
+            let source = image.to_rgba8();
+            let mut padded = image::RgbaImage::new(padded_width, padded_height);
+            let stride = padded_width as usize * 4;
+            let source_stride = source.width() as usize * 4;
+            for (destination, source) in padded
+                .as_mut()
+                .chunks_mut(stride)
+                .zip(source.as_raw().chunks(source_stride))
+            {
+                destination[..source_stride].copy_from_slice(source);
+            }
+            image::DynamicImage::ImageRgba8(padded)
+        };
         let size = cells;
         let result = if picker.protocol_type() == ratatui_image::picker::ProtocolType::Kitty {
+            if free_image_ids.is_empty() {
+                if let Some((_, old)) = encoded_cache.pop_lru() {
+                    encoded_bytes -= old.encoded_len();
+                    free_image_ids.push(old.id());
+                }
+            }
+            let image_id = free_image_ids.pop().expect("bounded Kitty image slot");
             // Reuse only our own ID: upstream generates a new random ID per protocol
             // and does not release terminal-side image data on Drop.
             let cells = Size::new(
@@ -1208,6 +1409,33 @@ fn viewer_loop(
                 .map(DisplayImage::Other)
                 .map_err(anyhow::Error::from)
         };
+        if let Ok(DisplayImage::Kitty(image)) = &result {
+            let bytes = image.encoded_len();
+            const ENCODED_LIMIT: usize = 64 * 1024 * 1024;
+            if bytes <= ENCODED_LIMIT {
+                while encoded_bytes + bytes > ENCODED_LIMIT || encoded_cache.len() == 32 {
+                    if let Some((_, old)) = encoded_cache.pop_lru() {
+                        encoded_bytes -= old.encoded_len();
+                        free_image_ids.push(old.id());
+                    } else {
+                        break;
+                    }
+                }
+                encoded_bytes += bytes;
+                encoded_cache.put(key, image.replay());
+            } else {
+                // Oversized transfers are not cached; their slot is reusable
+                // once this frame has been shown and the next encoding starts.
+                free_image_ids.push(image.id());
+            }
+        }
+        if env::var_os("LEAFVIEW_PERF").is_some() {
+            eprintln!(
+                "leafview encode page={} elapsed_ms={:.2}",
+                geometry.page + 1,
+                started.elapsed().as_secs_f64() * 1000.
+            );
+        }
         (geometry, result)
     });
     let reloader = Worker::new(|(path, revision): (PathBuf, u64), stop| {
@@ -1234,6 +1462,7 @@ fn viewer_loop(
         files.record(&path);
     }
     let mut app = App {
+        workspace_history: files.workspace_history(),
         files,
         terminal_size: Size::default(),
         opener: Worker::new(|(path, revision): (PathBuf, u64), stop| {
@@ -1414,12 +1643,14 @@ fn viewer_loop(
                     app.dirty = true;
                 }
                 Event::FocusLost => {
+                    app.files.clear_hover();
                     app.pointer = None;
                     app.hovered = None;
                     app.hover_deadline = None;
                     app.dirty = true;
                 }
                 Event::FocusGained => {
+                    kitty::invalidate_terminal_cache();
                     terminal.clear()?;
                     app.schedule();
                     app.dirty = true;
@@ -1608,6 +1839,71 @@ impl CommandCheck {
 #[cfg(test)]
 mod graphics_safety_tests {
     use super::use_safe_graphics;
+
+    #[test]
+    fn link_hint_renders_on_bottom_border_and_fits_small_panels() {
+        use super::*;
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(64, 6)).unwrap();
+        terminal
+            .draw(|f| {
+                render_link_hint(
+                    f,
+                    f.area(),
+                    &LinkAction::External("https://example.org".into()),
+                );
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let rendered = (0..6)
+            .map(|y| (0..64).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.lines().last().unwrap().contains("Click to open"));
+        assert!(rendered.contains("https://example.org"));
+        assert!(rendered.lines().take(5).all(|line| line.trim().is_empty()));
+        if let Ok(path) = std::env::var("LEAFVIEW_HINT_SNAPSHOT") {
+            std::fs::write(path, rendered).unwrap();
+        }
+        for width in 0..20 {
+            terminal
+                .draw(|f| {
+                    render_link_hint(
+                        f,
+                        ratatui::layout::Rect::new(0, 0, width, 2),
+                        &LinkAction::Unsupported("unsupported action".into()),
+                    );
+                })
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn document_without_sidebar_has_only_a_header() {
+        use super::*;
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 8)).unwrap();
+        terminal
+            .draw(|f| {
+                let block = document_block("PDF · test.pdf", false, true);
+                assert_eq!(
+                    block.inner(f.area()),
+                    ratatui::layout::Rect::new(0, 1, 40, 7)
+                );
+                f.render_widget(block, f.area());
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let snapshot = (0..8)
+            .map(|y| (0..40).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(snapshot.contains("PDF · test.pdf"));
+        assert!(!snapshot.contains(['│', '─', '┌', '┘']));
+        if let Ok(path) = std::env::var("LEAFVIEW_HEADER_SNAPSHOT") {
+            std::fs::write(path, snapshot).unwrap();
+        }
+    }
 
     #[test]
     fn low_resolution_requires_explicit_opt_in() {

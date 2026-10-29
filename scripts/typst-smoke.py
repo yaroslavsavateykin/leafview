@@ -33,9 +33,9 @@ with tempfile.TemporaryDirectory(prefix='leafview-live-') as tmp:
     sentinel = b'EXISTING PDF MUST REMAIN UNTOUCHED'
     if args.no_pdf:
         pdf.write_bytes(sentinel)
-    command = [str(root / 'target/release/leafview'), 'typst', str(project / 'main.typ')]
-    if args.no_pdf:
-        command.append('--no-pdf')
+    command = [str(root / 'target/release/leafview'), str(project / 'main.typ')]
+    if not args.no_pdf:
+        command.append('--write-pdf')
     proc = subprocess.Popen(command,
                             stdin=slave, stdout=slave, stderr=slave,
                             env={**os.environ, 'LEAFVIEW_GRAPHICS': 'safe', 'LEAFVIEW_TRACE': str(trace)}, start_new_session=True)
@@ -98,6 +98,12 @@ with tempfile.TemporaryDirectory(prefix='leafview-live-') as tmp:
         assert proc.poll() is None
         assert pdf.read_bytes() == before_error_pdf, 'failed compile replaced PDF'
         output.clear()
+        # A retry must dismiss stale diagnostics during the 200 ms debounce,
+        # before a successful compiler reply can clear them as a side effect.
+        save(source)
+        pump(.12)
+        assert b'Compiling' in output, 'retry did not repaint before compilation'
+        assert b'compilation error' not in output, 'retry repainted stale error panel'
         for i in range(40):
             save(source.replace('c^2', 'c^' + str(i + 3)))
             pump(.01)

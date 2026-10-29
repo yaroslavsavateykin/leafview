@@ -206,7 +206,7 @@ impl Live {
                     {
                         if let Err(error) = publish_pdf(
                             &output,
-                            &input.with_extension("pdf"),
+                            &export_path(&input, &options)?,
                             &publication_worker,
                             || {
                                 !stop.load(Ordering::SeqCst)
@@ -442,6 +442,27 @@ impl Live {
     }
 }
 /// Stage in the destination directory: rename never exposes a partial PDF.
+fn export_path(input: &Path, options: &crate::typst_options::Options) -> Result<PathBuf> {
+    let output = options
+        .output
+        .as_ref()
+        .map(|p| {
+            if p.is_absolute() {
+                p.clone()
+            } else {
+                input.parent().unwrap_or(Path::new(".")).join(p)
+            }
+        })
+        .unwrap_or_else(|| input.with_extension("pdf"));
+    anyhow::ensure!(
+        output
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("pdf")),
+        "Output must have a .pdf extension"
+    );
+    anyhow::ensure!(output != input, "Output must not overwrite the source");
+    Ok(output)
+}
 fn publish_pdf(
     source: &Path,
     destination: &Path,
@@ -492,6 +513,19 @@ pub fn changed_range(old: &str, new: &str) -> Option<std::ops::Range<usize>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn custom_export_path_is_relative_to_source_not_cwd() {
+        let mut options = crate::typst_options::Options {
+            output: Some("report.pdf".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            super::export_path(Path::new("/project/main.typ"), &options).unwrap(),
+            PathBuf::from("/project/report.pdf")
+        );
+        options.output = Some("main.typ".into());
+        assert!(super::export_path(Path::new("/project/main.typ"), &options).is_err());
+    }
     #[test]
     fn atomic_pdf_publication_rejects_stale_result() {
         let dir = tempfile::tempdir().unwrap();

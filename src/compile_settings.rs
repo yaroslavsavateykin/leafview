@@ -123,9 +123,15 @@ const LEAFVIEW: &[Field] = &[
     },
     Field {
         key: "write_pdf",
-        label: "Save PDF beside source",
-        help: "Publish <input>.pdf after successful builds. Off = private preview only.",
+        label: "Export PDF",
+        help: "--write-pdf · Publish after successful builds. Off = private preview only.",
         kind: Kind::Toggle,
+    },
+    Field {
+        key: "output",
+        label: "Output PDF path",
+        help: "--output · Filename or path, relative to source directory. Empty = <input>.pdf. Requires Export PDF.",
+        kind: Kind::Text,
     },
     Field {
         key: "auto_sync",
@@ -906,7 +912,7 @@ mod tests {
         p.key(KeyEvent::from(KeyCode::Up), &s.input);
         assert!(!p.input_actions);
         p.key(KeyEvent::from(KeyCode::Right), &s.input);
-        assert_eq!(p.fields().len(), 3);
+        assert_eq!(p.fields().len(), 4);
         assert_eq!(p.tab, 2);
         let before = p.value.auto_compile;
         p.key(KeyEvent::from(KeyCode::Enter), &s.input);

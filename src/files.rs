@@ -26,6 +26,7 @@ pub struct Files {
     sidebar_width: Option<u16>,
     tree_height: Option<u16>,
     recent_selected: usize,
+    recent_hover: Option<(usize, u16)>,
     recent_state: ListState,
     root: PathBuf,
     expanded: BTreeSet<PathBuf>,
@@ -70,6 +71,7 @@ impl Files {
             sidebar_width: None,
             tree_height: None,
             recent_selected: 0,
+            recent_hover: None,
             recent_state: ListState::default(),
             root,
             expanded: BTreeSet::new(),
@@ -144,10 +146,37 @@ impl Files {
             _ => {}
         }
     }
+    pub fn folder(&self) -> &Path {
+        &self.root
+    }
+    pub fn workspace_history(&self) -> Vec<(PathBuf, PathBuf)> {
+        self.history_path
+            .as_ref()
+            .and_then(|p| std::fs::read(p.with_file_name("workspaces.json")).ok())
+            .filter(|b| b.len() <= 256 * 1024)
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_else(|| {
+                self.recent
+                    .iter()
+                    .filter_map(|p| p.parent().map(|root| (root.to_owned(), p.clone())))
+                    .collect()
+            })
+    }
+    pub fn restore_folder(&mut self, root: &Path) {
+        if root.is_dir() {
+            self.root = root.to_owned();
+            self.expanded.clear();
+            self.refresh();
+        }
+    }
     pub fn record(&mut self, path: &Path) {
         if !path.is_file() || !is_document(path) {
             return;
         }
+        let mut workspaces = self.workspace_history();
+        workspaces.retain(|(root, doc)| root != &self.root || doc != path);
+        workspaces.insert(0, (self.root.clone(), path.to_owned()));
+        workspaces.truncate(9);
         self.recent.retain(|p| p != path);
         self.recent.insert(0, path.to_owned());
         self.recent.truncate(20);
@@ -160,6 +189,12 @@ impl Files {
                 serde_json::to_writer(&mut file, &self.recent)?;
                 file.flush()?;
                 file.persist(target).map_err(|e| e.error)?;
+                let mut workspace_file = tempfile::NamedTempFile::new_in(parent)?;
+                serde_json::to_writer(&mut workspace_file, &workspaces)?;
+                workspace_file.flush()?;
+                workspace_file
+                    .persist(target.with_file_name("workspaces.json"))
+                    .map_err(|e| e.error)?;
                 Ok(())
             })();
             if let Err(error) = result {
@@ -297,6 +332,75 @@ impl Files {
             _ => {}
         }
         None
+    }
+    pub fn hover_recent(&mut self, area: Rect, x: u16, y: u16) -> bool {
+        let previous = self.recent_hover.take();
+        let recent = self.panels(area)[1];
+        if self.visible
+            && area.width > 0
+            && x > recent.x
+            && x < recent.right().saturating_sub(1)
+            && y > recent.y
+            && y < recent.bottom().saturating_sub(1)
+        {
+            let index = self.recent_state.offset() + usize::from(y - recent.y - 1);
+            if index < self.recent.len() {
+                self.recent_hover = Some((index, y));
+                return self.recent_hover != previous;
+            }
+        }
+        previous.is_some()
+    }
+    pub fn clear_hover(&mut self) {
+        self.recent_hover = None;
+    }
+    pub fn render_recent_info(&self, f: &mut Frame<'_>, area: Rect) {
+        if !self.visible || area.width == 0 || area.height == 0 {
+            return;
+        }
+        let Some((index, row)) = self.recent_hover else {
+            return;
+        };
+        let Some(path) = self.recent.get(index) else {
+            return;
+        };
+        let metadata = std::fs::metadata(path);
+        let detail = match metadata {
+            Ok(meta) => {
+                let modified = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.elapsed().ok())
+                    .map(|d| format!("{} min ago", d.as_secs() / 60))
+                    .unwrap_or_else(|| "unknown".into());
+                format!("{} bytes · modified {}", meta.len(), modified)
+            }
+            Err(_) => "File unavailable".into(),
+        };
+        let width = area.width.min(58);
+        let height = area.height.min(5);
+        let popup = Rect::new(
+            area.x,
+            row.clamp(area.y, area.bottom().saturating_sub(height)),
+            width,
+            height,
+        );
+        f.render_widget(ratatui::widgets::Clear, popup);
+        f.render_widget(
+            ratatui::widgets::Paragraph::new(format!(
+                "{}\n{}",
+                crate::links::sanitize(&path.display().to_string()),
+                detail
+            ))
+            .wrap(ratatui::widgets::Wrap { trim: false })
+            .style(
+                Style::default()
+                    .fg(Color::Rgb(180, 192, 211))
+                    .bg(Color::Rgb(25, 29, 36)),
+            )
+            .block(panel_block("File info", true)),
+            popup,
+        );
     }
     pub fn panels(&self, area: Rect) -> [Rect; 2] {
         let minimum = area.height.min(3);
@@ -554,6 +658,27 @@ fn append_directory(
 mod tests {
     use super::*;
     #[test]
+    fn recent_popup_tracks_pointer_without_stealing_focus() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut files = Files::new(dir.path(), true);
+        files.recent = vec![dir.path().join("report.pdf")];
+        files.focused = false;
+        let area = Rect::new(0, 0, 30, 30);
+        let row = files.panels(area)[1].y + 1;
+        assert!(files.hover_recent(area, 3, row));
+        assert_eq!(files.recent_hover, Some((0, row)));
+        assert!(!files.focused);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(90, 30)).unwrap();
+        terminal
+            .draw(|f| files.render_recent_info(f, Rect::new(30, 0, 60, 30)))
+            .unwrap();
+        assert_eq!(terminal.backend().buffer()[(30, row)].symbol(), "┌");
+        assert!(files.hover_recent(area, 50, row));
+        assert!(files.recent_hover.is_none());
+    }
+
+    #[test]
     fn tree_is_pdf_typst_sorted_and_lazy() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("chapter")).unwrap();
@@ -591,6 +716,16 @@ mod tests {
         files.record(&pdf);
         let saved: Vec<PathBuf> = serde_json::from_slice(&std::fs::read(history).unwrap()).unwrap();
         assert_eq!(saved, vec![pdf.clone()]);
+        assert_eq!(
+            files.workspace_history(),
+            vec![(dir.path().to_owned(), pdf.clone())]
+        );
+        let other = tempfile::tempdir().unwrap();
+        let mut restarted = Files::new(other.path(), true);
+        restarted.history_path = files.history_path.clone();
+        let workspaces = restarted.workspace_history();
+        restarted.restore_folder(&workspaces[0].0);
+        assert_eq!(restarted.folder(), dir.path());
         let backend = ratatui::backend::TestBackend::new(38, 14);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal.draw(|f| files.render(f, f.area(), &pdf)).unwrap();

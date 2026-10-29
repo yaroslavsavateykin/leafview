@@ -10,9 +10,16 @@ fn present<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
 // One field definition drives compiler options and partial configuration layers.
 macro_rules! options {
     ($($name:ident: $ty:ty),* $(,)?) => {
-        #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+        #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
         #[serde(default, deny_unknown_fields)]
         pub struct Options { pub inputs: Vec<(String, String)>, $(pub $name: $ty,)* }
+        impl Default for Options {
+            fn default() -> Self {
+                let mut options = Self { inputs: Vec::new(), $($name: Default::default(),)* };
+                options.no_pdf = true;
+                options
+            }
+        }
         #[derive(Clone, Debug, Default, Serialize, Deserialize)]
         #[serde(default, deny_unknown_fields)]
         pub struct Patch {
@@ -37,7 +44,7 @@ options! {
     ignore_system: bool, ignore_embedded: bool, package: Option<PathBuf>,
     cache: Option<PathBuf>, cert: Option<PathBuf>, timestamp: Option<i64>,
     jobs: Option<usize>, features: Vec<String>, pretty: bool, no_tags: bool,
-    no_pdf: bool, standards: Vec<String>, pages: Option<String>,
+    no_pdf: bool, output: Option<PathBuf>, standards: Vec<String>, pages: Option<String>,
 }
 impl Options {
     pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<(PathBuf, Self)> {
@@ -99,7 +106,8 @@ impl Options {
                 "--features" => options.features = value()?.to_string_lossy().split(',').map(str::to_owned).collect(),
                 "--pdf-standard" => options.standards.extend(value()?.to_string_lossy().split(',').map(str::to_owned)),
                 "--pages" => options.pages = Some(value()?.to_string_lossy().into_owned()),
-                "--no-pdf" => { anyhow::ensure!(inline.is_none(), "--no-pdf takes no value"); options.no_pdf = true; }
+                "--write-pdf" => { anyhow::ensure!(inline.is_none(), "--write-pdf takes no value"); options.no_pdf = false; }
+                "--output" => options.output = Some(value()?.into()),
                 "--pretty" | "--no-pdf-tags" | "--ignore-system-fonts" | "--ignore-embedded-fonts" => {
                     anyhow::ensure!(inline.is_none(), "{flag} takes no value");
                     match flag { "--pretty" => options.pretty=true, "--no-pdf-tags" => options.no_tags=true, "--ignore-system-fonts" => options.ignore_system=true, _ => options.ignore_embedded=true }
@@ -126,10 +134,35 @@ fn env_bool(key: &str) -> Result<bool> {
         _ => bail!("invalid boolean in {key}"),
     }
 }
-pub const HELP: &str = "Usage: leafview [typst] <file.typ> [OPTIONS]\n\no opens editable Compile Settings; Save file remembers flags for this document.\n\nCompilation: --root DIR, --input key=value (repeatable), --font-path DIR,\n  --ignore-system-fonts, --ignore-embedded-fonts, --package-path DIR,\n  --package-cache-path DIR, --cert PATH, --creation-timestamp SECONDS,\n  -j/--jobs N, --features LIST, --pdf-standard LIST, --pages RANGES,\n  --no-pdf-tags, --pretty, -f/--format pdf.\nUI diagnostics: --diagnostic-format human|short, --color auto|always|never\n  (accepted; LeafView always sanitizes short status messages).\n--ppi is accepted but affects PNG export only, not PDF.\nExport/server flags --deps, --deps-format, --make-deps, --timings, --open,\n  --no-serve, --no-reload, --port are rejected explicitly.\nSuccessful builds atomically update <input>.pdf beside the input.\nUse --no-pdf to keep output private (existing PDF is left untouched).\n--help/-h shows this help; --version/-V shows the embedded compiler version.";
+pub const HELP: &str = "Usage: leafview [typst] <file.typ> [OPTIONS]\n\no opens editable Compile Settings; Save file remembers flags for this document.\n\nCompilation: --root DIR, --input key=value (repeatable), --font-path DIR,\n  --ignore-system-fonts, --ignore-embedded-fonts, --package-path DIR,\n  --package-cache-path DIR, --cert PATH, --creation-timestamp SECONDS,\n  -j/--jobs N, --features LIST, --pdf-standard LIST, --pages RANGES,\n  --no-pdf-tags, --pretty, -f/--format pdf.\nUI diagnostics: --diagnostic-format human|short, --color auto|always|never\n  (accepted; LeafView always sanitizes short status messages).\n--ppi is accepted but affects PNG export only, not PDF.\nExport/server flags --deps, --deps-format, --make-deps, --timings, --open,\n  --no-serve, --no-reload, --port are rejected explicitly.\nBy default output stays private; existing PDFs are left untouched.\nUse --write-pdf to atomically export <input>.pdf beside the input.\n--output PATH sets the exported PDF path (relative to the source directory).\n--help/-h shows this help; --version/-V shows the embedded compiler version.";
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn preview_is_private_and_export_is_explicit() {
+        assert!(Options::default().no_pdf);
+        assert!(serde_json::from_str::<Options>("{}").unwrap().no_pdf);
+        assert!(
+            Options::parse(["main.typ"].map(Into::into))
+                .unwrap()
+                .1
+                .no_pdf
+        );
+        assert!(
+            !Options::parse(["main.typ", "--write-pdf"].map(Into::into))
+                .unwrap()
+                .1
+                .no_pdf
+        );
+        assert!(Options::parse(["main.typ", "--no-pdf"].map(Into::into)).is_err());
+        assert_eq!(
+            Options::parse(["main.typ", "--output", "out.pdf"].map(Into::into))
+                .unwrap()
+                .1
+                .output,
+            Some("out.pdf".into())
+        );
+    }
     #[test]
     fn root_inputs_and_order() {
         let (p, o) = Options::parse(

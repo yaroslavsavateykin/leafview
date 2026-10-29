@@ -14,7 +14,7 @@ typst = ["dep:typst", "dep:typst-layout", "dep:typst-pdf", "dep:typst-kit"]
 anyhow = "1.0"
 base64 = "0.22"
 crossterm = "0.29"
-image = { version = "0.25", default-features = false, features = ["png"] }
+image = { version = "0.25", default-features = false, features = ["png", "pnm"] }
 lopdf = { version = "0.45", default-features = false }
 lru = "0.12"
 notify = "8"

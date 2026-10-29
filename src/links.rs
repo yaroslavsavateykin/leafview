@@ -172,7 +172,7 @@ pub struct PageLinks {
     pub space: PageSpace,
     pub links: Vec<PdfLink>,
 }
-#[derive(Default, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct LinkIndex {
     pub pages: Vec<Option<Arc<PageLinks>>>,
     pub error: Option<String>,
@@ -310,7 +310,10 @@ fn destination(
                 let space =
                     spaces[page as usize].context("unsupported destination page geometry")?;
                 let optional = |i: usize| -> Result<Option<f64>> {
-                    let value = object(d, a.get(i).context("short destination")?)?;
+                    let Some(value) = a.get(i) else {
+                        return Ok(None);
+                    };
+                    let value = object(d, value)?;
                     if matches!(value, Object::Null) {
                         Ok(None)
                     } else {
@@ -329,9 +332,9 @@ fn destination(
                             zoom,
                         }
                     }
-                    b"Fit" => DestinationKind::Fit,
-                    b"FitH" => DestinationKind::FitH(optional(2)?),
-                    b"FitV" => DestinationKind::FitV(optional(2)?),
+                    b"Fit" | b"FitB" => DestinationKind::Fit,
+                    b"FitH" | b"FitBH" => DestinationKind::FitH(optional(2)?),
+                    b"FitV" | b"FitBV" => DestinationKind::FitV(optional(2)?),
                     b"FitR" => {
                         if a.len() != 6 {
                             bail!("invalid FitR")
@@ -518,22 +521,58 @@ impl RenderGeometry {
         let (c, d) = to_pdf(px + font.0 as f64, py + font.1 as f64);
         let cell = PdfRect::new([a, b, c, d]).ok()?;
         let center = to_pdf(px + font.0 as f64 / 2., py + font.1 as f64 / 2.);
-        let mut hit = None;
+        let mut hit: Option<usize> = None;
         for (i, link) in links.links.iter().enumerate() {
             if link.bounds.intersection(cell) > 0. {
-                // Ambiguous cells touching two links are never activated.
-                if hit.is_some()
-                    || !link.bounds.contains(center.0, center.1)
-                    || link.bounds.intersection(cell) < cell.area() * 0.5
-                {
-                    return None;
+                // Text links are often shorter than a terminal cell. Accept an
+                // unambiguous overlap, but never guess between distinct targets.
+                if let Some(previous) = hit {
+                    if links.links[previous].action != link.action {
+                        return None;
+                    }
                 }
-                hit = Some(i);
+                if hit.is_none() || link.bounds.contains(center.0, center.1) {
+                    hit = Some(i);
+                }
             }
         }
         hit
     }
 }
+#[cfg(test)]
+mod hit_tests {
+    use super::*;
+    #[test]
+    fn short_links_and_duplicate_annotations_are_clickable_but_ambiguous_targets_are_not() {
+        let space = PageSpace {
+            media: PdfRect::new([0., 0., 100., 100.]).unwrap(),
+            crop: PdfRect::new([0., 0., 100., 100.]).unwrap(),
+            rotation: 0,
+        };
+        let link = PdfLink {
+            bounds: PdfRect::new([1., 94., 9., 96.]).unwrap(),
+            action: LinkAction::External("https://example.org".into()),
+        };
+        let mut page = PageLinks {
+            space,
+            links: vec![link.clone(), link],
+        };
+        let mut geometry = RenderGeometry {
+            revision: 1,
+            page: 0,
+            generation: 1,
+            raster: (100, 100),
+            crop: (0, 0, 100, 100),
+            links: Some(Arc::new(page.clone())),
+        };
+        let area = Rect::new(0, 0, 10, 10);
+        assert_eq!(geometry.hit(0, 0, area, (10, 10)), Some(1));
+        page.links[1].action = LinkAction::External("https://other.example".into());
+        geometry.links = Some(Arc::new(page));
+        assert_eq!(geometry.hit(0, 0, area, (10, 10)), None);
+    }
+}
+
 pub fn sanitize(text: &str) -> String {
     text.chars()
         .filter(|c| {
