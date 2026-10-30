@@ -27,6 +27,46 @@ pub struct Client {
     uri: String,
     pending: HashMap<u64, (String, u64, Instant)>,
 }
+pub fn char_position(text: &Rope, line: usize, column: usize) -> usize {
+    let line = line.min(text.len_lines().saturating_sub(1));
+    let mut pos = text.line_to_char(line);
+    let mut units = 0;
+    for ch in text.line(line).chars() {
+        if matches!(ch, '\n' | '\r') || units + ch.len_utf16() > column {
+            break;
+        }
+        units += ch.len_utf16();
+        pos += 1;
+    }
+    pos
+}
+pub fn value_position(text: &Rope, value: &Value) -> usize {
+    char_position(
+        text,
+        value["line"].as_u64().unwrap_or(0) as usize,
+        value["character"].as_u64().unwrap_or(0) as usize,
+    )
+}
+pub fn file_path(uri: &str) -> Option<std::path::PathBuf> {
+    let bytes = uri.strip_prefix("file://")?.as_bytes();
+    if !bytes.starts_with(b"/") {
+        return None;
+    }
+    let mut out = vec![];
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = std::str::from_utf8(bytes.get(i + 1..i + 3)?).ok()?;
+            out.push(u8::from_str_radix(hex, 16).ok()?);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    use std::os::unix::ffi::OsStringExt;
+    Some(std::ffi::OsString::from_vec(out).into())
+}
 fn uri(path: &Path) -> String {
     let mut out = "file://".to_owned();
     for byte in path.as_os_str().as_encoded_bytes() {
@@ -125,7 +165,22 @@ impl Client {
             uri: uri(path),
             pending: HashMap::new(),
         };
-        client.request("initialize",json!({"processId":std::process::id(),"rootUri":uri(path.parent().unwrap()),"capabilities":{"general":{"positionEncodings":["utf-16"]},"textDocument":{"synchronization":{"didSave":true},"completion":{"completionItem":{"snippetSupport":false}}}}}))?;
+        let root = path
+            .ancestors()
+            .skip(1)
+            .find(|p| {
+                [
+                    ".git",
+                    "Cargo.toml",
+                    "pyproject.toml",
+                    "package.json",
+                    "typst.toml",
+                ]
+                .iter()
+                .any(|name| p.join(name).exists())
+            })
+            .unwrap_or(path.parent().unwrap_or(Path::new(".")));
+        client.request("initialize",json!({"processId":std::process::id(),"rootUri":uri(root),"capabilities":{"general":{"positionEncodings":["utf-16"]},"textDocument":{"synchronization":{"didSave":true},"completion":{"completionItem":{"snippetSupport":true,"documentationFormat":["markdown","plaintext"],"insertReplaceSupport":true,"resolveSupport":{"properties":["documentation","detail","additionalTextEdits"]}},"completionList":{"itemDefaults":["editRange","insertTextFormat","insertTextMode","data"]}},"signatureHelp":{"signatureInformation":{"documentationFormat":["markdown","plaintext"],"parameterInformation":{"labelOffsetSupport":true}},"contextSupport":true}}}}))?;
         Ok(client)
     }
     fn send(&self, value: Value) -> Result<()> {
@@ -184,6 +239,18 @@ impl Client {
         self.request(method, params)?;
         Ok(())
     }
+    pub fn cancel_pending(&mut self) {
+        let ids: Vec<_> = self
+            .pending
+            .iter()
+            .filter(|(_, (m, _, _))| m != "initialize")
+            .map(|(id, _)| *id)
+            .collect();
+        for id in ids {
+            let _ = self.notify("$/cancelRequest", json!({"id":id}));
+            self.pending.remove(&id);
+        }
+    }
     pub fn poll(&mut self) -> Result<()> {
         if let Some(status) = self.child.try_wait()? {
             anyhow::bail!("LSP exited: {status}; :lsp-restart to retry");
@@ -200,7 +267,12 @@ impl Client {
                 if value.get("id").is_some() {
                     let id = value["id"].clone();
                     let result = if method == "workspace/configuration" {
-                        json!([])
+                        Value::Array(
+                            value["params"]["items"]
+                                .as_array()
+                                .map(|items| items.iter().map(|_| json!({})).collect())
+                                .unwrap_or_default(),
+                        )
                     } else {
                         Value::Null
                     };

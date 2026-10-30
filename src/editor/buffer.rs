@@ -14,6 +14,7 @@ pub struct Buffer {
     saved_revision: usize,
     pub scroll: usize,
     pub syntax: super::syntax::SyntaxCache,
+    pub snippet: Option<helix_core::snippets::ActiveSnippet>,
 }
 impl Buffer {
     pub fn from_text(path: PathBuf, text: Rope) -> Self {
@@ -29,6 +30,7 @@ impl Buffer {
             saved_revision: 0,
             scroll: 0,
             syntax: super::syntax::SyntaxCache::default(),
+            snippet: None,
         }
     }
     pub fn cursor(&self) -> usize {
@@ -73,6 +75,11 @@ impl Buffer {
     }
     pub fn edit_many(&mut self, changes: Vec<helix_core::Change>) {
         let transaction = Transaction::change(&self.state.doc, changes.into_iter());
+        if let Some(snippet) = &mut self.snippet {
+            if snippet.map(transaction.changes()) {
+                self.snippet = None;
+            }
+        }
         let original = self.state.clone(); // Rope clone shares its tree, not the file bytes.
         assert!(transaction.apply(&mut self.state.doc));
         self.pending = Some(match self.pending.take() {

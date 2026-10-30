@@ -5,11 +5,18 @@ pub struct Viewport {
     pub height: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fit {
+    Page,
+    Width,
+    Manual,
+}
 #[derive(Debug, Clone)]
 pub struct View {
     pub page: u32,
     pub pages: u32,
     pub zoom: f32,
+    pub fit: Fit,
     /// Page-relative scroll in rendered pixels.
     pub x: u32,
     pub y: u32,
@@ -21,6 +28,7 @@ impl View {
             page: 0,
             pages: pages.max(1),
             zoom: 1.0,
+            fit: Fit::Page,
             x: 0,
             y: 0,
         }
@@ -42,11 +50,31 @@ impl View {
         self.page = next;
         true
     }
+    /// Fit uses physical pixel dimensions (not terminal cell aspect).
+    pub fn apply_fit(&mut self, viewport: Viewport, aspect: f64) -> bool {
+        if self.fit == Fit::Manual || !aspect.is_finite() || aspect <= 0. {
+            return false;
+        }
+        let zoom = if self.fit == Fit::Width {
+            1.
+        } else {
+            (viewport.height as f64 / (viewport.width.max(1) as f64 * aspect)).min(1.) as f32
+        }
+        .max(0.01);
+        let changed = (self.zoom - zoom).abs() > 0.0001;
+        if changed {
+            self.x = 0;
+            self.y = 0;
+        }
+        self.zoom = zoom;
+        changed
+    }
     pub fn adjust_zoom(&mut self, delta: f32) -> bool {
         if !delta.is_finite() {
             return false;
         }
-        let new = (self.zoom + delta).clamp(0.5, 3.0);
+        self.fit = Fit::Manual;
+        let new = (self.zoom + delta).clamp(0.05, 3.0);
         if (new - self.zoom).abs() < 0.001 {
             return false;
         }
@@ -97,7 +125,7 @@ impl View {
 }
 
 pub fn raster_width(view: &View, viewport: Viewport) -> u32 {
-    ((viewport.width.max(1) as f32 * view.zoom).round() as u32).clamp(100, 3400)
+    ((viewport.width.max(1) as f32 * view.zoom).round() as u32).clamp(1, 3400)
 }
 
 /// Crop a pre-rasterized page, clamping scrolling to the actual image dimensions.
@@ -118,6 +146,52 @@ pub fn crop_bounds(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn opening_fits_portrait_landscape_and_resize() {
+        for (viewport, aspect) in [
+            (
+                Viewport {
+                    width: 1200,
+                    height: 600,
+                },
+                297. / 210.,
+            ),
+            (
+                Viewport {
+                    width: 600,
+                    height: 1000,
+                },
+                0.6,
+            ),
+            (
+                Viewport {
+                    width: 1800,
+                    height: 300,
+                },
+                1.5,
+            ),
+        ] {
+            let mut view = View::new(1);
+            view.apply_fit(viewport, aspect);
+            let width = raster_width(&view, viewport);
+            assert!(width <= viewport.width);
+            assert!(width as f64 * aspect <= viewport.height as f64 + 1.5);
+            view.adjust_zoom(0.1);
+            assert_eq!(view.fit, Fit::Manual);
+            let zoom = view.zoom;
+            view.apply_fit(
+                Viewport {
+                    width: 300,
+                    height: 200,
+                },
+                aspect,
+            );
+            assert_eq!(view.zoom, zoom);
+            view.fit = Fit::Width;
+            view.apply_fit(viewport, aspect);
+            assert_eq!(view.zoom, 1.);
+        }
+    }
     #[test]
     fn navigation_is_bounded() {
         let mut v = View::new(3);
@@ -245,6 +319,6 @@ mod tests {
         for _ in 0..30 {
             v.adjust_zoom(-0.25);
         }
-        assert_eq!(v.zoom, 0.5);
+        assert_eq!(v.zoom, 0.05);
     }
 }

@@ -1,0 +1,9 @@
+[keybindings]
+preset = "leafview-default"
+timeout_ms = 500
+
+[keybindings.pdf]
+"j" = "pdf.scroll_down"
+"k" = "pdf.scroll_up"
+"gg" = "pdf.first_page"
+"G" = "pdf.last_page"

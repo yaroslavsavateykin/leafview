@@ -149,7 +149,7 @@ impl Renderer {
                             continue;
                         }
                         let key = Key {
-                            revision: hint.doc.revision,
+                            revision: hint.doc.id,
                             page: hint.page,
                             width: hint.width,
                         };
@@ -186,7 +186,7 @@ impl Renderer {
                     continue;
                 }
                 let key = Key {
-                    revision: req.doc.revision,
+                    revision: req.doc.id,
                     page: req.page,
                     width: req.width,
                 };
@@ -202,6 +202,7 @@ impl Renderer {
                         });
                         let (x, y, w, h) = crop_bounds(r.width(), r.height(), req.viewport, sx, sy);
                         let geometry = crate::links::RenderGeometry {
+                            document_id: req.doc.id,
                             revision: req.doc.revision,
                             page: req.page,
                             generation: req.generation,
@@ -311,7 +312,7 @@ impl Renderer {
     }
     pub fn request(&self, mut request: Request) {
         *self.raster_key.lock().unwrap() = Some(Key {
-            revision: request.doc.revision,
+            revision: request.doc.id,
             page: request.page,
             width: request.width,
         });
@@ -321,12 +322,21 @@ impl Renderer {
         slot.latest = Some(request);
         cv.notify_one();
     }
+    /// Invalidate rendering immediately, including when a replacement is debounced.
+    pub fn invalidate(&self) {
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        *self.raster_key.lock().unwrap() = None;
+        let (lock, _) = &*self.inbox;
+        let mut mailbox = lock.lock().unwrap();
+        mailbox.latest = None;
+        mailbox.hint = None;
+    }
     pub fn current_generation(&self) -> u64 {
         self.generation.load(Ordering::SeqCst)
     }
     pub fn hint(&self, doc: Arc<Document>, page: u32, width: u32) {
         let key = Key {
-            revision: doc.revision,
+            revision: doc.id,
             page,
             width,
         };
@@ -633,6 +643,61 @@ mod tests {
         assert!(!cache.images.contains(&key));
     }
     #[test]
+    fn snapshots_with_equal_revision_have_distinct_raster_keys() {
+        let a = Document::open(&fixture(), 7).unwrap();
+        let b = Document::open(&fixture(), 7).unwrap();
+        assert_ne!(a.id, b.id);
+        let mut cache = Cache::new(1024);
+        let red = Arc::new(DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            2,
+            2,
+            image::Rgb([255, 0, 0]),
+        )));
+        let blue = Arc::new(DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            2,
+            2,
+            image::Rgb([0, 0, 255]),
+        )));
+        let ka = Key {
+            revision: a.id,
+            page: 0,
+            width: 2,
+        };
+        let kb = Key {
+            revision: b.id,
+            page: 0,
+            width: 2,
+        };
+        cache.insert(ka, red);
+        cache.insert(kb, blue);
+        assert_ne!(
+            cache.images.get(&ka).unwrap().to_rgb8(),
+            cache.images.get(&kb).unwrap().to_rgb8()
+        );
+    }
+    #[test]
+    fn invalidate_blocks_a_completed_old_document() {
+        let doc = Arc::new(Document::open(&fixture(), 1).unwrap());
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let renderer = Renderer::new(tx).unwrap();
+        renderer.request(Request {
+            generation: 0,
+            doc,
+            page: 0,
+            width: 200,
+            viewport: Viewport {
+                width: 200,
+                height: 300,
+            },
+            x: 0,
+            y: 0,
+            destination: None,
+        });
+        let result = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        renderer.invalidate();
+        assert_ne!(result.generation, renderer.current_generation());
+    }
+    #[test]
     fn latest_wins_and_shutdown() {
         let doc = Arc::new(Document::open(&fixture(), 1).unwrap());
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
@@ -674,7 +739,7 @@ mod tests {
         let renderer = Renderer::new(tx).unwrap();
         let deadline = Instant::now() + Duration::from_secs(3);
         let mut y = 0;
-        while !renderer.cache_contains(1, 0, 1800) {
+        while !renderer.cache_contains(doc.id, 0, 1800) {
             assert!(Instant::now() < deadline, "scrolling starved raster cache");
             renderer.request(Request {
                 generation: 0,
@@ -702,7 +767,7 @@ mod tests {
         let mut request = Request {
             generation: 0,
             destination: None,
-            doc,
+            doc: doc.clone(),
             page: 0,
             width: 800,
             viewport: Viewport {
@@ -721,7 +786,7 @@ mod tests {
             .is_ok());
         let cold = start.elapsed();
         let deadline = Instant::now() + Duration::from_secs(5);
-        while !renderer.cache_contains(1, 0, 840) || !renderer.cache_contains(1, 1, 800) {
+        while !renderer.cache_contains(doc.id, 0, 840) || !renderer.cache_contains(doc.id, 1, 800) {
             assert!(Instant::now() < deadline, "page/zoom prefetch missing");
             thread::sleep(Duration::from_millis(5));
         }
@@ -746,7 +811,7 @@ mod tests {
         let renderer = Renderer::new(tx).unwrap();
         renderer.hint(doc.clone(), 2, 400);
         let deadline = Instant::now() + Duration::from_secs(15);
-        while !renderer.cache_contains(1, 2, 400) {
+        while !renderer.cache_contains(doc.id, 2, 400) {
             assert!(Instant::now() < deadline, "hint did not warm the cache");
             thread::sleep(Duration::from_millis(10));
         }

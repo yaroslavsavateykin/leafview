@@ -1,0 +1,40 @@
+{
+  "debounce_ms": 50,
+  "menu_height": 10,
+  "menu_min_width": 15,
+  "menu_max_width": 70,
+  "documentation_width": 80,
+  "documentation_height": 20,
+  "documentation_auto_show": true,
+  "ghost_text": false,
+  "auto_insert": false,
+  "preselect": false,
+  "auto_brackets": true,
+  "auto_pairs": true,
+  "signature_auto_show": true,
+  "signature_delay_ms": 80,
+  "sources": ["lsp", "path", "snippets", "buffer"],
+  "background": [20, 22, 27],
+  "foreground": [155, 160, 169],
+  "selected_background": [38, 52, 63],
+  "border_color": [58, 62, 71],
+  "rounded_border": true,
+  "keys": {
+    "next": ["Down", "Tab", "C-n", "C-j"],
+    "previous": ["Up", "S-Tab", "C-p", "C-k"],
+    "accept": ["Enter"],
+    "hide": ["C-e"],
+    "show": ["C-Space"],
+    "documentation_up": ["C-u", "C-b"],
+    "documentation_down": ["C-d", "C-f"],
+    "snippet_forward": ["Tab"],
+    "snippet_backward": ["S-Tab"],
+    "window_next": ["F7"],
+    "window_close": ["F8"]
+  },
+  "snippets": {
+    "rs": {"dbg": "dbg!(${1:value});$0"},
+    "py": {"def": "def ${1:name}(${2:args}):\n    $0"},
+    "typ": {"let": "#let ${1:name} = ${2:value}$0"}
+  }
+}

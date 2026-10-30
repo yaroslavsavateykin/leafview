@@ -24,6 +24,9 @@ enum Pending {
     Play,
     Replace,
     Find(char),
+    Mark,
+    Jump(bool),
+    Z,
 }
 #[derive(Default, Clone)]
 struct Register {
@@ -32,6 +35,8 @@ struct Register {
 }
 pub struct Vim {
     pub mode: Mode,
+    pub viewport_height: usize,
+    marks: HashMap<(std::path::PathBuf, char), usize>,
     pub command: String,
     pub message: String,
     pending: Pending,
@@ -55,6 +60,8 @@ impl Default for Vim {
     fn default() -> Self {
         Self {
             mode: Mode::Normal,
+            viewport_height: 20,
+            marks: HashMap::new(),
             command: String::new(),
             message: String::new(),
             pending: Pending::None,
@@ -77,6 +84,31 @@ impl Default for Vim {
     }
 }
 impl Vim {
+    pub fn binding_mode(&self) -> &'static str {
+        if matches!(
+            self.pending,
+            Pending::Operator(..) | Pending::Object(..) | Pending::Indent(..) | Pending::Find(..)
+        ) {
+            return "operator";
+        }
+        match self.mode {
+            Mode::Normal => "normal",
+            Mode::Insert | Mode::Replace => "insert",
+            Mode::Visual => "visual",
+            Mode::VisualLine => "visual_line",
+            Mode::VisualBlock => "visual_block",
+            Mode::Command if self.command.starts_with('/') || self.command.starts_with('?') => {
+                "search"
+            }
+            Mode::Command => "command",
+        }
+    }
+    pub fn reset_mode(&mut self) {
+        self.mode = Mode::Normal;
+        self.pending = Pending::None;
+        self.count = 0;
+        self.command.clear();
+    }
     fn visual(&self) -> bool {
         matches!(
             self.mode,
@@ -228,7 +260,9 @@ impl Vim {
         }
     }
     fn dispatch(&mut self, b: &mut Buffer, key: KeyEvent) -> Option<String> {
-        if key.code == KeyCode::Esc {
+        if key.code == KeyCode::Esc
+            || (key.code == KeyCode::Char('[') && key.modifiers.contains(KeyModifiers::CONTROL))
+        {
             if matches!(self.mode, Mode::Insert | Mode::Replace) {
                 b.set_cursor(b.cursor().saturating_sub(1).max(b.start(b.line())));
                 b.commit();
@@ -260,6 +294,35 @@ impl Vim {
             return None;
         }
         if matches!(self.mode, Mode::Insert | Mode::Replace) {
+            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                let p = b.cursor();
+                match key.code {
+                    KeyCode::Char('w') => {
+                        let start = motions::motion(b, 'b', 1)
+                            .unwrap_or(p)
+                            .max(b.start(b.line()));
+                        b.edit(start, p, "");
+                        b.set_cursor(start);
+                    }
+                    KeyCode::Char('u') => {
+                        let start = b.start(b.line());
+                        b.edit(start, p, "");
+                        b.set_cursor(start);
+                    }
+                    KeyCode::Char('h') => {
+                        if p > 0 {
+                            b.edit(p - 1, p, "");
+                            b.set_cursor(p - 1);
+                        }
+                    }
+                    KeyCode::Char('j' | 'm') => {
+                        b.edit(p, p, "\n");
+                        b.set_cursor(p + 1);
+                    }
+                    _ => {}
+                }
+                return None;
+            }
             let movement = match key.code {
                 KeyCode::Left => Some('h'),
                 KeyCode::Right => Some('l'),
@@ -320,6 +383,45 @@ impl Vim {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 KeyCode::Char('r') => b.undo(true),
+                KeyCode::Char(c @ ('d' | 'u' | 'f' | 'b')) => {
+                    let half = matches!(c, 'd' | 'u');
+                    let amount = if self.count > 0 {
+                        self.count
+                    } else if half {
+                        (self.viewport_height / 2).max(1)
+                    } else {
+                        self.viewport_height.saturating_sub(2).max(1)
+                    };
+                    let down = matches!(c, 'd' | 'f');
+                    let row = if down {
+                        (b.line() + amount).min(b.state.doc.len_lines() - 1)
+                    } else {
+                        b.line().saturating_sub(amount)
+                    };
+                    b.scroll = if down {
+                        b.scroll
+                            .saturating_add(amount)
+                            .min(b.state.doc.len_lines().saturating_sub(self.viewport_height))
+                    } else {
+                        b.scroll.saturating_sub(amount)
+                    };
+                    b.set_cursor(b.start(row));
+                    self.count = 0;
+                }
+                KeyCode::Char('e' | 'y') => {
+                    if key.code == KeyCode::Char('e') {
+                        b.scroll = (b.scroll + 1)
+                            .min(b.state.doc.len_lines().saturating_sub(self.viewport_height));
+                    } else {
+                        b.scroll = b.scroll.saturating_sub(1);
+                    }
+                    let row = b.line().clamp(
+                        b.scroll,
+                        (b.scroll + self.viewport_height.saturating_sub(1))
+                            .min(b.state.doc.len_lines() - 1),
+                    );
+                    b.set_cursor(b.start(row));
+                }
                 KeyCode::Char('v') => {
                     self.mode = Mode::VisualBlock;
                     self.anchor = b.cursor();
@@ -334,9 +436,45 @@ impl Vim {
             KeyCode::Right => 'l',
             KeyCode::Up => 'k',
             KeyCode::Down => 'j',
+            KeyCode::Home => '0',
+            KeyCode::End => '$',
+            KeyCode::PageDown => {
+                return self.dispatch(b, KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+            }
+            KeyCode::PageUp => {
+                return self.dispatch(b, KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+            }
             _ => return None,
         };
         match self.pending {
+            Pending::Mark => {
+                self.marks.insert((b.path.clone(), c), b.cursor());
+                self.pending = Pending::None;
+                return None;
+            }
+            Pending::Jump(linewise) => {
+                if let Some(pos) = self.marks.get(&(b.path.clone(), c)).copied() {
+                    b.set_cursor(if linewise {
+                        b.start(b.state.doc.char_to_line(pos.min(b.state.doc.len_chars())))
+                    } else {
+                        pos
+                    });
+                }
+                self.pending = Pending::None;
+                return None;
+            }
+            Pending::Z => {
+                b.scroll = match c {
+                    'z' | '.' => b.line().saturating_sub(self.viewport_height / 2),
+                    't' => b.line(),
+                    'b' => b
+                        .line()
+                        .saturating_sub(self.viewport_height.saturating_sub(1)),
+                    _ => b.scroll,
+                };
+                self.pending = Pending::None;
+                return None;
+            }
             Pending::Register => {
                 self.register = c;
                 self.pending = Pending::None;
@@ -377,9 +515,8 @@ impl Vim {
             Pending::Object(op, around, n) => {
                 self.pending = Pending::None;
                 if let Some((a, z)) = motions::object(b, c, around) {
-                    for _ in 0..n {
+                    if n > 0 {
                         self.operate(b, op, a, z, false);
-                        break;
                     }
                 }
                 return None;
@@ -414,9 +551,21 @@ impl Vim {
             }
             Pending::G => {
                 self.pending = Pending::None;
-                if c == 'g' {
-                    b.set_cursor(b.start(self.count.saturating_sub(1)));
-                    self.count = 0;
+                let count = self.count;
+                self.count = 0;
+                match c {
+                    'g' => b.set_cursor(b.start(count.saturating_sub(1))),
+                    't' => {
+                        return Some(if count > 0 {
+                            format!("b {count}")
+                        } else {
+                            "bn".into()
+                        })
+                    }
+                    'T' => return Some("bp".into()),
+                    'd' => return Some("definition".into()),
+                    'r' => return Some("references".into()),
+                    _ => {}
                 }
                 return None;
             }
@@ -525,6 +674,39 @@ impl Vim {
             return None;
         }
         match c {
+            'm' => self.pending = Pending::Mark,
+            '\'' | '`' => self.pending = Pending::Jump(c == '\''),
+            'z' => self.pending = Pending::Z,
+            'K' => return Some("hover".into()),
+            'Y' => self.lines(b, 'y', n),
+            'H' | 'M' | 'L' => {
+                let row = match c {
+                    'H' => b.scroll + n.saturating_sub(1),
+                    'M' => b.scroll + self.viewport_height / 2,
+                    _ => b.scroll + self.viewport_height.saturating_sub(n),
+                };
+                b.set_cursor(b.start(row.min(b.state.doc.len_lines() - 1)));
+            }
+            '~' => {
+                let a = b.cursor();
+                let z = (a + n).min(b.end(b.line()));
+                let text: String = b
+                    .state
+                    .doc
+                    .slice(a..z)
+                    .chars()
+                    .flat_map(|c| {
+                        if c.is_uppercase() {
+                            c.to_lowercase().collect::<Vec<_>>()
+                        } else {
+                            c.to_uppercase().collect::<Vec<_>>()
+                        }
+                    })
+                    .collect();
+                b.edit(a, z, &text);
+                b.set_cursor((a + text.chars().count()).min(b.end(b.line()).saturating_sub(1)));
+                b.commit();
+            }
             '>' | '<' | '=' => {
                 self.pending = Pending::Indent(c);
                 self.count = n;
@@ -735,6 +917,10 @@ impl Vim {
             }
         }
         None
+    }
+    pub fn mouse_select(&mut self, anchor: usize) {
+        self.anchor = anchor;
+        self.mode = Mode::Visual;
     }
     pub fn selection(&self, b: &Buffer) -> Option<(usize, usize)> {
         self.visual()

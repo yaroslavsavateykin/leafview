@@ -1,4 +1,5 @@
 //! Leafview: a small terminal PDF viewer with latest-wins rendering and tmux graphics support.
+mod commands;
 #[cfg(feature = "typst")]
 mod compile_config;
 #[cfg(feature = "typst")]
@@ -8,10 +9,12 @@ mod document;
 #[cfg(feature = "editor")]
 mod editor;
 mod files;
+mod keybindings;
 mod kitty;
 #[cfg(test)]
 mod link_tests;
 mod links;
+mod picker;
 mod process;
 mod render;
 mod terminal;
@@ -58,8 +61,16 @@ use workers::Worker;
 mod welcome;
 
 struct App {
+    keybindings: keybindings::System,
     #[cfg(feature = "editor")]
     editor: editor::Editor,
+    picker: Option<picker::Picker>,
+    #[cfg(feature = "editor")]
+    browser_editor: bool,
+    #[cfg(feature = "editor")]
+    window_prefix: bool,
+    workspace_hover: Option<usize>,
+    split_drag: Option<u8>,
     workspace_history: Vec<(PathBuf, PathBuf)>,
     files: files::Files,
     terminal_size: Size,
@@ -97,6 +108,7 @@ struct App {
     encoder: Worker<EncodeInput, EncodeOutput>,
     reloader: Worker<(PathBuf, u64), Result<Document>>,
     reload_pending: bool,
+    reload_source: Option<PathBuf>,
     reload_again: bool,
     encoding_pending: bool,
     encode_latest: Option<EncodeInput>,
@@ -171,6 +183,8 @@ impl App {
     // still use latest-wins semantics, but we don't restart Poppler on every
     // auto-repeat and overwhelm Kitty/tmux with obsolete images.
     fn schedule(&mut self) {
+        let aspect = self.doc.page_aspect(self.view.page);
+        self.view.apply_fit(self.viewport, aspect);
         if self.source.is_dir() || self.viewport.width == 0 || self.viewport.height == 0 {
             return;
         }
@@ -263,6 +277,9 @@ impl App {
             3
         };
         let next = editor::focus::neighbor(&panes, current, direction);
+        if next < 2 {
+            self.browser_editor = current == 2 || (current < 2 && self.browser_editor);
+        }
         self.editor.focused = next == 2;
         self.files.focused = next < 2;
         if next < 2 {
@@ -274,13 +291,185 @@ impl App {
         self.hover_deadline = None;
         self.dirty = true;
     }
+    fn begin_picker(&mut self, target: picker::Target) {
+        let root = self.files.folder().to_owned();
+        self.picker = Some(picker::Picker::new(&root, target));
+        self.dirty = true;
+    }
+    fn choose_file(&mut self, path: PathBuf, target: picker::Target) {
+        self.picker = None;
+        #[cfg(feature = "editor")]
+        if target == picker::Target::Editor {
+            self.editor.open(&path);
+            self.files.focused = false;
+            self.geometry(self.terminal_size);
+            self.dirty = true;
+            return;
+        }
+        #[cfg(not(feature = "editor"))]
+        if target == picker::Target::Editor {
+            self.files.notice = Some("Build with --features editor".into());
+            self.dirty = true;
+            return;
+        }
+        if is_typst(&path) {
+            #[cfg(feature = "typst")]
+            if let Err(e) = self.open_typst(&path) {
+                self.files.notice = Some(format!("{e:#}"));
+            }
+            #[cfg(not(feature = "typst"))]
+            {
+                self.files.notice = Some("Build with --features typst".into());
+            }
+        } else if !self.opening
+            && self
+                .opener
+                .input
+                .as_ref()
+                .unwrap()
+                .try_send((path, self.doc.revision + 1))
+                .is_ok()
+        {
+            self.opening = true;
+        }
+        self.dirty = true;
+    }
     fn on_key(&mut self, key: KeyEvent) -> bool {
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
             return false;
         }
+        if let Some(result) = self.dispatch_bindings(key) {
+            return result;
+        }
+        self.on_key_legacy(key)
+    }
+    fn on_key_legacy(&mut self, key: KeyEvent) -> bool {
+        if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+            return false;
+        }
+        if let Some(picker) = &mut self.picker {
+            if key.code == KeyCode::Esc {
+                self.picker = None;
+            } else if key.code == KeyCode::Char('c')
+                && key.modifiers.contains(KeyModifiers::CONTROL)
+            {
+                return true;
+            } else {
+                let target = picker.target;
+                if let Some(path) = picker.key(key) {
+                    self.choose_file(path, target);
+                }
+            }
+            self.dirty = true;
+            return false;
+        }
+        #[cfg(feature = "typst")]
+        let modal = self.settings.is_some();
+        #[cfg(not(feature = "typst"))]
+        let modal = false;
+        if !modal
+            && (key.code == KeyCode::F(3)
+                || (key.code == KeyCode::Char('p')
+                    && key.modifiers.contains(KeyModifiers::CONTROL)))
+            && {
+                #[cfg(feature = "editor")]
+                {
+                    !(self.editor.visible
+                        && self.editor.focused
+                        && (self.editor.vim.mode == editor::vim::Mode::Insert
+                            || self.editor.owns_completion_key(key)))
+                }
+                #[cfg(not(feature = "editor"))]
+                {
+                    true
+                }
+            }
+        {
+            #[cfg(feature = "editor")]
+            let target = if self.editor.focused || (self.files.focused && self.browser_editor) {
+                picker::Target::Editor
+            } else {
+                picker::Target::Preview
+            };
+            #[cfg(not(feature = "editor"))]
+            let target = picker::Target::Preview;
+            self.begin_picker(target);
+            return false;
+        }
+        #[cfg(feature = "editor")]
+        if !modal
+            && self.editor.visible
+            && self.editor.focused
+            && self.editor.owns_tool_window_key(key)
+        {
+            self.editor.key(key);
+            self.dirty = true;
+            return false;
+        }
+        #[cfg(feature = "editor")]
+        if !modal && self.window_prefix {
+            self.window_prefix = false;
+            match key.code {
+                KeyCode::Char(direction @ ('h' | 'j' | 'k' | 'l')) => self.focus_pane(direction),
+                KeyCode::Char('w') => {
+                    if self.editor.visible && self.editor.focused {
+                        self.editor.focused = false;
+                    } else if self.editor.visible {
+                        self.editor.focused = true;
+                        self.files.focused = false;
+                    } else {
+                        self.files.cycle_focus(self.terminal_size.width);
+                    }
+                }
+                KeyCode::Char('v') => {
+                    self.editor.horizontal = false;
+                    if !self.editor.visible && !self.source.is_dir() {
+                        self.editor.open(&self.source);
+                    }
+                }
+                KeyCode::Char('s') => {
+                    self.editor.horizontal = true;
+                    if !self.editor.visible && !self.source.is_dir() {
+                        self.editor.open(&self.source);
+                    }
+                }
+                KeyCode::Char('c') => {
+                    self.editor.visible = false;
+                    self.editor.focused = false;
+                }
+                KeyCode::Char('=') => self.editor.ratio = 50,
+                KeyCode::Char('>' | '+') => self.editor.ratio = (self.editor.ratio + 5).min(80),
+                KeyCode::Char('<' | '-') => {
+                    self.editor.ratio = self.editor.ratio.saturating_sub(5).max(20)
+                }
+                _ => {}
+            }
+            self.geometry(self.terminal_size);
+            self.dirty = true;
+            return false;
+        }
+        #[cfg(feature = "editor")]
+        if !modal
+            && key.code == KeyCode::Char('w')
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && (!self.editor.focused || self.editor.vim.mode == editor::vim::Mode::Normal)
+        {
+            self.window_prefix = true;
+            self.editor.message =
+                "Ctrl+w: hjkl focus · w cycle · v/s split · <> resize · = equal · c hide".into();
+            self.dirty = true;
+            return false;
+        }
         #[cfg(feature = "editor")]
         if key.code == KeyCode::F(2) {
+            if !self.files.visible {
+                self.browser_editor = self.editor.focused;
+            }
             self.files.visible = !self.files.visible;
+            if self.files.visible {
+                self.files.focused = true;
+                self.editor.focused = false;
+            }
             if !self.files.visible {
                 self.files.focused = false;
             }
@@ -295,18 +484,22 @@ impl App {
                 && (!self.editor.focused || self.editor.vim.mode == editor::vim::Mode::Normal))
         {
             let direction = match key.code {
-                KeyCode::Backspace => Some('h'),
-                KeyCode::Char('h') | KeyCode::Left => Some('h'),
-                KeyCode::Char('j') | KeyCode::Down => Some('j'),
-                KeyCode::Char('k') | KeyCode::Up => Some('k'),
-                KeyCode::Char('l') | KeyCode::Right => Some('l'),
+                KeyCode::Backspace if self.editor.vim.mode != editor::vim::Mode::Insert => {
+                    Some('h')
+                }
+                KeyCode::Char('h') => Some('h'),
+                KeyCode::Char('j') => Some('j'),
+                KeyCode::Char('k') => Some('k'),
+                KeyCode::Char('l') => Some('l'),
                 _ => None,
             };
             #[cfg(feature = "typst")]
             let modal = self.settings.is_some();
             #[cfg(not(feature = "typst"))]
             let modal = false;
-            if let Some(direction) = direction.filter(|_| !modal) {
+            if let Some(direction) = direction.filter(|_| {
+                !modal && !(self.editor.focused && self.editor.owns_completion_key(key))
+            }) {
                 self.focus_pane(direction);
                 return false;
             }
@@ -334,7 +527,11 @@ impl App {
                 } else {
                     self.files.visible = true;
                     self.files.focused = false;
-                    self.editor.open(&self.source);
+                    if self.source.is_dir() {
+                        self.begin_picker(picker::Target::Editor);
+                    } else {
+                        self.editor.open(&self.source);
+                    }
                 }
                 self.geometry(self.terminal_size);
                 self.dirty = true;
@@ -342,6 +539,22 @@ impl App {
             }
             if self.editor.visible && key.code == KeyCode::F(6) {
                 self.editor.focused = !self.editor.focused;
+                self.dirty = true;
+                return false;
+            }
+            if self.editor.visible
+                && key.modifiers.contains(KeyModifiers::CONTROL)
+                && matches!(
+                    key.code,
+                    KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down
+                )
+            {
+                self.files.resize(
+                    key.code,
+                    self.terminal_size.width,
+                    self.terminal_size.height,
+                );
+                self.geometry(self.terminal_size);
                 self.dirty = true;
                 return false;
             }
@@ -505,6 +718,15 @@ impl App {
         }
         if self.files.focused && self.files.width(self.terminal_size.width) > 0 {
             if let Some(path) = self.files.key(key) {
+                #[cfg(feature = "editor")]
+                if self.browser_editor
+                    && !path
+                        .extension()
+                        .is_some_and(|e| e.eq_ignore_ascii_case("pdf"))
+                {
+                    self.choose_file(path, picker::Target::Editor);
+                    return false;
+                }
                 if !self.opening && !self.reload_pending {
                     if is_typst(&path) {
                         #[cfg(feature = "typst")]
@@ -587,6 +809,7 @@ impl App {
             KeyCode::Char('+') | KeyCode::Char('=') => request = self.view.adjust_zoom(0.05),
             KeyCode::Char('-') | KeyCode::Char('_') => request = self.view.adjust_zoom(-0.05),
             KeyCode::Char('z') => {
+                self.view.fit = view::Fit::Width;
                 self.view.zoom = 1.0;
                 self.view.x = 0;
                 self.view.y = 0;
@@ -649,8 +872,12 @@ impl App {
         self.error = session.warning.clone();
         self.session = Some(session);
         self.source = path;
+        self.view = View::new(1);
         self.compile_error = None;
         self.compile_millis = 0;
+        self.renderer.invalidate();
+        self.encode_latest = None;
+        self.render_due = None;
         self.image = None;
         self.displayed = None;
         self.image_area = ratatui::layout::Rect::default();
@@ -676,6 +903,14 @@ impl App {
             .get(location.page as usize)
             .and_then(|p| p.as_ref())
         else {
+            // Source synchronization must not depend on optional PDF link
+            // extraction. At least navigate to the mapped page if it failed.
+            self.view.page = location.page;
+            self.view.x = 0;
+            self.view.y = 0;
+            self.destination = None;
+            self.schedule();
+            self.dirty = true;
             return;
         };
         let space = links.space;
@@ -759,6 +994,7 @@ impl App {
             return;
         }
         self.reload_pending = true;
+        self.reload_source = Some(self.source.clone());
         if let Err(err) = self
             .reloader
             .input
@@ -778,6 +1014,13 @@ impl App {
     }
     fn finish_reload(&mut self, result: Result<Document>) {
         self.reload_pending = false;
+        if self
+            .reload_source
+            .take()
+            .is_some_and(|path| path != self.source)
+        {
+            return;
+        }
         match result {
             Ok(doc) => {
                 self.view.set_pages(doc.pages);
@@ -848,9 +1091,136 @@ impl App {
             .hint(self.doc.clone(), destination.page, width);
     }
     fn on_mouse(&mut self, event: MouseEvent) {
+        if let Some(picker) = &mut self.picker {
+            let target = picker.target;
+            let path = picker.mouse(
+                ratatui::layout::Rect::new(
+                    0,
+                    0,
+                    self.terminal_size.width,
+                    self.terminal_size.height,
+                ),
+                event.column,
+                event.row,
+                event.kind == MouseEventKind::Down(MouseButton::Left),
+            );
+            if let Some(path) = path {
+                self.choose_file(path, target);
+            }
+            self.dirty = true;
+            return;
+        }
         #[cfg(feature = "typst")]
         if self.settings.is_some() {
             return;
+        }
+        let sidebar = self.files.width(self.terminal_size.width);
+        let side_area = ratatui::layout::Rect::new(0, 0, sidebar, self.terminal_size.height);
+        let content = ratatui::layout::Rect::new(
+            sidebar,
+            0,
+            self.terminal_size.width.saturating_sub(sidebar),
+            self.terminal_size.height,
+        );
+        #[cfg(feature = "editor")]
+        let (source_area, preview_area) = editor_regions(
+            content,
+            self.editor.visible,
+            self.editor.horizontal,
+            self.editor.ratio,
+        );
+        #[cfg(not(feature = "editor"))]
+        let preview_area = content;
+        if event.kind == MouseEventKind::Up(MouseButton::Left) && self.split_drag.take().is_some() {
+            return;
+        }
+        if event.kind == MouseEventKind::Down(MouseButton::Left) {
+            self.split_drag = None;
+        }
+        if event.kind == MouseEventKind::Down(MouseButton::Left)
+            && event.row == preview_area.y
+            && event.column > preview_area.x + 1
+            && event.column < preview_area.right().saturating_sub(1)
+        {
+            self.begin_picker(picker::Target::Preview);
+            return;
+        }
+        #[cfg(feature = "editor")]
+        if self.editor.visible
+            && event.kind == MouseEventKind::Down(MouseButton::Left)
+            && event.row == source_area.y
+            && event.column > source_area.x + 1
+            && event.column < source_area.right().saturating_sub(1)
+        {
+            self.begin_picker(picker::Target::Editor);
+            return;
+        }
+        if event.kind == MouseEventKind::Down(MouseButton::Left) {
+            if sidebar > 0 && event.column.abs_diff(sidebar) <= 1 {
+                self.split_drag = Some(0);
+            } else if sidebar > 0
+                && event.column < sidebar
+                && event.row.abs_diff(self.files.panels(side_area)[1].y) <= 1
+            {
+                self.split_drag = Some(1);
+            }
+            #[cfg(feature = "editor")]
+            if self.split_drag.is_none()
+                && self.editor.visible
+                && (if self.editor.horizontal {
+                    event.row.abs_diff(source_area.bottom()) <= 1 && event.column >= sidebar
+                } else {
+                    event.column.abs_diff(source_area.right()) <= 1
+                })
+            {
+                self.split_drag = Some(2);
+            }
+        }
+        if matches!(
+            event.kind,
+            MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Moved
+        ) {
+            if let Some(split) = self.split_drag {
+                if split < 2 {
+                    self.files.drag_split(event.column, event.row, split == 0);
+                }
+                #[cfg(feature = "editor")]
+                if split == 2 {
+                    let (pos, size) = if self.editor.horizontal {
+                        (event.row, content.height)
+                    } else {
+                        (event.column.saturating_sub(sidebar), content.width)
+                    };
+                    self.editor.ratio =
+                        ((u32::from(pos) * 100 / u32::from(size.max(1))) as u16).clamp(20, 80);
+                }
+                self.geometry(self.terminal_size);
+                self.dirty = true;
+                return;
+            }
+        }
+        if self.split_drag.is_some() {
+            return;
+        }
+        if self.source.is_dir() {
+            let hovered = welcome::hit(
+                preview_area,
+                self.workspace_history.len(),
+                event.column,
+                event.row,
+            );
+            if self.workspace_hover != hovered {
+                self.workspace_hover = hovered;
+                self.dirty = true;
+            }
+            if event.kind == MouseEventKind::Down(MouseButton::Left) {
+                if let Some(index) = hovered {
+                    self.on_key(KeyEvent::from(KeyCode::Char(char::from(
+                        b'1' + index as u8,
+                    ))));
+                    return;
+                }
+            }
         }
         #[cfg(feature = "editor")]
         if self.editor.visible {
@@ -879,6 +1249,11 @@ impl App {
                 return;
             }
             if event.kind == MouseEventKind::Down(MouseButton::Left) {
+                if event.column < sidebar && self.editor.focused {
+                    self.browser_editor = true;
+                } else if event.column >= sidebar {
+                    self.browser_editor = false;
+                }
                 self.editor.focused = false;
                 self.dirty = true;
             }
@@ -902,7 +1277,15 @@ impl App {
         }
         let click = event.kind == MouseEventKind::Down(MouseButton::Left);
         if panel_width > 0 && event.column < panel_width {
+            let selected = self.files.select_at(side_area, event.column, event.row);
+            if selected {
+                self.dirty = true;
+            }
             if click {
+                #[cfg(feature = "editor")]
+                if self.editor.focused {
+                    self.browser_editor = true;
+                }
                 self.files.focused = true;
                 let panels = self.files.panels(ratatui::layout::Rect::new(
                     0,
@@ -915,6 +1298,9 @@ impl App {
                 self.hovered = None;
                 self.hover_deadline = None;
                 self.dirty = true;
+                if selected {
+                    self.on_non_focus_key(KeyEvent::from(KeyCode::Enter));
+                }
             }
             return;
         }
@@ -1009,6 +1395,7 @@ impl App {
                 }
                 self.history.push_back(self.view.clone());
                 self.view.page = dest.page;
+                self.view.fit = view::Fit::Manual;
                 self.view.zoom =
                     dest.view_zoom((self.viewport.width, self.viewport.height), self.view.zoom);
                 self.destination = Some(dest);
@@ -1060,6 +1447,9 @@ impl App {
                         (self.viewport.height / self.font_height) as u16,
                     );
                     if let Some(geometry) = completed.geometry {
+                        if geometry.document_id != self.doc.id {
+                            continue;
+                        }
                         self.encode_latest = Some((geometry, image, size));
                     }
                     self.error = self.doc.links.error.clone();
@@ -1074,6 +1464,7 @@ impl App {
         while let Ok((geometry, result)) = self.encoder.output.try_recv() {
             self.encoding_pending = false;
             if geometry.generation != self.renderer.current_generation()
+                || geometry.document_id != self.doc.id
                 || self.render_due.is_some()
             {
                 continue;
@@ -1109,7 +1500,9 @@ impl App {
         }
         if !self.encoding_pending {
             if let Some(input) = self.encode_latest.take() {
-                if input.0.generation == self.renderer.current_generation() {
+                if input.0.generation == self.renderer.current_generation()
+                    && input.0.document_id == self.doc.id
+                {
                     match self.encoder.input.as_ref().unwrap().try_send(input) {
                         Ok(()) => self.encoding_pending = true,
                         Err(mpsc::TrySendError::Full(input)) => {
@@ -1134,7 +1527,12 @@ impl App {
         #[cfg(feature = "typst")]
         {
             if self.live.as_ref().is_some_and(|live| live.compiling) {
-                return "Compiling…".into();
+                let live = self.live.as_ref().unwrap();
+                return if live.iteration > 0 {
+                    format!("Typst watch · updating · previous {} ms", live.last_millis)
+                } else {
+                    "Typst watch · starting…".into()
+                };
             }
             if let Some(notice) = &self.settings_notice {
                 return links::sanitize(notice);
@@ -1149,6 +1547,15 @@ impl App {
         }
         if !self.jump.is_empty() {
             return format!(":{} · Enter: go to page", self.jump);
+        }
+        #[cfg(feature = "typst")]
+        if self.error.is_none() {
+            if let Some(live) = &self.live {
+                return format!(
+                    "Typst watch · {} ms · pass {}",
+                    live.last_millis, live.iteration
+                );
+            }
         }
         self.error
             .as_ref()
@@ -1207,8 +1614,17 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
         app.files.render(f, columns[0], &app.source);
     }
     if app.source.is_dir() {
-        welcome::render(f, columns[1], app.files.folder(), &app.workspace_history);
+        welcome::render(
+            f,
+            columns[1],
+            app.files.folder(),
+            &app.workspace_history,
+            app.workspace_hover,
+        );
         app.files.render_recent_info(f, columns[1]);
+        if let Some(picker) = &app.picker {
+            picker.render(f);
+        }
         return;
     }
     let name = links::sanitize(
@@ -1218,10 +1634,15 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
             .to_string_lossy(),
     );
     let title = format!(
-        "PDF · {name} · {}/{} · {:.0}%",
+        "PDF · {name} · {}/{} · {:.0}%{} · ▾ F3",
         app.view.page + 1,
         app.view.pages,
-        app.view.zoom * 100.0
+        app.view.zoom * 100.0,
+        match app.view.fit {
+            view::Fit::Page => " · fit page",
+            view::Fit::Width => " · fit width",
+            view::Fit::Manual => "",
+        }
     );
     let pdf_block = document_block(
         &title,
@@ -1288,6 +1709,9 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
         render_compile_error(f, screen, error);
     }
     app.files.render_recent_info(f, columns[1]);
+    if let Some(picker) = &app.picker {
+        picker.render(f);
+    }
     #[cfg(feature = "typst")]
     if let Some(settings) = &app.settings {
         settings.render(f);
@@ -1489,7 +1913,7 @@ fn viewer_loop(
     let encoder = Worker::new(move |(geometry, image, _size): EncodeInput, _| {
         let started = Instant::now();
         let key = (
-            geometry.revision,
+            geometry.document_id,
             geometry.page,
             geometry.raster,
             geometry.crop,
@@ -1598,9 +2022,22 @@ fn viewer_loop(
     if pdf_mode {
         files.record(&path);
     }
+    let initial_view = View::new(doc.pages);
     let mut app = App {
+        keybindings: keybindings::System::new(if path.is_dir() {
+            &path
+        } else {
+            path.parent().unwrap_or(Path::new("."))
+        }),
         #[cfg(feature = "editor")]
         editor: editor::Editor::new(),
+        picker: None,
+        #[cfg(feature = "editor")]
+        browser_editor: false,
+        #[cfg(feature = "editor")]
+        window_prefix: false,
+        workspace_hover: None,
+        split_drag: None,
         workspace_history: files.workspace_history(),
         files,
         terminal_size: Size::default(),
@@ -1622,7 +2059,7 @@ fn viewer_loop(
         #[cfg(feature = "typst")]
         compile_millis: 0,
         source: path,
-        view: View::new(doc.pages),
+        view: initial_view,
         doc: doc.clone(),
         font_width: u32::from(font.width.max(1)),
         font_height: u32::from(font.height.max(1)),
@@ -1646,6 +2083,7 @@ fn viewer_loop(
         encoder,
         reloader,
         reload_pending: false,
+        reload_source: None,
         reload_again: false,
         encoding_pending: false,
         encode_latest: None,
@@ -1679,15 +2117,29 @@ fn viewer_loop(
     let _signals = Signals(signal_ids);
     let mut reload_due: Option<Instant> = None;
     loop {
+        if app.keybindings.poll_reload() {
+            app.dirty = true;
+        }
+        if let Some(resolution) = app.keybindings.engine.expire(Instant::now()) {
+            if app.resolve_binding(resolution) == Some(true) {
+                break;
+            }
+        }
         if stopping.load(std::sync::atomic::Ordering::Relaxed) {
             break;
         }
-        #[cfg(feature = "typst")]
-        app.consume_live();
         #[cfg(feature = "editor")]
-        if app.editor.poll() {
+        if app.editor.poll() | app.editor.tick() {
             app.dirty = true;
         }
+        #[cfg(all(feature = "editor", feature = "typst"))]
+        if let Some((path, byte)) = app.editor.saved_location.take() {
+            if let Some(live) = &mut app.live {
+                live.prefer_source(path, byte);
+            }
+        }
+        #[cfg(feature = "typst")]
+        app.consume_live();
         if app.files.poll() {
             app.dirty = true;
         }
@@ -1765,7 +2217,10 @@ fn viewer_loop(
             app.dirty = true;
         }
         if app.dirty {
-            terminal.draw(|f| ui(f, &mut app))?;
+            terminal.draw(|f| {
+                ui(f, &mut app);
+                app.keybindings.render(f);
+            })?;
             app.dirty = false;
         }
         if event::poll(Duration::from_millis(10))? {

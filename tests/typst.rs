@@ -107,6 +107,12 @@ fn same_generation_pdf_mapping_includes_formula_shift_error_recovery() {
     let fixed = helper.compile(4);
     assert!(fixed["error"].is_null());
     assert_eq!(fixed["generation"], 4);
+    assert_eq!(result["compiler_pid"], fixed["compiler_pid"]);
+    assert_eq!(fixed["iteration"], 4);
+    eprintln!(
+        "persistent Typst: cold={}ms, edit={}ms, recovery={}ms, pid={}",
+        result["millis"], shifted["millis"], fixed["millis"], fixed["compiler_pid"]
+    );
 }
 
 #[test]

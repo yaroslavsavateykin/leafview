@@ -151,7 +151,7 @@ fn editor_render_snapshot_and_tiny_sizes() {
     assert!(snapshot.lines().next().unwrap().contains("test.typ"));
     assert!(!snapshot.lines().next().unwrap().contains("Normal"));
     assert!(snapshot.lines().nth(10).unwrap().contains("Normal  1:1"));
-    assert_eq!(buffer[(7, 1)].fg, super::syntax::Token::Keyword.color());
+    assert_eq!(buffer[(7, 2)].fg, super::syntax::Token::Keyword.color());
     if let Ok(path) = std::env::var("LEAFVIEW_EDITOR_SNAPSHOT") {
         std::fs::write(path, snapshot).unwrap();
     }
@@ -167,9 +167,10 @@ fn completion_resize_and_command_hints() {
     editor.buffers.push(buffer("hello helium\nhe\n"));
     editor.buffers[0].set_cursor(15);
     editor.vim.mode = vim::Mode::Insert;
-    editor.key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
+    // Ctrl-N now opens completion rather than immediately replacing a word.
+    editor.complete_word(false);
     assert!(editor.buffers[0].state.doc.to_string().contains("helium\n"));
-    editor.key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
+    editor.complete_word(false);
     assert!(editor.buffers[0].state.doc.to_string().ends_with("hello\n"));
     editor.key(KeyEvent::from(KeyCode::Esc));
     editor.key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
@@ -192,7 +193,7 @@ fn mouse_insert_arrows_and_format_on_save() {
         crossterm::event::MouseEvent {
             kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
             column: 28,
-            row: 2,
+            row: 3,
             modifiers: KeyModifiers::NONE,
         },
         area,

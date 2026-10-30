@@ -56,11 +56,12 @@ version still match; formatting is undoable. `tinymist` and `typstyle` feature
 names imply editor for build compatibility but do NOT embed those tools.
 
 Explicit LSP commands: `:hover`, `:complete`, `:definition`, `:references`,
-`:signature`, `:symbols`, `:diagnostics`, `:lsp-restart`. Responses are presently
-shown as truncated/sanitized JSON status text, NOT actionable menus/navigation.
-Servers are external tinymist/rust-analyzer/clangd/pyright-langserver; override
+`:signature`, `:symbols`, `:diagnostics`, `:lsp-restart`. Responses use a structured popup for hover/signatures, completion acceptance,
+and definition/reference navigation. F1/F12/Ctrl+Space/Ctrl+s invoke these actions.
+Servers are external tinymist/rust-analyzer/clangd/pyright-langserver/typescript-language-server; override
 with `LEAFVIEW_LSP='program args'`. Sync currently happens on explicit requests,
-not continuously while typing. One active document/server is maintained.
+on explicit requests and debounced automatic completion/signature requests. One
+active document/server is maintained in a dedicated LSP worker.
 
 ## Tests run
 
@@ -103,9 +104,9 @@ not included. Search/substitution can still do linear UI-thread work.
   Python, JS/TS and C/C++ tokens, with a 256-line bounded cache per buffer and
   version invalidation. It is NOT Tree-sitter/semantic highlighting; multiline
   strings/comments and embedded Typst code context are approximate.
-* No full editor window/tab layout, divider dragging or persistence. Buffer
-  switching is not a tab UI. Viewer mouse/sidebar offsets with editor splits
-  need more integration coverage.
+* Clickable retained-buffer tabs and divider dragging are implemented; arbitrary
+  editor windows and layout persistence are not. More real-terminal mouse coverage
+  is still needed.
 * No automatic initial source pane, source diagnostic jump or new bidirectional
   source/PDF sync; existing compiler source maps remain unchanged.
 * Vim coverage is a subset, not full Neovim. Visual Block change/paste semantics,
@@ -113,9 +114,11 @@ not included. Search/substitution can still do linear UI-thread work.
   mapping configuration file, operator+find/%, exact word-motion edge cases and
   `==` are incomplete. `==` explicitly advises :format rather than pretending
   to indent. Combining graphemes are handled for h/l, not all edit operations.
-* No completion acceptance/snippets, rename, code-action application,
-  workspace edits, definition navigation, structured diagnostics popup,
-  automatic restart, continuous LSP sync or incremental didChange.
+* Basic completion acceptance (including UTF-16 textEdit), default snippet expansion,
+  and definition/reference navigation are implemented. No snippet tabstop navigation,
+  additionalTextEdits, rename, code-action
+  application, workspace edits, automatic restart, continuous LSP sync or incremental
+  didChange. Diagnostics can be requested explicitly; no persistent gutter.
 * Format-on-save is enabled by default for known file extensions. Disable with
   `:set noformatonsave`, enable with `:set formatonsave`. Missing/failed external
   formatter refuses the save with a message; no silent fallback. Stale results
@@ -124,6 +127,20 @@ not included. Search/substitution can still do linear UI-thread work.
   currently replaces the whole Rope text in one undoable transaction and does
   not preserve cursor mapping. File saves lack external-change conflict checks.
 * History is unbounded (upstream History); per-file input limited to 256 MiB.
-* LSP and IO share one worker; a slow LSP request delays save/open tasks but
-  does not block input. Root detection/server capabilities need extension.
+* LSP and IO use separate workers; a slow LSP request no longer delays save/open.
+  Root detection/server capabilities still need extension.
 * No actual SSH/tmux visual certification for the new source pane.
+
+## Interaction fixes verification
+
+Pointer row selection in tree/Recent, clickable/hovered welcome workspaces,
+Visual-mode mouse dragging, clickable tabs, Ctrl+PageUp/PageDown and draggable
+pane boundaries were added. Ctrl+arrows resize again; Ctrl+hjkl retains focus
+navigation. A release build with typst+editor passed. Native editor PTY smoke
+passed. Real Tinymist 0.15.10 (Typst 0.15.1) returned non-null hover, definition,
+signature and completion responses; Typstyle 0.15.2 formatted a test source.
+Both tools installed in ~/.local/bin in this environment. Rustfmt save/undo tests
+passed. Terminal TestBackend snapshots were inspected, not a real GUI screenshot.
+Full all-features run: 68 passed, 5 failed (existing PDF link/annotation geometry
+suites), 4 ignored at that point. Strict Clippy still reports existing warnings in
+LSP/Vim/main/tests/links; it is not a clean lint claim.

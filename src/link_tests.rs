@@ -94,6 +94,7 @@ fn coordinate_matrix_zoom_scroll_rotation_center_and_cells() {
                 ] {
                     let crop = (scroll.0, scroll.1, raster.0 - scroll.0, raster.1 - scroll.1);
                     let g = RenderGeometry {
+                        document_id: 1,
                         revision: 2,
                         page: page as u32,
                         generation: 7,
@@ -128,6 +129,7 @@ fn y_axis_and_ambiguous_small_links() {
     let index = index();
     let p = index.pages[0].clone().unwrap();
     let mut g = RenderGeometry {
+        document_id: 1,
         revision: 1,
         page: 0,
         generation: 1,

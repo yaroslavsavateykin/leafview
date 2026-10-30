@@ -26,6 +26,7 @@ struct Compiler {
     main: FileId,
     now: Time,
     pdf_options: typst_pdf::PdfOptions,
+    iteration: u64,
 }
 impl World for Compiler {
     fn library(&self) -> &LazyHash<Library> {
@@ -135,10 +136,12 @@ impl Compiler {
             main,
             now,
             pdf_options,
+            iteration: 0,
         })
     }
     fn compile(&mut self, request: CompileRequest) -> CompileReply {
         let start = std::time::Instant::now();
+        self.iteration += 1;
         self.files.reset();
         self.now.reset();
         let output = typst::compile::<PagedDocument>(self);
@@ -165,6 +168,8 @@ impl Compiler {
             points: Vec::new(),
             error: None,
             millis: 0,
+            compiler_pid: std::process::id(),
+            iteration: self.iteration,
         };
         if source_bytes > 16 * 1024 * 1024 {
             reply.error = Some("Typst source snapshots exceed 16 MiB".into());
@@ -212,6 +217,7 @@ impl Compiler {
                 let result = (|| -> Result<()> {
                     // Gather source spans from the exact frames exported below.
                     let mut exported_page = 0;
+                    let mut spans = std::collections::HashMap::new();
                     for (page, item) in document.pages().iter().enumerate() {
                         if self
                             .pdf_options
@@ -228,6 +234,7 @@ impl Compiler {
                             exported_page,
                             (item.frame.width().to_pt(), item.frame.height().to_pt()),
                             &mut reply.points,
+                            &mut spans,
                         );
                         exported_page += 1;
                     }
@@ -262,6 +269,10 @@ fn collect(
     page: u32,
     size: (f64, f64),
     points: &mut Vec<SourcePoint>,
+    spans: &mut std::collections::HashMap<
+        typst::syntax::Span,
+        Option<(PathBuf, std::ops::Range<usize>, bool)>,
+    >,
 ) {
     use typst::layout::{FrameItem, Transform};
     for (mut pos, item) in frame.items().cloned() {
@@ -277,6 +288,7 @@ fn collect(
                     page,
                     size,
                     points,
+                    spans,
                 );
             }
             FrameItem::Text(text) => {
@@ -285,20 +297,22 @@ fn collect(
                         return;
                     }
                     if let Some(id) = glyph.span.0.id() {
-                        if let (Ok(source), Ok(path)) =
-                            (world.source(id), world.files.loader().resolve(id))
-                        {
-                            if let Some(range) = source.find(glyph.span.0).map(|node| node.range())
+                        let cached = spans.entry(glyph.span.0).or_insert_with(|| {
+                            let source = world.source(id).ok()?;
+                            let path = world.files.loader().resolve(id).ok()?;
+                            let node = source.find(glyph.span.0)?;
+                            Some((
+                                path,
+                                node.range(),
+                                node.kind() == typst::syntax::SyntaxKind::MathText,
+                            ))
+                        });
+                        if let Some((path, range, math)) = cached {
                             {
                                 let point = pos.transform(transform);
-                                // Math text runs retain one span for a multi-digit
-                                // token; unlike markup their glyph offsets live
-                                // in TextItem::range rather than span.1.
-                                let math = source.find(glyph.span.0).is_some_and(|node| {
-                                    node.kind() == typst::syntax::SyntaxKind::MathText
-                                });
+                                let math = *math;
                                 let candidate = SourcePoint {
-                                    file: path,
+                                    file: path.clone(),
                                     start: if math {
                                         range.start
                                     } else {

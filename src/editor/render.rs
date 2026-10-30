@@ -26,11 +26,60 @@ impl Editor {
             Color::Rgb(20, 25, 33)
         };
         f.render_widget(Block::new().style(Style::default().bg(background)), area);
-        let block =
-            crate::files::panel_block(&name, self.focused).style(Style::default().bg(background));
-        let inner = block.inner(area);
+        let block = crate::files::panel_block(&format!("{name} · ▾ F3"), self.focused)
+            .style(Style::default().bg(background));
+        let mut inner = block.inner(area);
         f.render_widget(block, area);
         if inner.width == 0 || inner.height == 0 {
+            return;
+        }
+        for (index, x, width) in self.tab_regions(area) {
+            let b = &self.buffers[index];
+            let name = b.path.file_name().unwrap_or_default().to_string_lossy();
+            let available = width.saturating_sub(8) as usize;
+            let short: String = name.chars().take(available).collect();
+            let label = format!(
+                " {}{}{}",
+                short,
+                if name.chars().count() > available {
+                    "…"
+                } else {
+                    ""
+                },
+                if b.dirty() { " ●" } else { "" }
+            );
+            f.render_widget(
+                Paragraph::new(crate::links::sanitize(&label)).style(
+                    Style::default()
+                        .fg(if index == self.current {
+                            Color::Rgb(155, 235, 225)
+                        } else {
+                            Color::Rgb(150, 166, 185)
+                        })
+                        .bg(if index == self.current {
+                            Color::Rgb(42, 67, 80)
+                        } else {
+                            background
+                        }),
+                ),
+                Rect::new(x, inner.y, width, 1),
+            );
+            if width >= 4 {
+                f.render_widget(
+                    Paragraph::new(" × ").style(Style::default().fg(Color::Rgb(137, 159, 180)).bg(
+                        if index == self.current {
+                            Color::Rgb(42, 67, 80)
+                        } else {
+                            background
+                        },
+                    )),
+                    Rect::new(x + width - 3, inner.y, 3, 1),
+                );
+            }
+        }
+        inner.y = inner.y.saturating_add(1);
+        inner.height = inner.height.saturating_sub(1);
+        if inner.height == 0 {
             return;
         }
         let Some(b) = self.buffers.get_mut(self.current) else {
@@ -38,6 +87,7 @@ impl Editor {
             return;
         };
         let height = inner.height.saturating_sub(1) as usize;
+        self.viewport_height = height.max(1);
         let cursor = b.cursor();
         let row = b.line();
         if row < b.scroll {
@@ -146,6 +196,24 @@ impl Editor {
                     .bg(Color::Rgb(35, 47, 62)),
             ),
             Rect::new(inner.x, inner.bottom() - 1, inner.width, 1),
+        );
+        self.draw_signature(
+            f,
+            Rect::new(
+                inner.x,
+                inner.y,
+                inner.width,
+                inner.height.saturating_sub(1),
+            ),
+        );
+        self.draw_completion(
+            f,
+            Rect::new(
+                inner.x,
+                inner.y,
+                inner.width,
+                inner.height.saturating_sub(1),
+            ),
         );
     }
 }

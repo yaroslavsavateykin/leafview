@@ -20,9 +20,11 @@ with tempfile.TemporaryDirectory() as tmp:
         os.write(master,b'ciwNative\x1b');pump(.2);os.write(master,b':w\r');pump(.6)
         assert path.read_text()=='Native world\n',path.read_text()
         # Global navigation must escape editor input in all modes. Tree ->
-        # source -> PDF -> source via Ctrl+h/l and Ctrl+arrow reports.
+        # source -> PDF -> source via Ctrl+h/l. Ctrl+arrows resize panes.
         os.write(master,b'\x08');pump(.1)
         os.write(master,b'\x0c');pump(.1)
+        os.write(master,b'\x0c');pump(.1)
+        os.write(master,b'\x08');pump(.1)
         os.write(master,b'\x1b[1;5C');pump(.1)
         os.write(master,b'\x1b[1;5D');pump(.1)
         os.write(master,b'iX');pump(.1);os.write(master,b'\x1b');pump(.1);os.write(master,b':w\r');pump(.5)

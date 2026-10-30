@@ -480,6 +480,7 @@ impl LinkIndex {
 /// Snapshot identity and exact decoded pixel dimensions travel with the encoded image.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct RenderGeometry {
+    pub document_id: u64,
     pub revision: u64,
     pub page: u32,
     pub generation: u64,
@@ -558,6 +559,7 @@ mod hit_tests {
             links: vec![link.clone(), link],
         };
         let mut geometry = RenderGeometry {
+            document_id: 1,
             revision: 1,
             page: 0,
             generation: 1,

@@ -1,0 +1,17 @@
+[keybindings]
+preset = "custom"
+leader = "Space"
+local_leader = ","
+timeout_ms = 800
+
+[keybindings.normal]
+"x" = "editor.cursor.right"
+"Space s" = "editor.save"
+"Space d" = { disabled = true }
+
+[keybindings.insert]
+"Esc" = "editor.mode.normal"
+
+[keybindings.layout]
+"о" = "j"
+"л" = "k"

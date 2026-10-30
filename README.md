@@ -54,7 +54,8 @@ and is saved atomically to `$XDG_STATE_HOME/leafview/recent.json` (default:
 | `Ctrl+←` / `Ctrl+→` | Move the vertical split left / right (1 column) |
 | `Ctrl+↑` / `Ctrl+↓` | Move the tree/Recent split up / down (1 row, sidebar focus) |
 | `Tab` | Cycle focus: tree → Recent → PDF → tree |
-| Left click | Activate the clicked pane (hover never changes focus) |
+| Hover / left click | Select browser row / open file or toggle folder (hover does not change keyboard focus) |
+| Drag pane border | Resize sidebar, tree/Recent or source/PDF split |
 | `Esc` / `F2` | Show / hide sidebar |
 | `↑` / `↓`, `j` / `k` | Select entry |
 | `→` / `l` | Expand directory |
@@ -368,9 +369,65 @@ panel. Optional `LEAFVIEW_DEBUG`/`LEAFVIEW_PERF` diagnostics are written only to
 Build with `cargo build --release --features typst,editor`. While viewing a Typst
 file, F4 opens/hides the source pane; F6 switches source/PDF focus. `:w` saves
 asynchronously and the existing Typst watcher recompiles the saved source.
+The editor has a clickable tab strip (● marks unsaved changes); Ctrl+PageUp/PageDown
+switch retained buffers. Drag over source text to select it in Vim Visual mode
+(`y` copies to the Vim register, `d` deletes). Ctrl+arrows resize the sidebar;
+Ctrl+h/j/k/l move focus; Alt+Left/Right resize source/PDF. Pane borders are draggable.
+
+LSP shortcuts in source: F1 hover/documentation, F12 go to definition,
+Ctrl+Space completion, Ctrl+s signature/arguments. In the LSP popup use
+Up/Down or Tab to select, Enter to accept/jump, Esc to dismiss. Requests synchronize
+the current buffer before querying. Automatic completion runs after a 250 ms typing
+pause; `(` and `,` request argument/signature help. LSP uses its own worker, separate
+from file IO/formatting, and stale replies are rejected. `:set noautocomplete`
+disables automatic suggestions; `:set autocomplete` enables them. Basic snippet
+placeholders expand to their defaults (no tabstop navigation). Alt+f or `:format` formats; `:w` formats then saves by default.
+Install external `tinymist` and `typstyle` for Typst (compatible with Typst 0.15).
+Other languages use rust-analyzer/rustfmt, pyright-langserver/black,
+clangd/clang-format or typescript-language-server/prettier. Executables must be on
+PATH. `LEAFVIEW_LSP='program args'` and `LEAFVIEW_FORMATTER='program args'`
+override the commands (whitespace-separated arguments, not shell syntax).
+
 The editor is opt-in and is **not yet a complete Vim/LSP IDE**. Implemented
 commands, architecture, measured 1/10/100 MiB performance and explicit remaining
 limitations are documented in [EDITOR-HELIX-STATUS.md](EDITOR-HELIX-STATUS.md).
+
+### Independent source and preview file selection
+
+Click a pane title (▾ F3), or press F3 / Ctrl+p in that pane, to choose its file.
+Type to filter the current folder, arrows/Tab to select, Enter to open or enter a
+folder, Left with an empty search to go to the parent folder, Esc to cancel.
+The source picker includes common text/code formats; the preview picker includes
+PDF and Typst. Opening source does not change the preview document and choosing
+a preview does not replace the current source tab. The sidebar remembers whether
+you entered it from source or preview; PDF files always open in preview.
+
+Drag the shared pane borders with the left mouse button to resize. Mouse capture
+must be forwarded by the terminal/tmux; Shift+drag is often reserved by terminals
+for native text selection, so use plain left-button dragging.
+
+### Additional Vim keys
+
+| Keys | Action |
+| --- | --- |
+| Ctrl+w then h/j/k/l | Directional pane focus |
+| Ctrl+w then w | Cycle source/preview focus |
+| Ctrl+w then v / s | Vertical / horizontal source-preview split |
+| Ctrl+w then > / < / = / c | Resize / equalize / hide source (retains buffers) |
+| gt / gT / 2gt | Next / previous / numbered source tab |
+| :b 2 / :ls / :bd | Select / list / close buffer (dirty protection; :bd! discards) |
+| gd / gr / K | Definition / references / hover |
+| Ctrl+d/u, Ctrl+f/b | Half / full viewport down/up |
+| Ctrl+e/y | Scroll one row down/up |
+| H / M / L | Top / middle / bottom visible line |
+| zz / zt / zb | Center / top / bottom cursor line |
+| ma / 'a / `a | Set local mark / jump to its line / exact position |
+| Y / ~ | Yank lines / toggle character case |
+| Insert Ctrl+w / Ctrl+u | Delete previous word / to start of line |
+| Ctrl+[ | Escape to Normal mode |
+
+This remains a Vim subset, not full Neovim. Registers are internal (not system
+clipboard); mark positions are not remapped after edits.
 
 ## SSH and Kitty graphics
 

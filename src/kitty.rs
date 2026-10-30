@@ -97,25 +97,45 @@ impl Widget for &KittyImage {
         if width == 0 || height == 0 {
             return;
         }
+        // Encoder LRU eviction may reuse an ID while a visible replay still owns
+        // the old pixels. Upload state belongs to the slot's current content, not
+        // only to each replay's Arc. Re-upload on a content/epoch mismatch.
+        static SLOTS: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<u32, std::sync::Weak<AtomicU64>>>,
+        > = std::sync::OnceLock::new();
+        let mut slots = SLOTS.get_or_init(Default::default).lock().unwrap();
+        let same = slots
+            .get(&self.id)
+            .and_then(std::sync::Weak::upgrade)
+            .is_some_and(|sent| std::sync::Arc::ptr_eq(&sent, &self.sent));
+        if !same {
+            self.sent.store(0, Ordering::SeqCst);
+            slots.retain(|_, owner| owner.strong_count() > 0);
+            slots.insert(self.id, std::sync::Arc::downgrade(&self.sent));
+        }
+        let epoch = TERMINAL_EPOCH.load(Ordering::SeqCst);
+        let upload = self.sent.swap(epoch, Ordering::SeqCst) != epoch;
+        drop(slots);
         let [extra, r, g, b] = self.id.to_be_bytes();
         for y in 0..height {
             let mut row = String::new();
-            let epoch = TERMINAL_EPOCH.load(Ordering::SeqCst);
-            if y == 0 && self.sent.swap(epoch, Ordering::SeqCst) != epoch {
+            if y == 0 && upload {
                 row.push_str(&self.transfer);
             }
             // Save/restore the cursor and foreground, not just its position.
             write!(
                 row,
-                "\x1b7\x1b[38;2;{r};{g};{b}m\u{10eeee}{}{}{}",
+                "\x1b7\x1b[?7l\x1b[38;2;{r};{g};{b}m\u{10eeee}{}{}{}",
                 DIACRITICS[y as usize], DIACRITICS[0], DIACRITICS[extra as usize]
             )
             .unwrap();
             row.extend(std::iter::repeat_n('\u{10eeee}', usize::from(width - 1)));
-            row.push_str("\x1b8");
+            // Full-width rows (fit width / 100%) must not leave delayed
+            // autowrap pending or scroll at the terminal's right margin.
+            row.push_str("\x1b[?7h\x1b8");
             buf[(area.x, area.y + y)]
                 .set_symbol(&row)
-                .set_diff_option(CellDiffOption::ForcedWidth(NonZeroU16::new(1).unwrap()));
+                .set_diff_option(CellDiffOption::ForcedWidth(NonZeroU16::new(width).unwrap()));
             for x in 1..width {
                 buf[(area.x + x, area.y + y)].set_diff_option(CellDiffOption::Skip);
             }
@@ -466,6 +486,12 @@ mod tests {
         let mut buf = Buffer::empty(Rect::new(0, 0, 40, 15));
         (&kitty).render(buf.area, &mut buf);
         assert!(buf[(0, 0)].symbol().contains("f=100"));
+        assert!(buf[(0, 0)].symbol().contains("\x1b[?7l"));
+        assert!(buf[(0, 0)].symbol().contains("\x1b[?7h"));
+        assert_eq!(
+            buf[(0, 0)].diff_option,
+            CellDiffOption::ForcedWidth(NonZeroU16::new(40).unwrap())
+        );
         (&kitty).render(buf.area, &mut buf);
         assert!(!buf[(0, 0)].symbol().contains("f=100"));
         let mut revisited = Buffer::empty(Rect::new(0, 0, 40, 15));
@@ -473,6 +499,15 @@ mod tests {
         assert!(
             !revisited[(0, 0)].symbol().contains("f=100"),
             "cached viewport uploaded PNG again"
+        );
+        // Simulate encoder slot reuse while an old visible/replay owner survives.
+        let replacement = KittyImage::new(image.clone(), Size::new(40, 15), 123, false).unwrap();
+        (&replacement).render(revisited.area, &mut revisited);
+        assert!(revisited[(0, 0)].symbol().contains("f=100"));
+        (&replay).render(revisited.area, &mut revisited);
+        assert!(
+            revisited[(0, 0)].symbol().contains("f=100"),
+            "old replay must restore its content after ID reuse"
         );
         let fresh = KittyImage::new(image, Size::new(40, 15), 124, false).unwrap();
         let queued_clone = fresh.replay();

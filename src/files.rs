@@ -333,6 +333,44 @@ impl Files {
         }
         None
     }
+    pub fn select_at(&mut self, area: Rect, x: u16, y: u16) -> bool {
+        for (recent, panel) in self.panels(area).into_iter().enumerate() {
+            if x > panel.x
+                && x < panel.right().saturating_sub(1)
+                && y > panel.y
+                && y < panel.bottom().saturating_sub(1)
+            {
+                let offset = if recent == 1 {
+                    self.recent_state.offset()
+                } else {
+                    self.state.offset()
+                };
+                let index = offset + usize::from(y - panel.y - 1);
+                let len = if recent == 1 {
+                    self.recent.len()
+                } else {
+                    self.entries.len()
+                };
+                if index < len {
+                    self.recent_focused = recent == 1;
+                    if recent == 1 {
+                        self.recent_selected = index;
+                    } else {
+                        self.selected = index;
+                    }
+                    return true;
+                }
+            }
+        }
+        false
+    }
+    pub fn drag_split(&mut self, x: u16, y: u16, vertical: bool) {
+        if vertical {
+            self.sidebar_width = Some(x);
+        } else {
+            self.tree_height = Some(y);
+        }
+    }
     pub fn hover_recent(&mut self, area: Rect, x: u16, y: u16) -> bool {
         let previous = self.recent_hover.take();
         let recent = self.panels(area)[1];
@@ -657,6 +695,28 @@ fn append_directory(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn pointer_selects_entries_and_resizes_dividers() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.typ"), "hello").unwrap();
+        let mut files = Files::new(dir.path(), true);
+        files.focused = false;
+        let area = Rect::new(0, 0, 30, 30);
+        assert!(files.select_at(area, 3, 2));
+        assert_eq!(files.selected, 1);
+        assert!(!files.focused);
+        assert_eq!(
+            files.key(KeyEvent::from(KeyCode::Enter)),
+            Some(dir.path().join("a.typ"))
+        );
+        files.recent = vec![dir.path().join("a.typ")];
+        assert!(files.select_at(area, 3, files.panels(area)[1].y + 1));
+        assert!(files.recent_focused);
+        files.drag_split(40, 10, true);
+        assert_eq!(files.width(120), 40);
+        files.drag_split(40, 10, false);
+        assert_eq!(files.panels(area)[0].height, 10);
+    }
     #[test]
     fn recent_popup_tracks_pointer_without_stealing_focus() {
         let dir = tempfile::tempdir().unwrap();

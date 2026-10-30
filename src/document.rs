@@ -12,7 +12,10 @@ pub struct Document {
     snapshot: NamedTempFile,
     pub pages: u32,
     pub revision: u64,
+    /// Process-unique identity of this immutable snapshot (revision is caller-local).
+    pub id: u64,
     pub links: crate::links::LinkIndex,
+    fallback_aspect: f64,
 }
 impl Document {
     pub fn open(source: &Path, revision: u64) -> Result<Self> {
@@ -63,6 +66,19 @@ impl Document {
             })
             .filter(|&n| n > 0)
             .context("pdfinfo did not report a valid page count")?;
+        let fallback_aspect = info
+            .lines()
+            .find_map(|line| {
+                let size = line.strip_prefix("Page size:")?;
+                let mut numbers = size.split_whitespace();
+                let width = numbers.next()?.parse::<f64>().ok()?;
+                if numbers.next()? != "x" {
+                    return None;
+                }
+                let height = numbers.next()?.parse::<f64>().ok()?;
+                (width > 0. && height > 0.).then_some(height / width)
+            })
+            .unwrap_or(297. / 210.);
         copied.hash(&mut fingerprint);
         // Cache by immutable PDF contents, not path/mtime: Typst writes a new
         // temporary path for every compilation, and atomic saves reuse names.
@@ -83,12 +99,27 @@ impl Document {
             }
             links
         };
+        static NEXT_SNAPSHOT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         Ok(Self {
+            id: NEXT_SNAPSHOT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             links,
             snapshot,
             pages,
             revision,
+            fallback_aspect,
         })
+    }
+    pub fn page_aspect(&self, page: u32) -> f64 {
+        self.links
+            .pages
+            .get(page as usize)
+            .and_then(Option::as_ref)
+            .map(|p| {
+                let (w, h) = p.space.size();
+                h / w
+            })
+            .filter(|a| a.is_finite() && *a > 0.)
+            .unwrap_or(self.fallback_aspect)
     }
     pub fn snapshot_path(&self) -> &Path {
         self.snapshot.path()

@@ -1,0 +1,11 @@
+[keybindings]
+preset = "astronvim"
+leader = "Space"
+local_leader = ","
+timeout_ms = 500
+
+[keybindings.normal]
+"<Leader>w" = "editor.save"
+"<Leader>ff" = "files.find"
+"<Leader>lR" = "lsp.references"
+"<Leader>lh" = "lsp.signature"

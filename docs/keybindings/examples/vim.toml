@@ -1,0 +1,9 @@
+[keybindings]
+preset = "vim"
+timeout_ms = 500
+
+[keybindings.normal]
+"j" = "editor.cursor.down"
+"k" = "editor.cursor.up"
+"gg" = "editor.cursor.file_start"
+"G" = "editor.cursor.file_end"

@@ -37,6 +37,10 @@ pub struct CompileReply {
     pub points: Vec<SourcePoint>,
     pub error: Option<String>,
     pub millis: u64,
+    #[serde(default)]
+    pub compiler_pid: u32,
+    #[serde(default)]
+    pub iteration: u64,
 }
 pub fn reply_path(output: &Path) -> PathBuf {
     output.with_extension("json")
@@ -143,6 +147,10 @@ pub struct Live {
     pub auto_sync: bool,
     pub last: Option<SourcePoint>,
     pub compiling: bool,
+    pub compiler_pid: u32,
+    pub iteration: u64,
+    pub last_millis: u64,
+    preferred: Option<(PathBuf, usize)>,
 }
 impl Live {
     pub fn new(
@@ -180,7 +188,10 @@ impl Live {
                     if process.is_none() {
                         *process = Some(CompilerProcess::new(&input, &root, &options)?);
                     }
-                    let result = process.as_mut().unwrap().compile(generation, &cancelled);
+                    // Superseding edits must not kill the persistent Typst world:
+                    // let this pass finish/cache, discard its result, then compile latest.
+                    let shutdown = || stop.load(Ordering::SeqCst);
+                    let result = process.as_mut().unwrap().compile(generation, &shutdown);
                     let (mut reply, output) = match result {
                         Ok(v) => v,
                         Err(e) => {
@@ -188,7 +199,7 @@ impl Live {
                             return Err(e);
                         }
                     };
-                    let document = if reply.error.is_none() {
+                    let document = if reply.error.is_none() && !cancelled() {
                         Some(Document::open_cancel(&output, generation, cancelled)?)
                     } else {
                         None
@@ -222,9 +233,6 @@ impl Live {
                         document,
                     })
                 })();
-                if result.is_err() {
-                    process.lock().unwrap().0.take();
-                }
                 (generation, result)
             },
         );
@@ -266,6 +274,10 @@ impl Live {
             auto_sync: true,
             last: None,
             compiling: true,
+            compiler_pid: 0,
+            iteration: 0,
+            last_millis: 0,
+            preferred: None,
         })
     }
     pub fn configure(&mut self, settings: &crate::compile_config::Effective) -> Result<()> {
@@ -282,6 +294,11 @@ impl Live {
         }
         Ok(())
     }
+    /// Prefer the native editor's saved cursor over filesystem event ordering.
+    pub fn prefer_source(&mut self, path: PathBuf, byte: usize) {
+        let path = path.canonicalize().unwrap_or(path);
+        self.preferred = Some((path, byte));
+    }
     pub fn refresh(&mut self) {
         let _publication = self.publication.lock().unwrap();
         self.generation.fetch_add(1, Ordering::SeqCst);
@@ -293,8 +310,19 @@ impl Live {
             self.refresh();
             self.changed.extend(self.dependencies.iter().cloned());
         }
+        let mut touched = BTreeSet::new();
         while let Ok(path) = self.events.try_recv() {
             if self.dependencies.contains(&path) && self.auto_compile {
+                touched.insert(path);
+            }
+        }
+        for path in touched {
+            // Deduplicate notify bursts and ignore saves with identical bytes.
+            if !self
+                .sources
+                .get(&path)
+                .is_some_and(|old| std::fs::read_to_string(&path).ok().as_ref() == Some(old))
+            {
                 self.changed.retain(|p| p != &path);
                 self.changed.push(path);
                 let _publication = self.publication.lock().unwrap();
@@ -320,6 +348,9 @@ impl Live {
                 }
                 Ok(finished) => {
                     let reply = finished.reply;
+                    self.compiler_pid = reply.compiler_pid;
+                    self.iteration = reply.iteration;
+                    self.last_millis = reply.millis;
                     // Watch dependency parents (atomic rename safe), never a recursive home tree.
                     for path in &reply.dependencies {
                         if let Some(parent) = path.parent() {
@@ -380,6 +411,7 @@ impl Live {
                             self.sources = reply.sources;
                             self.changed.clear();
                             self.last = location.clone();
+                            self.preferred = None;
                         }
                         update = Some(Update {
                             generation: reply.generation,
@@ -408,9 +440,17 @@ impl Live {
         update
     }
     fn resolve(&self, reply: &CompileReply) -> Option<SourcePoint> {
+        if let Some((path, byte)) = &self.preferred {
+            if let Some(point) = nearest_point(&reply.points, path, *byte, self.last.as_ref()) {
+                return Some(point);
+            }
+        }
         for path in self.changed.iter().rev() {
             let (Some(old), Some(new)) = (self.sources.get(path), reply.sources.get(path)) else {
-                return None;
+                if let Some(point) = nearest_point(&reply.points, path, 0, self.last.as_ref()) {
+                    return Some(point);
+                }
+                continue;
             };
             let Some(range) = changed_range(old, new) else {
                 continue;
@@ -426,6 +466,18 @@ impl Live {
                     return Some((*first).clone());
                 }
             }
+            if !candidates.is_empty() {
+                let previous = self.last.as_ref().map(|p| p.page);
+                return candidates
+                    .into_iter()
+                    .min_by_key(|p| {
+                        (
+                            previous.map_or(0, |page| p.page.abs_diff(page)),
+                            p.start.abs_diff(range.start),
+                        )
+                    })
+                    .cloned();
+            }
             if range.is_empty() {
                 let closest = reply
                     .points
@@ -436,10 +488,35 @@ impl Live {
                     return Some(point.clone());
                 }
             }
-            return None;
+            if let Some(point) = nearest_point(&reply.points, path, range.start, self.last.as_ref())
+            {
+                return Some(point);
+            }
         }
         None
     }
+}
+fn nearest_point(
+    points: &[SourcePoint],
+    path: &Path,
+    byte: usize,
+    previous: Option<&SourcePoint>,
+) -> Option<SourcePoint> {
+    points
+        .iter()
+        .filter(|p| p.file == path)
+        .min_by_key(|p| {
+            let distance = if byte < p.start {
+                p.start - byte
+            } else {
+                byte.saturating_sub(p.end)
+            };
+            (
+                distance,
+                previous.map_or(0, |old| p.page.abs_diff(old.page)),
+            )
+        })
+        .cloned()
 }
 /// Stage in the destination directory: rename never exposes a partial PDF.
 fn export_path(input: &Path, options: &crate::typst_options::Options) -> Result<PathBuf> {
@@ -538,6 +615,61 @@ mod tests {
         publish_pdf(&source, &target, &std::sync::Mutex::new(()), || true).unwrap();
         assert_eq!(std::fs::read(&target).unwrap(), b"new PDF");
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+    #[test]
+    #[ignore = "requires compiled application; set LEAFVIEW_TEST_BINARY"]
+    fn compiler_process_reuses_world_across_generations() {
+        let binary = std::env::var_os("LEAFVIEW_TEST_BINARY").expect("LEAFVIEW_TEST_BINARY");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("main.typ");
+        std::fs::write(&path, "#for i in range(3000) { [Line #i ]; linebreak() }").unwrap();
+        let options = crate::typst_options::Options::default();
+        let mut child = Command::new(binary)
+            .arg("--typst-compiler")
+            .arg(&path)
+            .arg(dir.path())
+            .arg(serde_json::to_string(&options).unwrap())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        let input = child.stdin.take().unwrap();
+        let pid = child.id();
+        let mut process = CompilerProcess {
+            child,
+            input,
+            directory: tempfile::tempdir().unwrap(),
+        };
+        let (first, _) = process.compile(1, &|| false).unwrap();
+        let (second, _) = process.compile(99, &|| false).unwrap();
+        assert_eq!(first.compiler_pid, pid);
+        assert_eq!(second.compiler_pid, pid);
+        assert_eq!(second.iteration, 2);
+    }
+    #[test]
+    fn source_cursor_matches_nonrendered_code_and_imports() {
+        let path = PathBuf::from("/project/chapter.typ");
+        let points = vec![
+            SourcePoint {
+                file: path.clone(),
+                start: 100,
+                end: 110,
+                page: 5,
+                x: 0.2,
+                y: 0.4,
+            },
+            SourcePoint {
+                file: path.clone(),
+                start: 200,
+                end: 210,
+                page: 7,
+                x: 0.3,
+                y: 0.5,
+            },
+        ];
+        assert_eq!(nearest_point(&points, &path, 125, None).unwrap().page, 5);
+        assert_eq!(nearest_point(&points, &path, 203, None).unwrap().page, 7);
+        assert!(nearest_point(&points, Path::new("/other.typ"), 203, None).is_none());
     }
     #[test]
     fn utf8_and_last_change() {
