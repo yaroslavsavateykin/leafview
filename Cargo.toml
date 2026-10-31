@@ -3,8 +3,12 @@ name = "leafview"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "Minimal, responsive PDF viewer for terminals and tmux"
+description = "Terminal PDF viewer with live Typst previews and an optional source editor"
 readme = "README.md"
+repository = "https://github.com/yaroslavsavateykin/leafview"
+homepage = "https://github.com/yaroslavsavateykin/leafview"
+keywords = ["pdf", "typst", "terminal", "viewer", "tui"]
+categories = ["command-line-utilities", "text-editors"]
 
 [features]
 default = []
