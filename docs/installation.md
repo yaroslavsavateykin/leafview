@@ -22,10 +22,10 @@ the pinned Helix Git dependency when building the editor.
 ## Choose a build
 
 ```sh
-# PDF viewer; no compiler or editor
-cargo build --locked --release
-# PDF + bundled Typst compiler
-cargo build --locked --release --features typst -j 2
+# PDF + bundled Typst compiler (default)
+cargo build --locked --release -j 2
+# PDF viewer only; no compiler or editor
+cargo build --locked --release --no-default-features
 # Full document workspace
 cargo build --locked --release --features typst,editor -j 2
 ./target/release/leafview --help
@@ -43,8 +43,9 @@ compiler memory use, but is not a memory guarantee.
 | `tinymist` | Compatibility feature alias enabling `editor`; no bundled server |
 | `typstyle` | Compatibility feature alias enabling `editor`; no bundled formatter |
 
-Default features are empty. `editor` alone can edit source beside a PDF;
-Typst compilation still requires `typst`.
+`typst` is enabled by default, including automatic compilation on save.
+Use `--no-default-features` for an explicitly PDF-only build. A saved
+`auto_compile: false` setting still selects manual compilation for that document.
 
 ## Optional external tools
 

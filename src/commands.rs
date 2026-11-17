@@ -164,9 +164,14 @@ impl App {
                 self.schedule();
             }
             "pdf.next_page" | "pdf.previous_page" => {
-                self.view
-                    .step_page((count as i32) * if id.ends_with("next_page") { 1 } else { -1 });
-                self.schedule();
+                let direction = if id.ends_with("next_page") { 1 } else { -1 };
+                if count == 1 {
+                    self.queue_page_turn(direction);
+                } else if self.view.step_page(direction * count as i32) {
+                    // An explicit numeric count is a destination, not auto-repeat.
+                    self.destination = None;
+                    self.schedule();
+                }
             }
             "pdf.first_page" | "pdf.last_page" => {
                 self.view.go_to(if id.ends_with("first_page") {
@@ -192,7 +197,10 @@ impl App {
                 };
                 self.schedule();
             }
-            "pdf.reload" => self.reload(),
+            "pdf.reload" => {
+                crate::kitty::invalidate_terminal_cache();
+                self.reload();
+            }
             #[cfg(feature = "typst")]
             "typst.compile" => {
                 if let Some(live) = &mut self.live {

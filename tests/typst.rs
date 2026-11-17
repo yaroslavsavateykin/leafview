@@ -116,6 +116,23 @@ fn same_generation_pdf_mapping_includes_formula_shift_error_recovery() {
 }
 
 #[test]
+fn source_snapshots_larger_than_sixteen_mib_still_preview() {
+    let mut helper = Helper::new();
+    let main = helper.dir.path().join("main.typ");
+    // Large source, tiny layout: the former snapshot cap rejected a valid PDF.
+    let source = format!("/*{}*/\nLarge source preview", "x".repeat(17 * 1024 * 1024));
+    std::fs::write(&main, &source).unwrap();
+    let reply = helper.compile(1);
+    assert!(reply["error"].is_null(), "{}", reply["error"]);
+    assert_eq!(reply["sources"][main.to_str().unwrap()], source);
+    let pdf = lopdf::Document::load(helper.dir.path().join("1.pdf")).unwrap();
+    assert!(pdf
+        .extract_text(&[1])
+        .unwrap()
+        .contains("Large source preview"));
+}
+
+#[test]
 fn compiler_options_inputs_pages_and_pdf_mapping() {
     let mut helper = Helper::with_options(
         json!({"inputs":[["message","FROM_INPUT"]],"pages":"7-8", "pretty":true,"no_tags":true, "standards":["1.7"],"ignore_system":true,"jobs":1,"timestamp":1700000000}),

@@ -42,7 +42,7 @@ const TYPST: &[Field] = &[
     Field {
         key: "jobs",
         label: "Compiler threads",
-        help: "--jobs · 1–256. Empty = automatic (currently 2 threads).",
+        help: "--jobs · 1–256. Empty = automatic (all available CPUs).",
         kind: Kind::Number,
     },
     Field {

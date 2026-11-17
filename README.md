@@ -64,7 +64,7 @@ cd leafview
 cargo install --locked --path .
 ```
 
-The default build is **PDF-only**. To include live Typst compilation and the source editor:
+The default build includes **PDF viewing and live Typst compilation**. To add the source editor:
 
 ```sh
 cargo install --locked --path . --features typst,editor -j 2

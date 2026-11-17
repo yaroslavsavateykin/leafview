@@ -38,6 +38,26 @@ impl Cache {
             limit,
         }
     }
+    // Release old speculation as navigation advances. Preserve the visible
+    // raster, nearby pages and nearby zoom levels, but don't let distant pages
+    // permanently fill the budget and prevent forward prefetch.
+    fn retain_window(&mut self, current: Key) {
+        let obsolete: Vec<_> = self
+            .images
+            .iter()
+            .map(|(&key, _)| key)
+            .filter(|key| {
+                key.revision != current.revision
+                    || key.page.abs_diff(current.page) > 6
+                    || (key.width != current.width && key.page != current.page)
+            })
+            .collect();
+        for key in obsolete {
+            if let Some(image) = self.images.pop(&key) {
+                self.bytes -= image.as_bytes().len();
+            }
+        }
+    }
     // Speculation must never evict a useful raster, especially the visible page.
     fn insert_prefetched(&mut self, key: Key, image: Arc<DynamicImage>) {
         if !self.images.contains(&key)
@@ -251,18 +271,7 @@ impl Renderer {
                 }
                 // Release obsolete speculative rasters to make room as the window moves.
                 {
-                    let mut cache = wc.lock().unwrap();
-                    let obsolete: Vec<_> = cache
-                        .images
-                        .iter()
-                        .map(|(&k, _)| k)
-                        .filter(|k| k.revision != key.revision)
-                        .collect();
-                    for old in obsolete {
-                        if let Some(image) = cache.images.pop(&old) {
-                            cache.bytes -= image.as_bytes().len();
-                        }
-                    }
+                    wc.lock().unwrap().retain_window(key);
                 }
                 // Never block the foreground mailbox on speculation. Two bounded
                 // background workers can run Poppler alongside the visible render.
@@ -281,17 +290,35 @@ impl Renderer {
                                     current.revision != key.revision || current.width != key.width
                                 })
                         };
-                        let targets = speculative_keys(key, req.doc.pages, req.viewport.width);
-                        for pair in targets.chunks(2) {
-                            if cancelled() {
+                        let mut attempted = std::collections::HashSet::new();
+                        let mut center = key;
+                        while !cancelled() {
+                            let Some(current) = *desired.lock().unwrap() else {
+                                break;
+                            };
+                            if current != center {
+                                center = current;
+                                attempted.clear();
+                                cache.lock().unwrap().retain_window(center);
+                            }
+                            // Re-evaluate after every pair, not only after an
+                            // entire batch around an obsolete page completes.
+                            let pair: Vec<_> =
+                                speculative_keys(center, req.doc.pages, req.viewport.width)
+                                    .into_iter()
+                                    .filter(|target| !attempted.contains(target))
+                                    .take(2)
+                                    .collect();
+                            if pair.is_empty() {
                                 break;
                             }
+                            attempted.extend(pair.iter().copied());
                             rayon::scope(|scope| {
-                                for &target in pair {
+                                for &target in &pair {
                                     let (cache, cancelled, path) =
                                         (&cache, &cancelled, req.doc.snapshot_path());
                                     scope.spawn(move |_| {
-                                        let _ = prefetch(cache, target, key, path, cancelled);
+                                        let _ = prefetch(cache, target, center, path, cancelled);
                                     });
                                 }
                             });
@@ -382,9 +409,11 @@ fn neighbors(page: u32, pages: u32, distance: u32) -> [Option<u32>; 2] {
 
 fn speculative_keys(key: Key, pages: u32, viewport_width: u32) -> Vec<Key> {
     let mut targets = Vec::new();
-    // Adjacent pages first, then the next keyboard/wheel zoom in either direction.
-    for page in neighbors(key.page, pages, 1).into_iter().flatten() {
-        targets.push(Key { page, ..key });
+    // Navigation first. Speculative zoom must not delay the next PDF pages.
+    for distance in 1..=6 {
+        for page in neighbors(key.page, pages, distance).into_iter().flatten() {
+            targets.push(Key { page, ..key });
+        }
     }
     let step = ((viewport_width as f64 * 0.05).round() as u32).max(1);
     let min_width = (viewport_width / 2).clamp(100, 3400);
@@ -395,11 +424,6 @@ fn speculative_keys(key: Key, pages: u32, viewport_width: u32) -> Vec<Key> {
     ] {
         if width != key.width {
             targets.push(Key { width, ..key });
-        }
-    }
-    for distance in 2..=6 {
-        for page in neighbors(key.page, pages, distance).into_iter().flatten() {
-            targets.push(Key { page, ..key });
         }
     }
     targets
@@ -495,6 +519,49 @@ fn rasterize(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn sliding_window_releases_budget_for_new_neighbors() {
+        let image = Arc::new(DynamicImage::new_rgb8(10, 10));
+        let size = image.as_bytes().len();
+        let key = Key {
+            revision: 1,
+            page: 0,
+            width: 100,
+        };
+        let mut cache = Cache::new(size * 7);
+        for page in 0..7 {
+            cache.insert_prefetched(Key { page, ..key }, image.clone());
+        }
+        assert_eq!(cache.bytes, size * 7);
+        let current = Key { page: 10, ..key };
+        cache.retain_window(current);
+        assert_eq!(cache.bytes, size * 3);
+        cache.insert(current, image.clone());
+        cache.insert_prefetched(Key { page: 11, ..key }, image.clone());
+        assert!(cache.images.contains(&current));
+        assert!(cache.images.contains(&Key { page: 11, ..key }));
+        assert!(!cache.images.contains(&key));
+        cache.retain_window(Key {
+            revision: 2,
+            ..current
+        });
+        assert_eq!(cache.bytes, 0);
+    }
+
+    #[test]
+    fn page_prefetch_precedes_speculative_zoom() {
+        let key = Key {
+            revision: 1,
+            page: 10,
+            width: 800,
+        };
+        let targets = speculative_keys(key, 30, 800);
+        assert_eq!(targets[0], Key { page: 11, ..key });
+        assert_eq!(targets[1], Key { page: 9, ..key });
+        assert!(targets[..12].iter().all(|target| target.width == 800));
+        assert!(targets[12..].iter().all(|target| target.page == 10));
+    }
+
     #[test]
     fn prefetch_bounds_and_budget() {
         assert_eq!(neighbors(0, 10, 1), [Some(1), None]);

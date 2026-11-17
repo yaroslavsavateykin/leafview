@@ -26,6 +26,12 @@ LEAFVIEW_DEBUG=1 LEAFVIEW_LOG=/tmp/leafview.log leafview document.pdf # log sele
 Ghostty/tmux exception. Explicit safe mode deliberately skips graphics
 capability negotiation. Navigation/render requests are coalesced to at most
 one every 25 ms during key repeats; the final viewport is always scheduled.
+Relative page turns retain at most two pending steps and expire after 180 ms
+without fresh input. Reversing direction replaces pending repeats; terminals
+that report key release clear them immediately. Numeric page-turn counts jump
+directly to the destination instead of building a render queue. Input is drained
+in bounded batches before graphics output, so buffered repeats do not require
+one PNG transfer per key.
 Ctrl-C is handled as an ordinary clean exit. A system-level
 SIGKILL, OOM kill, or a crash inside Ghostty itself cannot be handled by an
 application's cleanup code.
@@ -69,12 +75,20 @@ set -g focus-events on
 The first display transmits PNG data; revisiting cached views uses terminal-side
 images without retransmitting them. Network throughput still bounds cold-page
 latency. Reattaching from another client invalidates upload state on focus;
-press `r` if focus forwarding is unavailable. Cleanup deletes only Leafview's
-32 image slots. The protocol uses no server-local image filenames.
+press `r` if focus forwarding is unavailable. A metadata worker also watches
+client identity, pane zoom/copy-mode visibility and layout changes every 200 ms;
+returning to a visible pane or changing clients triggers cache recovery.
+Ordinary page changes upload once, with no delayed retransmission; ordinary
+pane focus changes do not invalidate images when the metadata tracker is active.
+Very fast transitions between metadata polls can still require manual recovery.
+Cleanup deletes only Leafview's process-owned image slots. The protocol uses no server-local image filenames.
 
 Verification: `python3 scripts/ssh-kitty-smoke.py` emulates a Kitty client over a
 PTY with 1.2-second query latency, direct/tmux framing, inline PNG transport and
-focus-triggered re-upload. This is **not** a real SSH/network or visual terminal
+focus recovery outside the tmux tracker, single-upload page changes, and emulated client/zoom changes
+without focus events. `python3 scripts/navigation-tail-smoke.py` generates a
+200-page PDF and checks burst-repeat bounds, idle stability, reverse navigation
+and TTY restoration. This is **not** a real SSH/network or visual terminal
 test; those remain to be checked on the target client/server.
 
 ## Terminals and tmux

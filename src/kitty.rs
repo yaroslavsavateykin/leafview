@@ -18,6 +18,31 @@ use std::{
 };
 
 static TERMINAL_EPOCH: AtomicU64 = AtomicU64::new(1);
+static SLOTS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<u32, std::sync::Weak<AtomicU64>>>,
+> = std::sync::OnceLock::new();
+
+fn delete_image(writer: &mut impl std::io::Write, id: u32, tmux: bool) -> std::io::Result<()> {
+    let command = format!("\x1b_Ga=d,d=I,i={id},q=2;\x1b\\");
+    if tmux {
+        write!(
+            writer,
+            "\x1bPtmux;{}\x1b\\",
+            command.replace('\x1b', "\x1b\x1b")
+        )
+    } else {
+        writer.write_all(command.as_bytes())
+    }
+}
+
+pub fn cleanup(writer: &mut impl std::io::Write, tmux: bool) -> std::io::Result<()> {
+    let mut slots = SLOTS.get_or_init(Default::default).lock().unwrap();
+    for &id in slots.keys() {
+        delete_image(writer, id, tmux)?;
+    }
+    slots.clear();
+    writer.flush()
+}
 
 /// A new SSH/tmux client has no copies of the old client's image cache.
 pub fn invalidate_terminal_cache() {
@@ -28,7 +53,9 @@ pub struct KittyImage {
     pub size: Size,
     id: u32,
     transfer: std::sync::Arc<str>,
+    tmux: bool,
     sent: std::sync::Arc<AtomicU64>,
+    diff_color: ratatui::style::Color,
 }
 impl KittyImage {
     pub fn encoded_len(&self) -> usize {
@@ -37,6 +64,9 @@ impl KittyImage {
     pub fn id(&self) -> u32 {
         self.id
     }
+    pub fn lease(&self) -> std::sync::Weak<AtomicU64> {
+        std::sync::Arc::downgrade(&self.sent)
+    }
     // Reuse the terminal-resident image, not just its encoded PNG. All clones
     // share upload state; a never-displayed queued image still uploads once.
     pub fn replay(&self) -> Self {
@@ -44,8 +74,52 @@ impl KittyImage {
             size: self.size,
             id: self.id,
             transfer: self.transfer.clone(),
+            tmux: self.tmux,
             sent: self.sent.clone(),
+            diff_color: self.diff_color,
         }
+    }
+    /// Upload outside Ratatui's diff buffer: an overlay can replace image cells
+    /// before flush, so rendering a widget cannot mean the transfer was sent.
+    pub fn upload(&self, writer: &mut impl std::io::Write) -> std::io::Result<()> {
+        let mut slots = SLOTS.get_or_init(Default::default).lock().unwrap();
+        let epoch = TERMINAL_EPOCH.load(Ordering::SeqCst);
+        let same = slots
+            .get(&self.id)
+            .and_then(std::sync::Weak::upgrade)
+            .is_some_and(|owner| std::sync::Arc::ptr_eq(&owner, &self.sent));
+        if same && self.sent.load(Ordering::SeqCst) == epoch {
+            return Ok(());
+        }
+        // Release only images no longer held by cache, visible frame or worker.
+        let retired: Vec<_> = slots
+            .iter()
+            .filter(|(_, owner)| owner.strong_count() == 0)
+            .map(|(&id, _)| id)
+            .collect();
+        for id in retired {
+            delete_image(writer, id, self.tmux)?;
+            slots.remove(&id);
+        }
+        // Replacing image data alone can retain an old virtual placement's
+        // dimensions/content in terminals. Remove this owned slot first so
+        // zoom/page cache reuse creates a fresh placement, not a stale one.
+        let delete = format!("\x1b_Ga=d,d=I,i={},q=2;\x1b\\", self.id);
+        if self.tmux {
+            write!(
+                writer,
+                "\x1bPtmux;{}\x1b\\",
+                delete.replace('\x1b', "\x1b\x1b")
+            )?;
+        } else {
+            writer.write_all(delete.as_bytes())?;
+        }
+        writer.write_all(self.transfer.as_bytes())?;
+        writer.flush()?;
+        self.sent.store(epoch, Ordering::SeqCst);
+        slots.retain(|_, owner| owner.strong_count() > 0);
+        slots.insert(self.id, std::sync::Arc::downgrade(&self.sent));
+        Ok(())
     }
     pub fn new(image: DynamicImage, size: Size, id: u32, tmux: bool) -> Result<Self> {
         let rgb = image.into_rgba8();
@@ -57,22 +131,34 @@ impl KittyImage {
                 rgb.height(),
                 image::ExtendedColorType::Rgba8,
             )?;
-        let transfer = transfer(&png, id, tmux);
+        static NEXT_CONTENT: AtomicU64 = AtomicU64::new(1);
+        let [_, r, g, b] = (NEXT_CONTENT.fetch_add(1, Ordering::Relaxed) as u32).to_be_bytes();
+        let transfer = transfer(&png, id, size, tmux);
         Ok(Self {
             size,
             id,
             transfer: transfer.into(),
+            tmux,
             sent: std::sync::Arc::new(AtomicU64::new(0)),
+            diff_color: ratatui::style::Color::Rgb(r, g, b),
         })
     }
 }
-fn transfer(png: &[u8], id: u32, tmux: bool) -> String {
+fn transfer(png: &[u8], id: u32, size: Size, tmux: bool) -> String {
     let mut out = String::new();
     let count = png.len().div_ceil(3072);
     for (i, chunk) in png.chunks(3072).enumerate() {
         let mut command = String::from("\x1b_Gq=2,");
         if i == 0 {
-            write!(command, "i={id},a=T,U=1,f=100,t=d,").unwrap();
+            // The negotiated font metrics can differ from the outer terminal
+            // (especially across tmux). Define the virtual placement grid
+            // explicitly: placeholders use these rows/columns, not PNG pixels.
+            write!(
+                command,
+                "i={id},a=T,U=1,f=100,t=d,c={},r={},",
+                size.width, size.height
+            )
+            .unwrap();
         }
         write!(command, "m={};", u8::from(i + 1 < count)).unwrap();
         STANDARD.encode_string(chunk, &mut command);
@@ -89,7 +175,7 @@ fn transfer(png: &[u8], id: u32, tmux: bool) -> String {
 }
 impl Widget for &KittyImage {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let width = area.width.min(self.size.width);
+        let width = area.width.min(self.size.width).min(DIACRITICS.len() as u16);
         let height = area
             .height
             .min(self.size.height)
@@ -97,47 +183,26 @@ impl Widget for &KittyImage {
         if width == 0 || height == 0 {
             return;
         }
-        // Encoder LRU eviction may reuse an ID while a visible replay still owns
-        // the old pixels. Upload state belongs to the slot's current content, not
-        // only to each replay's Arc. Re-upload on a content/epoch mismatch.
-        static SLOTS: std::sync::OnceLock<
-            std::sync::Mutex<std::collections::HashMap<u32, std::sync::Weak<AtomicU64>>>,
-        > = std::sync::OnceLock::new();
-        let mut slots = SLOTS.get_or_init(Default::default).lock().unwrap();
-        let same = slots
-            .get(&self.id)
-            .and_then(std::sync::Weak::upgrade)
-            .is_some_and(|sent| std::sync::Arc::ptr_eq(&sent, &self.sent));
-        if !same {
-            self.sent.store(0, Ordering::SeqCst);
-            slots.retain(|_, owner| owner.strong_count() > 0);
-            slots.insert(self.id, std::sync::Arc::downgrade(&self.sent));
-        }
-        let epoch = TERMINAL_EPOCH.load(Ordering::SeqCst);
-        let upload = self.sent.swap(epoch, Ordering::SeqCst) != epoch;
-        drop(slots);
         let [extra, r, g, b] = self.id.to_be_bytes();
+
         for y in 0..height {
-            let mut row = String::new();
-            if y == 0 && upload {
-                row.push_str(&self.transfer);
-            }
-            // Save/restore the cursor and foreground, not just its position.
-            write!(
-                row,
-                "\x1b7\x1b[?7l\x1b[38;2;{r};{g};{b}m\u{10eeee}{}{}{}",
-                DIACRITICS[y as usize], DIACRITICS[0], DIACRITICS[extra as usize]
-            )
-            .unwrap();
-            row.extend(std::iter::repeat_n('\u{10eeee}', usize::from(width - 1)));
-            // Full-width rows (fit width / 100%) must not leave delayed
-            // autowrap pending or scroll at the terminal's right margin.
-            row.push_str("\x1b[?7h\x1b8");
-            buf[(area.x, area.y + y)]
-                .set_symbol(&row)
-                .set_diff_option(CellDiffOption::ForcedWidth(NonZeroU16::new(width).unwrap()));
-            for x in 1..width {
-                buf[(area.x + x, area.y + y)].set_diff_option(CellDiffOption::Skip);
+            for x in 0..width {
+                // Each placeholder must own exactly one buffer cell. A whole
+                // row stored in its first cell makes Ratatui skip overlays in
+                // the middle of that row (even after Clear resets their cells).
+                // Explicit coordinates also let isolated cells be restored
+                // correctly when an overlay closes. DECRC restores the cursor
+                // as well as the foreground, so advance it again: Crossterm
+                // omits MoveTo for adjacent cells and expects Print to advance
+                // by one column. CUF clamps at the right margin without wrap.
+                let symbol = format!(
+                    "\x1b7\x1b[?7l\x1b[38;2;{r};{g};{b}m\u{10eeee}{}{}{}\x1b[?7h\x1b8\x1b[1C",
+                    DIACRITICS[y as usize], DIACRITICS[x as usize], DIACRITICS[extra as usize]
+                );
+                buf[(area.x + x, area.y + y)]
+                    .set_symbol(&symbol)
+                    .set_fg(self.diff_color)
+                    .set_diff_option(CellDiffOption::ForcedWidth(NonZeroU16::new(1).unwrap()));
             }
         }
     }
@@ -448,6 +513,75 @@ static DIACRITICS: [char; 297] = [
 mod tests {
     use super::*;
     #[test]
+    fn adjacent_placeholders_advance_the_terminal_cursor() {
+        use ratatui::{backend::Backend, backend::CrosstermBackend};
+
+        let area = Rect::new(2, 1, 3, 1);
+        let kitty =
+            KittyImage::new(DynamicImage::new_rgb8(30, 10), Size::new(3, 1), 127, false).unwrap();
+        let mut buf = Buffer::empty(area);
+        (&kitty).render(area, &mut buf);
+        let mut bytes = Vec::new();
+        let mut backend = CrosstermBackend::new(&mut bytes);
+        backend
+            .draw((area.x..area.right()).map(|x| (x, area.y, &buf[(x, area.y)])))
+            .unwrap();
+        let wire = String::from_utf8(bytes).unwrap();
+        // The backend positions only the first cell. Each save/restore pair
+        // must therefore advance once or all three columns overwrite it.
+        assert_eq!(wire.matches("\x1b[2;3H").count(), 1);
+        assert_eq!(wire.matches("\x1b8\x1b[1C").count(), 3);
+        assert_eq!(wire.matches('\u{10eeee}').count(), 3);
+    }
+
+    #[test]
+    fn overlays_replace_image_cells_and_closing_restores_them() {
+        use ratatui::widgets::{Clear, Paragraph};
+
+        let area = Rect::new(0, 0, 12, 4);
+        let image_area = Rect::new(1, 1, 10, 2);
+        let overlay = Rect::new(4, 1, 4, 2);
+        let kitty = KittyImage::new(
+            DynamicImage::new_rgb8(100, 40),
+            Size::new(10, 2),
+            126,
+            false,
+        )
+        .unwrap();
+        let mut image = Buffer::empty(area);
+        (&kitty).render(image_area, &mut image);
+        let mut menu = image.clone();
+        Clear.render(overlay, &mut menu);
+        Paragraph::new("MENU").render(overlay, &mut menu);
+
+        // Exercise the real diff: a wide image cell used to suppress all
+        // updates inside the menu, although the final buffer contained it.
+        let opening = image.diff(&menu);
+        for y in overlay.y..overlay.bottom() {
+            for x in overlay.x..overlay.right() {
+                assert!(opening.iter().any(|(cx, cy, _)| (*cx, *cy) == (x, y)));
+            }
+        }
+        let closing = menu.diff(&image);
+        for y in overlay.y..overlay.bottom() {
+            for x in overlay.x..overlay.right() {
+                let (_, _, cell) = closing
+                    .iter()
+                    .find(|(cx, cy, _)| (*cx, *cy) == (x, y))
+                    .expect("closing overlay must restore each image cell");
+                assert!(cell.symbol().contains('\u{10eeee}'));
+                let coordinates = format!(
+                    "{}{}{}",
+                    DIACRITICS[(y - image_area.y) as usize],
+                    DIACRITICS[(x - image_area.x) as usize],
+                    DIACRITICS[0]
+                );
+                assert!(cell.symbol().contains(&coordinates));
+            }
+        }
+    }
+
+    #[test]
     fn lossless_chunked_transport() {
         let image = DynamicImage::new_rgba8(400, 300);
         let kitty = KittyImage::new(image.clone(), Size::new(40, 15), 123, false).unwrap();
@@ -467,7 +601,7 @@ mod tests {
         assert!(kitty.transfer.len() < 400 * 300);
         // Incompressible data exercises continuation framing, not just a tiny PNG.
         let payload: Vec<u8> = (0..20000).map(|i| (i * 37) as u8).collect();
-        let commands = transfer(&payload, 123, false);
+        let commands = transfer(&payload, 123, Size::new(40, 15), false);
         let mut decoded = Vec::new();
         for command in commands.split("\x1b_G").skip(1) {
             let (_, data) = command.split_once(';').unwrap();
@@ -479,18 +613,32 @@ mod tests {
         assert_eq!(commands.matches("m=0;").count(), 1);
         assert_eq!(commands.matches("a=T").count(), 1);
         let replay = kitty.replay();
+        let lease = kitty.lease();
+        assert!(
+            lease.strong_count() >= 2,
+            "visible clones must protect their slot"
+        );
         assert!(std::sync::Arc::ptr_eq(&kitty.transfer, &replay.transfer));
         assert_eq!(replay.encoded_len(), kitty.encoded_len());
-        let wrapped = transfer(&bytes, 123, true);
+        let wrapped = transfer(&bytes, 123, Size::new(40, 15), true);
+        assert!(wrapped.contains("c=40,r=15,"));
         assert!(wrapped.starts_with("\x1bPtmux;\x1b\x1b_G"));
         let mut buf = Buffer::empty(Rect::new(0, 0, 40, 15));
         (&kitty).render(buf.area, &mut buf);
-        assert!(buf[(0, 0)].symbol().contains("f=100"));
+        assert!(!buf[(0, 0)].symbol().contains("f=100"));
+        let mut wire = Vec::new();
+        kitty.upload(&mut wire).unwrap();
+        let commands = String::from_utf8_lossy(&wire);
+        assert!(commands.contains("f=100"));
+        assert!(commands.find("a=d,d=I,i=123").unwrap() < commands.find("a=T,U=1").unwrap());
+        wire.clear();
+        replay.upload(&mut wire).unwrap();
+        assert!(wire.is_empty());
         assert!(buf[(0, 0)].symbol().contains("\x1b[?7l"));
         assert!(buf[(0, 0)].symbol().contains("\x1b[?7h"));
         assert_eq!(
             buf[(0, 0)].diff_option,
-            CellDiffOption::ForcedWidth(NonZeroU16::new(40).unwrap())
+            CellDiffOption::ForcedWidth(NonZeroU16::new(1).unwrap())
         );
         (&kitty).render(buf.area, &mut buf);
         assert!(!buf[(0, 0)].symbol().contains("f=100"));
@@ -502,20 +650,47 @@ mod tests {
         );
         // Simulate encoder slot reuse while an old visible/replay owner survives.
         let replacement = KittyImage::new(image.clone(), Size::new(40, 15), 123, false).unwrap();
+        let previous = revisited.clone();
         (&replacement).render(revisited.area, &mut revisited);
-        assert!(revisited[(0, 0)].symbol().contains("f=100"));
+        assert_eq!(
+            previous.diff(&revisited).len(),
+            40 * 15,
+            "reused image slots must repaint without a terminal clear"
+        );
+        replacement.upload(&mut wire).unwrap();
+        assert!(!wire.is_empty());
+        wire.clear();
         (&replay).render(revisited.area, &mut revisited);
+        replay.upload(&mut wire).unwrap();
         assert!(
-            revisited[(0, 0)].symbol().contains("f=100"),
-            "old replay must restore its content after ID reuse"
+            !wire.is_empty(),
+            "old replay must restore content after slot reuse"
         );
         let fresh = KittyImage::new(image, Size::new(40, 15), 124, false).unwrap();
         let queued_clone = fresh.replay();
         let mut pending = Buffer::empty(Rect::new(0, 0, 40, 15));
         (&queued_clone).render(pending.area, &mut pending);
-        assert!(
-            pending[(0, 0)].symbol().contains("f=100"),
-            "undisplayed cached image skipped its first upload"
-        );
+        // Entirely overwrite the widget before the frame is flushed. Upload
+        // must still occur; widget rendering cannot mark the image as sent.
+        pending.reset();
+        wire.clear();
+        queued_clone.upload(&mut wire).unwrap();
+        assert!(!wire.is_empty(), "overlay lost the first upload");
+        // Failed terminal IO must leave the transfer retryable.
+        struct Failed;
+        impl std::io::Write for Failed {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let retry =
+            KittyImage::new(DynamicImage::new_rgb8(2, 2), Size::new(1, 1), 125, false).unwrap();
+        assert!(retry.upload(&mut Failed).is_err());
+        wire.clear();
+        retry.upload(&mut wire).unwrap();
+        assert!(!wire.is_empty());
     }
 }

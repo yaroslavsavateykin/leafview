@@ -14,13 +14,13 @@ leafview typst letuchka.typ --root ../..
 leafview typst main.typ --input edition=teacher --font-path ./fonts -j 2
 ```
 
-Typst support is opt-in (ordinary PDF builds do not include the compiler):
+Typst support is included in the default build:
 
 ```sh
-cargo install --locked --features typst --path . -j 2
+cargo install --locked --path . -j 2
 ```
 
-For a PDF-only installation, use `cargo install --locked --path .`.
+For a PDF-only installation, use `cargo install --locked --no-default-features --path .`.
 
 LeafView compiles the entry file in an owned background compiler process and
 shows the PDF using the **same renderer and graphics policy** as PDF mode.
@@ -68,6 +68,12 @@ search paths). Page selection renumbers source mappings to the exported PDF.
 sanitized short status messages; `--ppi` has no effect on PDF (PNG export only).
 Use `leafview typst --help` or `--version` for help/compiler version.
 
+The compiler uses all available logical CPUs by default for parallel work.
+Set `--jobs N` (or **Compiler threads** in settings) to choose a fixed pool size.
+A saved nonempty jobs setting overrides automatic selection. Compilation passes
+remain serialized to preserve the incremental world; not every Typst operation
+can run in parallel.
+
 Not all CLI side effects fit a live PDF viewer: `--deps`, `--deps-format`,
 `--make-deps`, `--timings`, `--open`, `--no-serve`, `--no-reload`, `--port`,
 non-PDF output formats and a positional output path are **explicitly rejected**,
@@ -95,12 +101,19 @@ compiler glyph spans to find its new PDF coordinates. Multiple disjoint edits
 in one save deterministically select the last change in file order; deletion
 uses the nearest surviving mapped token. Repeated spans on different pages,
 style-only changes without glyph correspondence and resource-only changes do
-not force an arbitrary jump. Manual navigation stays put until a new mapped
-source change; zoom is preserved, and a target already visible does not scroll.
-Otherwise it is positioned near the upper/left third of the viewport.
+not force an arbitrary jump. With **Follow source edits** enabled (`s`, or the LeafView settings tab), a
+successful recompile follows the mapped edit, including a move to another page.
+Disable it to preserve the currently selected PDF page and replace its contents
+in place. If that page no longer exists, the viewer clamps to the new last page.
+The old image remains visible until the replacement is ready. Press `f` to follow
+the last mapped source edit explicitly regardless of the automatic setting.
+Zoom is preserved, and a target already visible does not scroll. Otherwise it is
+positioned near the upper/left third of the viewport.
 
-Limits: one compile has a 60 s timeout and a 3 GiB address-space cap; source
-snapshots are capped at 16 MiB, the map at 500,000 glyph entries. Mapping covers
+The live compiler has no LeafView-imposed time or address-space cap. Source
+snapshots and glyph maps are not size-capped. Shutdown still cancels and reaps
+the helper; superseded edits reuse its incremental world. The PDF viewer and
+rasterizer retain their separate snapshot/render budgets. Mapping covers
 text/math glyphs, not arbitrary shape/image source expressions. Highly dynamic
 macros, generated content and multi-location spans can remain unmapped. Glyph
 coordinates indicate a baseline, not an exact selection rectangle. Native

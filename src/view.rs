@@ -22,6 +22,61 @@ pub struct View {
     pub y: u32,
 }
 
+/// Keep at most two recent turns while a page is being prepared. Legacy
+/// terminals report auto-repeat as ordinary presses and have no release event,
+/// so a timestamp is needed to prevent a slow render from building a long tail.
+#[derive(Default)]
+pub struct PageTurns {
+    pending: std::collections::VecDeque<i32>,
+    last_input: Option<std::time::Instant>,
+}
+
+impl PageTurns {
+    pub fn push(&mut self, view: &View, delta: i32) {
+        self.push_at(view, delta, std::time::Instant::now());
+    }
+
+    fn push_at(&mut self, view: &View, delta: i32, now: std::time::Instant) {
+        self.expire(now);
+        let delta = delta.signum();
+        if delta == 0 {
+            return;
+        }
+        // A direction change replaces obsolete forward motion, not a command
+        // to be executed after all the old repeats.
+        if self.pending.back().is_some_and(|&step| step != delta) {
+            self.pending.clear();
+        }
+        self.last_input = Some(now);
+        let target = self
+            .pending
+            .iter()
+            .fold(i64::from(view.page), |page, step| page + i64::from(*step));
+        let next = target + i64::from(delta);
+        if self.pending.len() < 2 && (0..i64::from(view.pages)).contains(&next) {
+            self.pending.push_back(delta);
+        }
+    }
+
+    pub fn pop(&mut self) -> Option<i32> {
+        self.pop_at(std::time::Instant::now())
+    }
+
+    fn pop_at(&mut self, now: std::time::Instant) -> Option<i32> {
+        self.expire(now);
+        self.pending.pop_front()
+    }
+
+    fn expire(&mut self, now: std::time::Instant) {
+        if self.last_input.is_some_and(|last| {
+            now.saturating_duration_since(last) >= std::time::Duration::from_millis(180)
+        }) {
+            self.pending.clear();
+            self.last_input = None;
+        }
+    }
+}
+
 impl View {
     pub fn new(pages: u32) -> Self {
         Self {
@@ -191,6 +246,64 @@ mod tests {
             view.apply_fit(viewport, aspect);
             assert_eq!(view.zoom, 1.);
         }
+    }
+    #[test]
+    fn held_page_turns_have_a_bounded_tail() {
+        let view = View::new(1000);
+        let mut turns = PageTurns::default();
+        let now = std::time::Instant::now();
+        for _ in 0..10000 {
+            turns.push_at(&view, 1, now);
+        }
+        assert_eq!(turns.pop_at(now), Some(1));
+        assert_eq!(turns.pop_at(now), Some(1));
+        assert_eq!(turns.pop_at(now), None);
+    }
+    #[test]
+    fn stale_page_turns_expire_after_slow_render() {
+        let view = View::new(100);
+        let mut turns = PageTurns::default();
+        let now = std::time::Instant::now();
+        turns.push_at(&view, 1, now);
+        assert_eq!(
+            turns.pop_at(now + std::time::Duration::from_millis(180)),
+            None
+        );
+        turns.push_at(&view, 1, now + std::time::Duration::from_secs(1));
+        assert_eq!(turns.pop(), Some(1));
+    }
+    #[test]
+    fn direction_changes_replace_pending_repeats_and_respect_bounds() {
+        let mut view = View::new(5);
+        view.page = 2;
+        let mut turns = PageTurns::default();
+        for delta in [1, 1, 1, -1] {
+            turns.push(&view, delta);
+        }
+        assert_eq!(turns.pop(), Some(-1));
+        assert_eq!(turns.pop(), None);
+        view.page = 0;
+        turns.push(&view, -1);
+        assert_eq!(turns.pop(), None);
+        view.page = 3;
+        turns.push(&view, 1);
+        turns.push(&view, 1);
+        assert_eq!(turns.pop(), Some(1));
+        assert_eq!(turns.pop(), None);
+    }
+    #[test]
+    fn document_refresh_preserves_page_and_pan_until_page_is_removed() {
+        let mut view = View::new(5);
+        view.go_to(3);
+        view.zoom = 1.75;
+        view.x = 40;
+        view.y = 80;
+        for pages in [8, 3, 10] {
+            view.set_pages(pages);
+            assert_eq!((view.page, view.zoom, view.x, view.y), (2, 1.75, 40, 80));
+        }
+        view.set_pages(2);
+        assert_eq!(view.page, 1);
     }
     #[test]
     fn navigation_is_bounded() {

@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import pty
 import select
+import signal
 import struct
 import subprocess
 import tempfile
@@ -31,6 +32,17 @@ for wrapped in (False, True):
         # tmux server or changing a user's passthrough configuration.
         for name in ('TMUX', 'WEZTERM_EXECUTABLE', 'KONSOLE_VERSION', 'LEAFVIEW_QUERY_TIMEOUT_MS'):
             env.pop(name, None)
+        # Model metadata independently of focus/resize events. Never query or
+        # modify the user's real tmux server from this protocol emulator.
+        env.pop('TMUX_PANE', None)
+        state = Path(tmp) / 'tmux-state'
+        if wrapped:
+            fake_tmux = Path(tmp) / 'tmux'
+            fake_tmux.write_text('#!/bin/sh\nexec /bin/cat "$LEAFVIEW_TEST_TMUX_STATE"\n')
+            fake_tmux.chmod(0o700)
+            state.write_text('1|0|0|0|12|100|/dev/pts/2|1|layout\n')
+            env.update(PATH=tmp + os.pathsep + env['PATH'], TMUX_PANE='%999',
+                       LEAFVIEW_TEST_TMUX_STATE=str(state))
         proc = subprocess.Popen([str(root / args.binary), str(root / 'tests/fixtures/sample.pdf')],
                                 stdin=slave, stdout=slave, stderr=slave, env=env,
                                 start_new_session=True)
@@ -60,9 +72,74 @@ for wrapped in (False, True):
             if wrapped:
                 assert b'\x1bPtmux;' in output, 'missing tmux wrapping'
             output.clear()
-            os.write(master, b'\x1b[I')  # focus: attaching from a new SSH client
+            os.write(master, b'j')  # next page is prepared before publication
+            pump(1)
+            begin = output.find(b'\x1b[?2026h')
+            upload = output.find(b'f=100,t=d')
+            end = output.find(b'\x1b[?2026l', upload)
+            assert b'\x1b[2J' not in output, 'page replacement cleared the visible PDF'
+            assert 0 <= begin < upload < end, ('page replacement is not synchronized', output[-2000:])
+            assert output.count(b'f=100,t=d') == 1, 'page was uploaded twice (visible flicker)'
+            output.clear()
+            pump(.7)
+            assert b'f=100,t=d' not in output, 'page was retransmitted after settling'
+            if wrapped:
+                # Change client while the window remains active, without focus.
+                state.write_text('1|0|0|0|14|200|/dev/pts/3|1|layout\n')
+                pump(1)
+                assert b'f=100,t=d' in output, 'client change without focus lost the image'
+                output.clear()
+                # Another pane is zoomed; then restore this still-unfocused pane.
+                state.write_text('1|1|0|0|14|200|/dev/pts/3|1|layout\n')
+                pump(.6)
+                assert b'f=100,t=d' not in output, 'hidden pane uploaded graphics'
+                state.write_text('1|0|0|0|14|200|/dev/pts/3|1|layout\n')
+                pump(1)
+                assert b'f=100,t=d' in output, 'unzoom without focus lost the image'
+            output.clear()
+            os.write(master, b'\x1b[O')  # hidden tmux window
+            pump(.3)
+            assert b'f=100,t=d' not in output, 'uploaded graphics on focus loss'
+            os.write(master, b'\x1b[I')  # return / attach from a new SSH client
             pump(2)
-            assert b'f=100,t=d' in output, ('focus failed to re-upload terminal cache', output[-2000:])
+            expected = 0 if wrapped else 2
+            assert output.count(b'f=100,t=d') == expected, ('ordinary tmux pane focus must not reupload; direct focus recovers', output[-2000:])
+            assert b'\x1b[2J' not in output, 'focus recovery erased the visible image'
+            output.clear()
+            pump(1)
+            assert b'f=100,t=d' not in output, 'focus recovery kept uploading while idle'
+            os.write(master, b'\x1b[I\x1b[O')  # leave before delayed replay
+            pump(.1)
+            output.clear()
+            pump(.5)
+            assert b'f=100,t=d' not in output, 'delayed replay was not cancelled on focus loss'
+            os.write(master, b'\x1b[I')
+            pump(.5)
+            # A visible PDF can remain unfocused beside an editor. Cache
+            # invalidation on same-size resize must still upload before draw.
+            os.write(master, b'\x1b[O')
+            pump(.3)
+            output.clear()
+            proc.send_signal(signal.SIGWINCH)
+            pump(1)
+            assert b'f=100,t=d' in output, 'unfocused resize lost the image'
+            os.write(master, b'\x1b[I')
+            pump(.5)
+            # A tmux reattach can resize without sending FocusGained. Even a
+            # same-size SIGWINCH must invalidate the terminal-resident cache.
+            output.clear()
+            proc.send_signal(signal.SIGWINCH)
+            pump(2)
+            assert b'f=100,t=d' in output, ('resize failed to re-upload terminal cache', output[-2000:])
+            # An actual geometry change makes Ratatui clear its viewport. That
+            # clear must precede the first PNG, never invalidate a fresh upload.
+            output.clear()
+            fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 32, 104, 0, 0))
+            proc.send_signal(signal.SIGWINCH)
+            pump(2)
+            upload = output.find(b'f=100,t=d')
+            clear = output.find(b'\x1b[2J')
+            assert 0 <= clear < upload, ('resize cleared after graphics upload', output[-2000:])
             os.write(master, b'\x03')
             proc.wait(timeout=3)
             assert proc.returncode == 0

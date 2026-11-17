@@ -18,6 +18,7 @@ mod picker;
 mod process;
 mod render;
 mod terminal;
+mod tmux;
 #[cfg(feature = "typst")]
 mod typst_compiler;
 #[cfg(feature = "typst")]
@@ -120,6 +121,7 @@ struct App {
     loading: bool,
     last_render_at: Option<Instant>,
     render_due: Option<Instant>,
+    page_turns: view::PageTurns,
 }
 
 // Only targeted Kitty deletion: never erase images belonging to adjacent panes.
@@ -143,7 +145,8 @@ impl Drop for GraphicsCleanup {
         if !self.enabled {
             return;
         }
-        let seq = (0..32)
+        let _ = kitty::cleanup(&mut std::io::stdout(), self.tmux);
+        let seq = (0..40)
             .map(|slot| {
                 format!(
                     "\x1b_Ga=d,d=I,i={},q=2;\x1b\\",
@@ -183,6 +186,7 @@ impl App {
     // still use latest-wins semantics, but we don't restart Poppler on every
     // auto-repeat and overwhelm Kitty/tmux with obsolete images.
     fn schedule(&mut self) {
+        self.page_turns = view::PageTurns::default();
         let aspect = self.doc.page_aspect(self.view.page);
         self.view.apply_fit(self.viewport, aspect);
         if self.source.is_dir() || self.viewport.width == 0 || self.viewport.height == 0 {
@@ -200,6 +204,24 @@ impl App {
             }
         }
         self.dispatch_render();
+    }
+    fn queue_page_turn(&mut self, delta: i32) {
+        self.page_turns.push(&self.view, delta);
+        self.advance_page_turn();
+    }
+    fn advance_page_turn(&mut self) {
+        if self.loading {
+            return;
+        }
+        if let Some(delta) = self.page_turns.pop() {
+            let remaining = std::mem::take(&mut self.page_turns);
+            if self.view.step_page(delta) {
+                self.destination = None;
+                self.schedule();
+                self.dirty = true;
+            }
+            self.page_turns = remaining;
+        }
     }
     fn flush_render(&mut self) {
         if self.render_due.is_some_and(|due| Instant::now() >= due) {
@@ -245,7 +267,7 @@ impl App {
             width: u32::from(content.width.saturating_sub(if framed { 2 } else { 0 }))
                 .saturating_mul(self.font_width)
                 .clamp(1, 3400),
-            height: u32::from(content.height.saturating_sub(2))
+            height: u32::from(content.height.saturating_sub(if framed { 2 } else { 1 }))
                 .saturating_mul(self.font_height)
                 .clamp(1, 2400),
         };
@@ -335,6 +357,10 @@ impl App {
         self.dirty = true;
     }
     fn on_key(&mut self, key: KeyEvent) -> bool {
+        if key.kind == KeyEventKind::Release {
+            self.page_turns = view::PageTurns::default();
+            return false;
+        }
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
             return false;
         }
@@ -777,17 +803,15 @@ impl App {
             KeyCode::Right | KeyCode::Down | KeyCode::Char('l' | 'j')
                 if key.modifiers.contains(KeyModifiers::SHIFT) =>
             {
-                request = self.view.step_page(1)
+                self.queue_page_turn(1)
             }
             KeyCode::Left | KeyCode::Up | KeyCode::Char('h' | 'k')
                 if key.modifiers.contains(KeyModifiers::SHIFT) =>
             {
-                request = self.view.step_page(-1)
+                self.queue_page_turn(-1)
             }
-            KeyCode::Char('L' | 'J' | 'n' | ' ') | KeyCode::PageDown => {
-                request = self.view.step_page(1)
-            }
-            KeyCode::Char('H' | 'K' | 'p') | KeyCode::PageUp => request = self.view.step_page(-1),
+            KeyCode::Char('L' | 'J' | 'n' | ' ') | KeyCode::PageDown => self.queue_page_turn(1),
+            KeyCode::Char('H' | 'K' | 'p') | KeyCode::PageUp => self.queue_page_turn(-1),
             KeyCode::Char('g') | KeyCode::Home => request = self.view.go_to(1),
             KeyCode::Char('G') | KeyCode::End => request = self.view.go_to(self.view.pages),
             KeyCode::Char('j') | KeyCode::Down => {
@@ -816,7 +840,10 @@ impl App {
                 request = true;
             }
             KeyCode::Char('b') => {
-                if let Some(view) = self.history.pop_back() {
+                if let Some(mut view) = self.history.pop_back() {
+                    // History may outlive a document refresh; never restore an
+                    // obsolete page count or navigate beyond the current PDF.
+                    view.set_pages(self.doc.pages);
                     self.view = view;
                     request = true;
                 }
@@ -952,6 +979,7 @@ impl App {
             return;
         };
         let was_compiling = live.compiling;
+        let auto_sync = live.auto_sync;
         let update = live.poll();
         if was_compiling != live.compiling {
             self.dirty = true;
@@ -962,7 +990,6 @@ impl App {
             self.error = self.session.as_ref().and_then(|s| s.warning.clone());
             self.dirty = true;
         }
-        let auto_sync = live.auto_sync;
         if let Some(update) = update {
             self.compile_millis = update.millis;
             self.compile_error = update.error.clone();
@@ -977,8 +1004,8 @@ impl App {
                 self.doc = Arc::new(doc);
                 self.schedule();
                 if auto_sync {
-                    if let Some(location) = update.location {
-                        self.follow_source(&location);
+                    if let Some(location) = update.location.as_ref() {
+                        self.follow_source(location);
                     }
                 }
             }
@@ -1362,12 +1389,12 @@ impl App {
                     .is_none_or(|t| t.elapsed() >= Duration::from_millis(250)) =>
             {
                 self.last_swipe_page = Some(Instant::now());
-                self.view
-                    .step_page(if event.kind == MouseEventKind::ScrollRight {
-                        1
-                    } else {
-                        -1
-                    })
+                self.queue_page_turn(if event.kind == MouseEventKind::ScrollRight {
+                    1
+                } else {
+                    -1
+                });
+                false
             }
             _ => false,
         };
@@ -1447,7 +1474,7 @@ impl App {
                         (self.viewport.height / self.font_height) as u16,
                     );
                     if let Some(geometry) = completed.geometry {
-                        if geometry.document_id != self.doc.id {
+                        if geometry.document_id != self.doc.id || geometry.page != self.view.page {
                             continue;
                         }
                         self.encode_latest = Some((geometry, image, size));
@@ -1465,6 +1492,7 @@ impl App {
             self.encoding_pending = false;
             if geometry.generation != self.renderer.current_generation()
                 || geometry.document_id != self.doc.id
+                || geometry.page != self.view.page
                 || self.render_due.is_some()
             {
                 continue;
@@ -1527,12 +1555,7 @@ impl App {
         #[cfg(feature = "typst")]
         {
             if self.live.as_ref().is_some_and(|live| live.compiling) {
-                let live = self.live.as_ref().unwrap();
-                return if live.iteration > 0 {
-                    format!("Typst watch · updating · previous {} ms", live.last_millis)
-                } else {
-                    "Typst watch · starting…".into()
-                };
+                return "Compiling…".into();
             }
             if let Some(notice) = &self.settings_notice {
                 return links::sanitize(notice);
@@ -1547,15 +1570,6 @@ impl App {
         }
         if !self.jump.is_empty() {
             return format!(":{} · Enter: go to page", self.jump);
-        }
-        #[cfg(feature = "typst")]
-        if self.error.is_none() {
-            if let Some(live) = &self.live {
-                return format!(
-                    "Typst watch · {} ms · pass {}",
-                    live.last_millis, live.iteration
-                );
-            }
         }
         self.error
             .as_ref()
@@ -1635,7 +1649,11 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
     );
     let title = format!(
         "PDF · {name} · {}/{} · {:.0}%{} · ▾ F3",
-        app.view.page + 1,
+        app.displayed
+            .as_ref()
+            .filter(|g| g.document_id == app.doc.id)
+            .map_or(app.view.page, |g| g.page)
+            + 1,
         app.view.pages,
         app.view.zoom * 100.0,
         match app.view.fit {
@@ -1658,10 +1676,7 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
             }
         },
     );
-    let mut screen = pdf_block.inner(columns[1]);
-    if panel_width == 0 {
-        screen.height = screen.height.saturating_sub(1);
-    }
+    let screen = pdf_block.inner(columns[1]);
     f.render_widget(pdf_block, columns[1]);
     f.render_widget(
         Block::new().style(Style::default().bg(Color::Rgb(20, 22, 26))),
@@ -1671,6 +1686,8 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
     let compilation_failed = app.compile_error.is_some();
     #[cfg(not(feature = "typst"))]
     let compilation_failed = false;
+    // Keep the last completed image while rendering/encoding the next page.
+    // Link hit-testing separately rejects geometry for the requested new page.
     if let Some(image) = app.image.as_ref() {
         if screen.width == 0 || screen.height == 0 {
             return;
@@ -1699,10 +1716,18 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
             .get(id)
             .map(|link| &link.action)
     }) {
-        render_link_hint(f, columns[1], action);
+        if panel_width == 0 {
+            render_header_notice(f, columns[1], &title, link_hint_line(action));
+        } else {
+            render_link_hint(f, columns[1], action);
+        }
     } else {
         let notice = app.footer_notice();
-        render_footer_notice(f, columns[1], &notice);
+        if panel_width == 0 {
+            render_header_notice(f, columns[1], &title, Line::from(notice));
+        } else {
+            render_footer_notice(f, columns[1], &notice);
+        }
     }
     #[cfg(feature = "typst")]
     if let Some(error) = &app.compile_error {
@@ -1732,6 +1757,44 @@ fn document_block(title: &str, framed: bool, active: bool) -> Block<'static> {
     }
 }
 
+// Reserve the right side before painting the title, so long filenames cannot
+// overlap status text. The last row belongs entirely to the PDF.
+fn render_header_notice(
+    f: &mut Frame<'_>,
+    panel: ratatui::layout::Rect,
+    title: &str,
+    notice: Line<'_>,
+) {
+    if panel.is_empty() {
+        return;
+    }
+    let style = Style::default()
+        .fg(Color::Rgb(180, 192, 211))
+        .bg(Color::Rgb(25, 29, 36));
+    let width = if notice.width() == 0 {
+        0
+    } else {
+        notice
+            .width()
+            .saturating_add(2)
+            .min(usize::from(panel.width / 2)) as u16
+    };
+    let header = ratatui::layout::Rect::new(panel.x, panel.y, panel.width, 1);
+    f.render_widget(Block::new().style(style), header);
+    f.render_widget(
+        Paragraph::new(format!(" {title} ")).style(style),
+        ratatui::layout::Rect::new(panel.x, panel.y, panel.width - width, 1),
+    );
+    if width > 0 {
+        f.render_widget(
+            Paragraph::new(notice)
+                .alignment(ratatui::layout::Alignment::Right)
+                .style(style),
+            ratatui::layout::Rect::new(panel.right() - width, panel.y, width.saturating_sub(1), 1),
+        );
+    }
+}
+
 fn render_footer_notice(f: &mut Frame<'_>, panel: ratatui::layout::Rect, notice: &str) {
     if notice.is_empty() || panel.height < 2 || panel.width < 4 {
         return;
@@ -1747,11 +1810,7 @@ fn render_footer_notice(f: &mut Frame<'_>, panel: ratatui::layout::Rect, notice:
     );
 }
 
-// The footer is outside Kitty placements, including the borderless layout.
-fn render_link_hint(f: &mut Frame<'_>, panel: ratatui::layout::Rect, action: &LinkAction) {
-    if panel.width < 8 || panel.height < 2 {
-        return;
-    }
+fn link_hint_line(action: &LinkAction) -> Line<'static> {
     let (label, detail, color) = match action {
         LinkAction::External(url) => (
             "↗ Click to open",
@@ -1769,13 +1828,21 @@ fn render_link_hint(f: &mut Frame<'_>, panel: ratatui::layout::Rect, action: &Li
             Color::Rgb(224, 182, 112),
         ),
     };
-    let hint = Line::from(vec![
+    Line::from(vec![
         Span::styled(format!(" {label} "), Style::default().fg(color)),
         Span::styled(
             format!("· {detail} "),
             Style::default().fg(Color::Rgb(180, 192, 211)),
         ),
-    ]);
+    ])
+}
+
+// The footer is outside Kitty placements in the framed layout.
+fn render_link_hint(f: &mut Frame<'_>, panel: ratatui::layout::Rect, action: &LinkAction) {
+    if panel.width < 8 || panel.height < 2 {
+        return;
+    }
+    let hint = link_hint_line(action);
     let width = (hint.width().min(u16::MAX as usize) as u16).min(panel.width.saturating_sub(4));
     let area = ratatui::layout::Rect::new(panel.x + 2, panel.bottom() - 1, width, 1);
     f.render_widget(
@@ -1904,9 +1971,14 @@ fn viewer_loop(
     );
     // Fixed process-owned slots bound terminal memory and permit upload-free
     // revisits. Reusing an evicted slot replaces its terminal image atomically.
-    let mut free_image_ids: Vec<u32> = (0..32)
+    let mut free_image_ids: Vec<_> = (0..40)
         .rev()
-        .map(|slot| graphics.id.wrapping_mul(64).wrapping_add(slot))
+        .map(|slot| {
+            (
+                graphics.id.wrapping_mul(64).wrapping_add(slot),
+                std::sync::Weak::new(),
+            )
+        })
         .collect();
     let mut encoded_cache = lru::LruCache::new(std::num::NonZeroUsize::new(32).unwrap());
     let mut encoded_bytes: usize = 0;
@@ -1953,10 +2025,16 @@ fn viewer_loop(
             if free_image_ids.is_empty() {
                 if let Some((_, old)) = encoded_cache.pop_lru() {
                     encoded_bytes -= old.encoded_len();
-                    free_image_ids.push(old.id());
+                    free_image_ids.push((old.id(), old.lease()));
                 }
             }
-            let image_id = free_image_ids.pop().expect("bounded Kitty image slot");
+            // An evicted image can still be visible or waiting in the worker
+            // output. Only recycle its terminal slot after all owners release it.
+            let available = free_image_ids
+                .iter()
+                .rposition(|(_, lease)| lease.strong_count() == 0)
+                .expect("bounded Kitty image slot");
+            let (image_id, _) = free_image_ids.swap_remove(available);
             // Reuse only our own ID: upstream generates a new random ID per protocol
             // and does not release terminal-side image data on Drop.
             let cells = Size::new(
@@ -1977,7 +2055,7 @@ fn viewer_loop(
                 while encoded_bytes + bytes > ENCODED_LIMIT || encoded_cache.len() == 32 {
                     if let Some((_, old)) = encoded_cache.pop_lru() {
                         encoded_bytes -= old.encoded_len();
-                        free_image_ids.push(old.id());
+                        free_image_ids.push((old.id(), old.lease()));
                     } else {
                         break;
                     }
@@ -1987,7 +2065,7 @@ fn viewer_loop(
             } else {
                 // Oversized transfers are not cached; their slot is reusable
                 // once this frame has been shown and the next encoding starts.
-                free_image_ids.push(image.id());
+                free_image_ids.push((image.id(), image.lease()));
             }
         }
         if env::var_os("LEAFVIEW_PERF").is_some() {
@@ -2095,6 +2173,7 @@ fn viewer_loop(
         loading: false,
         last_render_at: None,
         render_due: None,
+        page_turns: view::PageTurns::default(),
     };
     app.geometry(terminal.size()?);
     let stopping = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -2116,7 +2195,38 @@ fn viewer_loop(
     }
     let _signals = Signals(signal_ids);
     let mut reload_due: Option<Instant> = None;
-    loop {
+    let mut presented_frame = None;
+    // A focus report can precede tmux's outer-screen repaint. Replay once
+    // after it settles; never renew graphics periodically while idle.
+    let mut focus_replay_due: Option<Instant> = None;
+    // Focus reports describe the active pane, not whether a neighbouring PDF
+    // pane became visible after switching tmux windows. Poll only metadata in
+    // a worker; never rerasterize or periodically resend idle images.
+    let mut tmux_visibility = env::var_os("TMUX_PANE").filter(|_| tmux).map(|pane| {
+        Worker::new(move |(): (), stop| {
+            let mut command = std::process::Command::new("tmux");
+            command
+                .args(["display-message", "-p", "-t"])
+                .arg(&pane)
+                .arg(tmux::State::FORMAT);
+            let deadline = Instant::now() + Duration::from_millis(400);
+            process::run(&mut command, 1024, &|| {
+                stop.load(std::sync::atomic::Ordering::Relaxed) || Instant::now() >= deadline
+            })
+            .ok()
+            .and_then(|mut output| {
+                use std::io::{Read, Seek, SeekFrom};
+                output.seek(SeekFrom::Start(0)).ok()?;
+                let mut value = String::new();
+                output.read_to_string(&mut value).ok()?;
+                tmux::State::parse(&value)
+            })
+        })
+    });
+    let mut tmux_state: Option<tmux::State> = None;
+    let mut tmux_poll_pending = false;
+    let mut tmux_poll_due = Instant::now();
+    'app_loop: loop {
         if app.keybindings.poll_reload() {
             app.dirty = true;
         }
@@ -2127,6 +2237,54 @@ fn viewer_loop(
         }
         if stopping.load(std::sync::atomic::Ordering::Relaxed) {
             break;
+        }
+        // Drain a bounded input batch before expensive terminal output. This
+        // prevents old key repeats from being consumed one PNG upload at a time.
+        for _ in 0..64 {
+            if !event::poll(Duration::ZERO)? {
+                break;
+            }
+            match event::read()? {
+                Event::Key(key) => {
+                    if app.on_key(key) {
+                        break 'app_loop;
+                    }
+                }
+                Event::Mouse(mouse) => app.on_mouse(mouse),
+                Event::Resize(width, height) => {
+                    // tmux resize/reattach can replace the outer terminal cache
+                    // without a focus event. Cached encodings must upload again.
+                    kitty::invalidate_terminal_cache();
+                    app.hovered = None;
+                    app.hover_deadline = None;
+                    app.image_area = ratatui::layout::Rect::default();
+                    app.geometry(Size::new(width, height));
+                    app.dirty = true;
+                }
+                Event::FocusLost => {
+                    focus_replay_due = None;
+                    app.page_turns = view::PageTurns::default();
+                    app.files.clear_hover();
+                    app.pointer = None;
+                    app.hovered = None;
+                    app.hover_deadline = None;
+                    app.dirty = true;
+                }
+                Event::FocusGained => {
+                    // tmux sends this for an ordinary click between adjacent
+                    // panes. Focus alone does not invalidate terminal images.
+                    // Client/visibility changes are tracked by the metadata
+                    // worker; retain focus recovery only without that tracker.
+                    if tmux_visibility.is_none() {
+                        kitty::invalidate_terminal_cache();
+                        terminal.swap_buffers();
+                        terminal.swap_buffers();
+                        focus_replay_due = Some(Instant::now() + Duration::from_millis(200));
+                    }
+                    app.dirty = true;
+                }
+                _ => {}
+            }
         }
         #[cfg(feature = "editor")]
         if app.editor.poll() | app.editor.tick() {
@@ -2216,44 +2374,87 @@ fn viewer_loop(
             app.reload();
             app.dirty = true;
         }
-        if app.dirty {
-            terminal.draw(|f| {
-                ui(f, &mut app);
-                app.keybindings.render(f);
-            })?;
-            app.dirty = false;
-        }
-        if event::poll(Duration::from_millis(10))? {
-            match event::read()? {
-                Event::Key(key) => {
-                    if app.on_key(key) {
-                        break;
+        if let Some(worker) = &mut tmux_visibility {
+            if let Ok(state) = worker.output.try_recv() {
+                tmux_poll_pending = false;
+                if let Some(state) = state {
+                    if tmux_state
+                        .as_ref()
+                        .is_some_and(|old| state.needs_replay(old))
+                    {
+                        kitty::invalidate_terminal_cache();
+                        terminal.swap_buffers();
+                        terminal.swap_buffers();
+                        // Force upload even if the adjacent pane owns focus.
+                        presented_frame = None;
+                        focus_replay_due = Some(Instant::now() + Duration::from_millis(350));
+                        app.dirty = true;
                     }
+                    if !state.visible {
+                        focus_replay_due = None;
+                        app.page_turns = view::PageTurns::default();
+                    }
+                    tmux_state = Some(state);
                 }
-                Event::Mouse(mouse) => app.on_mouse(mouse),
-                Event::Resize(width, height) => {
-                    app.hovered = None;
-                    app.hover_deadline = None;
-                    app.image_area = ratatui::layout::Rect::default();
-                    app.geometry(Size::new(width, height));
-                    app.dirty = true;
-                }
-                Event::FocusLost => {
-                    app.files.clear_hover();
-                    app.pointer = None;
-                    app.hovered = None;
-                    app.hover_deadline = None;
-                    app.dirty = true;
-                }
-                Event::FocusGained => {
-                    kitty::invalidate_terminal_cache();
-                    terminal.clear()?;
-                    app.schedule();
-                    app.dirty = true;
-                }
-                _ => {}
+            }
+            if !tmux_poll_pending && Instant::now() >= tmux_poll_due {
+                tmux_poll_pending = worker.input.as_ref().unwrap().try_send(()).is_ok();
+                tmux_poll_due = Instant::now() + Duration::from_millis(200);
             }
         }
+        if focus_replay_due.is_some_and(|due| Instant::now() >= due) {
+            focus_replay_due = None;
+            terminal.swap_buffers();
+            terminal.swap_buffers();
+            kitty::invalidate_terminal_cache();
+            presented_frame = None;
+            app.dirty = true;
+        }
+        // Present only completed frames. Recovery is event-driven and bounded;
+        // once a frame settles there are no periodic idle PNG uploads.
+        let frame = app
+            .displayed
+            .as_ref()
+            .map(|geometry| (geometry.document_id, geometry.generation));
+        let new_frame = frame != presented_frame;
+        let replace_image = matches!(app.image, Some(DisplayImage::Kitty(_))) && new_frame;
+        if replace_image {
+            app.dirty = true;
+        }
+        presented_frame = frame;
+        if app.dirty {
+            use crossterm::SynchronizedUpdate;
+            // Upload while the previous placeholders remain visible, then
+            // publish only changed cells. Never clear/invalidate on page turns:
+            // not every terminal (or tmux client) honors synchronized updates.
+            std::io::stdout().sync_update(|stdout| -> Result<()> {
+                // Ratatui clears on resize. Do that BEFORE uploading graphics:
+                // otherwise draw() can erase the newly created placement while
+                // our upload cache already considers it terminal-resident.
+                terminal.autoresize()?;
+                // Focus belongs to a pane, not the whole visible window. A
+                // resize/reattach can invalidate graphics while an adjacent
+                // editor owns focus. Always ensure residency before drawing;
+                // upload() is a no-op while the terminal cache is valid.
+                if let Some(DisplayImage::Kitty(image)) = &app.image {
+                    image.upload(stdout)?;
+                }
+                if replace_image {
+                    terminal.swap_buffers();
+                    terminal.swap_buffers();
+                }
+                terminal.draw(|f| {
+                    ui(f, &mut app);
+                    app.keybindings.render(f);
+                })?;
+                Ok(())
+            })??;
+            app.dirty = false;
+        }
+        // Advance only after the completed page has actually been presented.
+        app.advance_page_turn();
+        // Keep worker polling responsive without busy-spinning when idle.
+        let _ = event::poll(Duration::from_millis(10))?;
     }
     Ok(())
 }
@@ -2502,14 +2703,16 @@ mod graphics_safety_tests {
     }
 
     #[test]
-    fn footer_notice_stays_below_document() {
+    fn borderless_notice_is_top_right_and_leaves_last_row_for_pdf() {
         use super::*;
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 8)).unwrap();
         terminal
             .draw(|f| {
-                f.render_widget(document_block("PDF · document.pdf", false, true), f.area());
-                render_footer_notice(f, f.area(), "Compiling…");
+                let block = document_block("PDF · document.pdf", false, true);
+                assert_eq!(block.inner(f.area()).bottom(), f.area().bottom());
+                f.render_widget(block, f.area());
+                render_header_notice(f, f.area(), "PDF · document.pdf", Line::from("Compiling…"));
             })
             .unwrap();
         let buffer = terminal.backend().buffer();
@@ -2517,9 +2720,9 @@ mod graphics_safety_tests {
             .map(|y| (0..60).map(|x| buffer[(x, y)].symbol()).collect::<String>())
             .collect::<Vec<_>>();
         assert!(rows[0].contains("document.pdf"));
-        assert!(!rows[0].contains("Compiling"));
-        assert!(rows[7].contains("Compiling"));
-        if let Ok(path) = std::env::var("LEAFVIEW_FOOTER_SNAPSHOT") {
+        assert!(rows[0].ends_with("Compiling… "));
+        assert!(rows[1..].iter().all(|row| row.trim().is_empty()));
+        if let Ok(path) = std::env::var("LEAFVIEW_STATUS_SNAPSHOT") {
             std::fs::write(path, rows.join("\n")).unwrap();
         }
     }

@@ -150,14 +150,10 @@ impl Compiler {
             .filter_map(|id| loader.resolve(id).ok().map(|p| (id, p)))
             .collect();
         let mut sources = BTreeMap::new();
-        let mut source_bytes = 0usize;
         for (id, path) in &deps {
             if path.extension().is_some_and(|e| e == "typ") {
                 if let Ok(source) = self.source(*id) {
-                    source_bytes = source_bytes.saturating_add(source.text().len());
-                    if source_bytes <= 16 * 1024 * 1024 {
-                        sources.insert(path.clone(), source.text().to_owned());
-                    }
+                    sources.insert(path.clone(), source.text().to_owned());
                 }
             }
         }
@@ -171,10 +167,6 @@ impl Compiler {
             compiler_pid: std::process::id(),
             iteration: self.iteration,
         };
-        if source_bytes > 16 * 1024 * 1024 {
-            reply.error = Some("Typst source snapshots exceed 16 MiB".into());
-            return reply;
-        }
         match output.output {
             Err(errors) => {
                 reply.error = Some(
@@ -238,16 +230,8 @@ impl Compiler {
                         );
                         exported_page += 1;
                     }
-                    anyhow::ensure!(
-                        reply.points.len() <= 500_000,
-                        "source map exceeds 500000 points"
-                    );
                     let pdf = typst_pdf::pdf(&document, &self.pdf_options)
                         .map_err(|e| anyhow::anyhow!("PDF export: {e:?}"))?;
-                    anyhow::ensure!(
-                        pdf.len() <= 512 * 1024 * 1024,
-                        "compiled PDF exceeds 512 MiB"
-                    );
                     std::fs::write(&request.output, pdf)?;
                     Ok(())
                 })();
@@ -293,9 +277,6 @@ fn collect(
             }
             FrameItem::Text(text) => {
                 for glyph in text.glyphs {
-                    if points.len() > 500_000 {
-                        return;
-                    }
                     if let Some(id) = glyph.span.0.id() {
                         let cached = spans.entry(glyph.span.0).or_insert_with(|| {
                             let source = world.source(id).ok()?;
@@ -343,6 +324,10 @@ fn collect(
         }
     }
 }
+fn default_compiler_threads() -> usize {
+    std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
+}
+
 pub fn serve() -> Result<()> {
     let input = std::env::args_os().nth(2).context("missing Typst input")?;
     let root = std::env::args_os().nth(3).context("missing Typst root")?;
@@ -352,9 +337,9 @@ pub fn serve() -> Result<()> {
         .transpose()?
         .unwrap_or_default();
     rayon::ThreadPoolBuilder::new()
-        .num_threads(options.jobs.unwrap_or(2))
+        .num_threads(options.jobs.unwrap_or_else(default_compiler_threads))
         .build_global()
-        .ok();
+        .context("initialize Typst compiler threads")?;
     let mut compiler = Compiler::new(input.into(), root.into(), options)?;
     for line in std::io::stdin().lock().lines() {
         let line = line?;

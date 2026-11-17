@@ -48,6 +48,7 @@ pub fn reply_path(output: &Path) -> PathBuf {
 struct CompilerProcess {
     child: Child,
     input: ChildStdin,
+    stderr: std::fs::File,
     directory: tempfile::TempDir,
 }
 impl Drop for CompilerProcess {
@@ -59,21 +60,41 @@ impl Drop for CompilerProcess {
 impl CompilerProcess {
     fn new(input: &Path, root: &Path, options: &crate::typst_options::Options) -> Result<Self> {
         let directory = tempfile::tempdir()?;
-        let mut child = Command::new("prlimit")
-            .args(["--as=3221225472", "--"])
-            .arg(std::env::current_exe()?)
+        let stderr = tempfile::tempfile()?;
+        let mut command = Command::new(std::env::current_exe()?);
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::process::CommandExt;
+            let parent = std::process::id() as libc::pid_t;
+            // Drop handles ordinary shutdown. The kernel handles abrupt death,
+            // including SIGKILL, when Rust destructors cannot run.
+            unsafe {
+                command.pre_exec(move || {
+                    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    // The parent may have died between fork and prctl.
+                    if libc::getppid() != parent {
+                        libc::_exit(1);
+                    }
+                    Ok(())
+                });
+            }
+        }
+        let mut child = command
             .arg("--typst-compiler")
             .arg(input)
             .arg(root)
             .arg(serde_json::to_string(options)?)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::from(stderr.try_clone()?))
             .spawn()?;
         let input = child.stdin.take().context("compiler stdin")?;
         Ok(Self {
             child,
             input,
+            stderr,
             directory,
         })
     }
@@ -96,26 +117,43 @@ impl CompilerProcess {
         )?;
         self.input.write_all(b"\n")?;
         self.input.flush()?;
-        let start = Instant::now();
         while !reply.exists() {
-            if cancelled() || start.elapsed() > Duration::from_secs(60) {
+            if cancelled() {
                 let _ = self.child.kill();
-                anyhow::bail!("Typst compilation cancelled or timed out");
+                anyhow::bail!("Typst compilation cancelled");
             }
-            anyhow::ensure!(
-                self.child.try_wait()?.is_none(),
-                "Typst compiler stopped (resource limit or internal error)"
-            );
+            if let Some(status) = self.child.try_wait()? {
+                anyhow::bail!("{}", compiler_exit_error(status, &mut self.stderr));
+            }
             std::thread::sleep(Duration::from_millis(10));
         }
-        anyhow::ensure!(
-            std::fs::metadata(&reply)?.len() <= 96 * 1024 * 1024,
-            "source map exceeds 96 MiB"
-        );
         let result = serde_json::from_reader(std::fs::File::open(reply)?)?;
         Ok((result, output))
     }
 }
+fn compiler_exit_error(status: std::process::ExitStatus, stderr: &mut std::fs::File) -> String {
+    use std::io::{Read, Seek, SeekFrom};
+
+    // Keep the UI diagnostic bounded, including when the compiler panics.
+    // A file avoids blocking the child on an undrained stderr pipe.
+    let mut tail = Vec::new();
+    if let Ok(len) = stderr.metadata().map(|m| m.len()) {
+        if stderr
+            .seek(SeekFrom::Start(len.saturating_sub(8192)))
+            .is_ok()
+        {
+            let _ = stderr.take(8192).read_to_end(&mut tail);
+        }
+    }
+    let detail = String::from_utf8_lossy(&tail);
+    let detail = detail.trim();
+    if detail.is_empty() {
+        format!("Typst compiler exited with {status}; no stderr diagnostic was produced")
+    } else {
+        format!("Typst compiler exited with {status}:\n{detail}")
+    }
+}
+
 pub struct Update {
     pub generation: u64,
     pub document: Option<Document>,
@@ -590,6 +628,23 @@ pub fn changed_range(old: &str, new: &str) -> Option<std::ops::Range<usize>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    #[test]
+    fn compiler_exit_diagnostic_includes_status_and_bounded_stderr() {
+        use std::os::unix::process::ExitStatusExt;
+        let mut stderr = tempfile::tempfile().unwrap();
+        stderr.write_all(&vec![b'x'; 16_384]).unwrap();
+        stderr.write_all(b"\nallocation failed").unwrap();
+        let error = compiler_exit_error(std::process::ExitStatus::from_raw(6), &mut stderr);
+        assert!(error.contains("signal: 6"));
+        assert!(error.ends_with("allocation failed"));
+        assert!(error.len() < 8400);
+        let mut empty = tempfile::tempfile().unwrap();
+        let error = compiler_exit_error(std::process::ExitStatus::from_raw(256), &mut empty);
+        assert!(error.contains("exit status: 1"));
+        assert!(error.contains("no stderr diagnostic"));
+    }
+
     #[test]
     fn custom_export_path_is_relative_to_source_not_cwd() {
         let mut options = crate::typst_options::Options {
@@ -638,6 +693,7 @@ mod tests {
         let mut process = CompilerProcess {
             child,
             input,
+            stderr: tempfile::tempfile().unwrap(),
             directory: tempfile::tempdir().unwrap(),
         };
         let (first, _) = process.compile(1, &|| false).unwrap();
